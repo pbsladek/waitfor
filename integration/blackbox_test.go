@@ -66,6 +66,17 @@ func requireBlackbox(t *testing.T) {
 	}
 }
 
+func requireKubernetesBlackbox(t *testing.T) {
+	t.Helper()
+	requireBlackbox(t)
+	if os.Getenv("WAITFOR_BLACKBOX_K8S") != "1" {
+		t.Skip("set WAITFOR_BLACKBOX_K8S=1 to run against a real Kubernetes cluster")
+	}
+	if _, err := exec.LookPath("kubectl"); err != nil {
+		t.Fatalf("kubectl is required for Kubernetes black-box test: %v", err)
+	}
+}
+
 type commandResult struct {
 	code   int
 	stdout string
@@ -379,20 +390,10 @@ func TestBinaryInvalidArgsExitCode(t *testing.T) {
 }
 
 func TestBinaryKubernetesNamespacePolling(t *testing.T) {
-	requireBlackbox(t)
-	if os.Getenv("WAITFOR_BLACKBOX_K8S") != "1" {
-		t.Skip("set WAITFOR_BLACKBOX_K8S=1 to run against a real Kubernetes cluster")
-	}
-	if _, err := exec.LookPath("kubectl"); err != nil {
-		t.Fatalf("kubectl is required for Kubernetes black-box test: %v", err)
-	}
+	requireKubernetesBlackbox(t)
 
 	ns := fmt.Sprintf("waitfor-blackbox-%d", time.Now().UnixNano())
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = kubectl(ctx, "delete", "namespace", ns, "--ignore-not-found=true")
-	})
+	cleanupNamespace(t, ns)
 
 	createErr := make(chan error, 1)
 	go func() {
@@ -408,9 +409,7 @@ func TestBinaryKubernetesNamespacePolling(t *testing.T) {
 		"k8s", "namespace/" + ns,
 		"--jsonpath", ".metadata.name == " + ns,
 	}
-	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
-		args = append(args, "--kubeconfig", kubeconfig)
-	}
+	args = appendKubeconfig(args)
 	result := runWaitfor(t, args...)
 	requireExitCode(t, result, 0)
 	if err := <-createErr; err != nil {
@@ -419,10 +418,7 @@ func TestBinaryKubernetesNamespacePolling(t *testing.T) {
 }
 
 func TestBinaryKubernetesNamespaceTimeout(t *testing.T) {
-	requireBlackbox(t)
-	if os.Getenv("WAITFOR_BLACKBOX_K8S") != "1" {
-		t.Skip("set WAITFOR_BLACKBOX_K8S=1 to run against a real Kubernetes cluster")
-	}
+	requireKubernetesBlackbox(t)
 
 	ns := fmt.Sprintf("waitfor-blackbox-missing-%d", time.Now().UnixNano())
 	args := []string{
@@ -431,16 +427,437 @@ func TestBinaryKubernetesNamespaceTimeout(t *testing.T) {
 		"k8s", "namespace/" + ns,
 		"--jsonpath", ".metadata.name == " + ns,
 	}
-	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
-		args = append(args, "--kubeconfig", kubeconfig)
-	}
+	args = appendKubeconfig(args)
 	result := runWaitfor(t, args...)
 	requireExitCode(t, result, 1)
 }
 
+func TestBinaryKubernetesPodReadyConditionPolling(t *testing.T) {
+	requireKubernetesBlackbox(t)
+
+	ns := createNamespace(t)
+	pod := "waitfor-ready"
+	applyKubernetesYAML(t, fmt.Sprintf(`apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.10
+`, pod, ns))
+
+	patchErr := patchKubernetesStatusAfter(300*time.Millisecond,
+		"pod", pod, ns,
+		`{"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}`)
+
+	args := appendKubeconfig([]string{
+		"--timeout", "10s",
+		"--interval", "200ms",
+		"k8s", "pod/" + pod,
+		"--namespace", ns,
+	})
+	result := runWaitfor(t, args...)
+	requireExitCode(t, result, 0)
+	requireAsyncKubectl(t, patchErr, "patch pod status")
+}
+
+func TestBinaryKubernetesDeploymentAvailableConditionPolling(t *testing.T) {
+	requireKubernetesBlackbox(t)
+
+	ns := createNamespace(t)
+	deployment := "waitfor-api"
+	applyKubernetesYAML(t, fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+`, deployment, ns, deployment, deployment))
+
+	patchErr := patchKubernetesStatusAfter(300*time.Millisecond,
+		"deployment", deployment, ns,
+		`{"status":{"observedGeneration":1,"replicas":1,"readyReplicas":1,"availableReplicas":1,"conditions":[{"type":"Available","status":"True","reason":"MinimumReplicasAvailable"}]}}`)
+
+	args := appendKubeconfig([]string{
+		"--timeout", "10s",
+		"--interval", "200ms",
+		"k8s", "deployment/" + deployment,
+		"--namespace", ns,
+		"--condition", "Available",
+	})
+	result := runWaitfor(t, args...)
+	requireExitCode(t, result, 0)
+	requireAsyncKubectl(t, patchErr, "patch deployment status")
+}
+
+func TestBinaryKubernetesServiceJSONPath(t *testing.T) {
+	requireKubernetesBlackbox(t)
+
+	ns := createNamespace(t)
+	service := "waitfor-svc"
+	applyKubernetesYAML(t, fmt.Sprintf(`apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  selector:
+    app: waitfor
+  ports:
+    - port: 80
+      targetPort: 8080
+`, service, ns))
+
+	args := appendKubeconfig([]string{
+		"--timeout", "10s",
+		"--interval", "200ms",
+		"k8s", "service/" + service,
+		"--namespace", ns,
+		"--jsonpath", ".spec.type == ClusterIP",
+	})
+	result := runWaitfor(t, args...)
+	requireExitCode(t, result, 0)
+}
+
+func TestBinaryKubernetesMultipleResourcesPolling(t *testing.T) {
+	requireKubernetesBlackbox(t)
+
+	ns := createNamespace(t)
+	service := "waitfor-multi"
+	applyKubernetesYAML(t, fmt.Sprintf(`apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  selector:
+    app: waitfor
+  ports:
+    - port: 80
+      targetPort: 8080
+`, service, ns))
+
+	args := appendKubeconfig([]string{
+		"--timeout", "10s",
+		"--interval", "200ms",
+		"k8s", "namespace/" + ns,
+		"--jsonpath", ".metadata.name == " + ns,
+		"--",
+		"k8s", "service/" + service,
+		"--namespace", ns,
+		"--jsonpath", ".metadata.name == " + service,
+	})
+	result := runWaitfor(t, args...)
+	requireExitCode(t, result, 0)
+}
+
+func TestBinaryKubernetesJobCompleteConditionPolling(t *testing.T) {
+	requireKubernetesBlackbox(t)
+
+	ns := createNamespace(t)
+	job := "waitfor-migrate"
+	applyKubernetesYAML(t, fmt.Sprintf(`apiVersion: batch/v1
+kind: Job
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: registry.k8s.io/pause:3.10
+`, job, ns))
+
+	patchErr := patchKubernetesStatusAfter(300*time.Millisecond,
+		"job", job, ns,
+		`{"status":{"succeeded":1,"conditions":[{"type":"Complete","status":"True"}]}}`)
+
+	args := appendKubeconfig([]string{
+		"--timeout", "10s",
+		"--interval", "200ms",
+		"k8s", "job/" + job,
+		"--namespace", ns,
+		"--condition", "Complete",
+	})
+	result := runWaitfor(t, args...)
+	requireExitCode(t, result, 0)
+	requireAsyncKubectl(t, patchErr, "patch job status")
+}
+
+func TestBinaryKubernetesStatefulSetJSONPath(t *testing.T) {
+	requireKubernetesBlackbox(t)
+
+	ns := createNamespace(t)
+	statefulSet := "waitfor-db"
+	applyKubernetesYAML(t, fmt.Sprintf(`apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicas: 1
+  serviceName: %s
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+`, statefulSet, ns, statefulSet, statefulSet, statefulSet))
+
+	patchErr := patchKubernetesStatusAfter(300*time.Millisecond,
+		"statefulset", statefulSet, ns,
+		`{"status":{"replicas":1,"readyReplicas":1,"currentReplicas":1,"updatedReplicas":1}}`)
+
+	args := appendKubeconfig([]string{
+		"--timeout", "10s",
+		"--interval", "200ms",
+		"k8s", "statefulset/" + statefulSet,
+		"--namespace", ns,
+		"--jsonpath", ".status.readyReplicas == 1",
+	})
+	result := runWaitfor(t, args...)
+	requireExitCode(t, result, 0)
+	requireAsyncKubectl(t, patchErr, "patch statefulset status")
+}
+
+func TestBinaryKubernetesDaemonSetJSONPath(t *testing.T) {
+	requireKubernetesBlackbox(t)
+
+	ns := createNamespace(t)
+	daemonSet := "waitfor-agent"
+	applyKubernetesYAML(t, fmt.Sprintf(`apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+`, daemonSet, ns, daemonSet, daemonSet))
+
+	patchErr := patchKubernetesStatusAfter(300*time.Millisecond,
+		"daemonset", daemonSet, ns,
+		`{"status":{"desiredNumberScheduled":1,"currentNumberScheduled":1,"numberReady":1}}`)
+
+	args := appendKubeconfig([]string{
+		"--timeout", "10s",
+		"--interval", "200ms",
+		"k8s", "daemonset/" + daemonSet,
+		"--namespace", ns,
+		"--jsonpath", ".status.numberReady >= 1",
+	})
+	result := runWaitfor(t, args...)
+	requireExitCode(t, result, 0)
+	requireAsyncKubectl(t, patchErr, "patch daemonset status")
+}
+
+func TestBinaryKubernetesNamespaceFlagSelectsResource(t *testing.T) {
+	requireKubernetesBlackbox(t)
+
+	firstNS := createNamespace(t)
+	secondNS := createNamespace(t)
+	service := "waitfor-same-name"
+	applyKubernetesYAML(t, fmt.Sprintf(`apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  selector:
+    app: waitfor
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  selector:
+    app: waitfor
+  ports:
+    - port: 80
+      targetPort: 8080
+`, service, firstNS, service, secondNS))
+
+	args := appendKubeconfig([]string{
+		"--timeout", "10s",
+		"--interval", "200ms",
+		"k8s", "svc/" + service,
+		"--namespace", secondNS,
+		"--jsonpath", ".metadata.namespace == " + secondNS,
+	})
+	result := runWaitfor(t, args...)
+	requireExitCode(t, result, 0)
+}
+
+func TestBinaryKubernetesUnsupportedKindFatal(t *testing.T) {
+	requireBlackbox(t)
+
+	result := runWaitfor(t, "k8s", "configmap/example")
+	requireExitCode(t, result, 3)
+}
+
+func TestBinaryKubernetesJSONOutput(t *testing.T) {
+	requireKubernetesBlackbox(t)
+
+	ns := createNamespace(t)
+	service := "waitfor-json"
+	applyKubernetesYAML(t, fmt.Sprintf(`apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  selector:
+    app: waitfor
+  ports:
+    - port: 80
+      targetPort: 8080
+`, service, ns))
+
+	args := appendKubeconfig([]string{
+		"--output", "json",
+		"--timeout", "10s",
+		"--interval", "200ms",
+		"k8s", "service/" + service,
+		"--namespace", ns,
+		"--jsonpath", ".spec.type == ClusterIP",
+	})
+	result := runWaitfor(t, args...)
+	requireExitCode(t, result, 0)
+	if result.stderr != "" {
+		t.Fatalf("stderr = %q, want empty for JSON output", result.stderr)
+	}
+
+	var payload struct {
+		Status     string `json:"status"`
+		Satisfied  bool   `json:"satisfied"`
+		Conditions []struct {
+			Backend   string `json:"backend"`
+			Target    string `json:"target"`
+			Satisfied bool   `json:"satisfied"`
+		} `json:"conditions"`
+	}
+	if err := json.Unmarshal([]byte(result.stdout), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, result.stdout)
+	}
+	if payload.Status != "satisfied" || !payload.Satisfied {
+		t.Fatalf("payload = %+v, want satisfied", payload)
+	}
+	if len(payload.Conditions) != 1 {
+		t.Fatalf("conditions = %d, want 1", len(payload.Conditions))
+	}
+	condition := payload.Conditions[0]
+	if condition.Backend != "k8s" || condition.Target != "service/"+service || !condition.Satisfied {
+		t.Fatalf("condition = %+v, want satisfied k8s service", condition)
+	}
+}
+
+func createNamespace(t *testing.T) string {
+	t.Helper()
+	ns := fmt.Sprintf("waitfor-blackbox-%d", time.Now().UnixNano())
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := kubectl(ctx, "create", "namespace", ns); err != nil {
+		t.Fatalf("kubectl create namespace: %v", err)
+	}
+	cleanupNamespace(t, ns)
+	return ns
+}
+
+func cleanupNamespace(t *testing.T, ns string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = kubectl(ctx, "delete", "namespace", ns, "--ignore-not-found=true")
+	})
+}
+
+func appendKubeconfig(args []string) []string {
+	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
+		return append(args, "--kubeconfig", kubeconfig)
+	}
+	return args
+}
+
+func applyKubernetesYAML(t *testing.T, manifest string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := kubectlWithInput(ctx, manifest, "apply", "-f", "-"); err != nil {
+		t.Fatalf("kubectl apply: %v", err)
+	}
+}
+
+func patchKubernetesStatusAfter(delay time.Duration, kind string, name string, namespace string, patch string) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		time.Sleep(delay)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		errCh <- kubectl(ctx,
+			"patch", kind, name,
+			"--namespace", namespace,
+			"--subresource", "status",
+			"--type", "merge",
+			"--patch", patch)
+	}()
+	return errCh
+}
+
+func requireAsyncKubectl(t *testing.T, errCh <-chan error, action string) {
+	t.Helper()
+	if err := <-errCh; err != nil {
+		t.Fatalf("kubectl %s: %v", action, err)
+	}
+}
+
 func kubectl(ctx context.Context, args ...string) error {
+	return kubectlWithInput(ctx, "", args...)
+}
+
+func kubectlWithInput(ctx context.Context, input string, args ...string) error {
 	cmd := exec.CommandContext(ctx, "kubectl", args...)
 	var output bytes.Buffer
+	if input != "" {
+		cmd.Stdin = bytes.NewBufferString(input)
+	}
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	if err := cmd.Run(); err != nil {
