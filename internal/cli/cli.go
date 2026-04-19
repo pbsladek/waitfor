@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -53,11 +52,11 @@ func Execute(ctx context.Context, args []string, stdin io.Reader, stdout io.Writ
 		var ee exitError
 		if errors.As(err, &ee) {
 			if ee.err != nil {
-				fmt.Fprintf(stderr, "waitfor: %v\n", ee.err)
+				_, _ = fmt.Fprintf(stderr, "waitfor: %v\n", ee.err)
 			}
 			return ee.code
 		}
-		fmt.Fprintf(stderr, "waitfor: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "waitfor: %v\n", err)
 		return ExitFatal
 	}
 	return ExitSatisfied
@@ -151,6 +150,33 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	}
 }
 
+func applyFormatAndMode(opts globalOptions, format, mode string) (globalOptions, error) {
+	switch output.Format(format) {
+	case output.FormatText, output.FormatJSON:
+		opts.format = output.Format(format)
+	default:
+		return opts, fmt.Errorf("invalid output format %q", format)
+	}
+	switch mode {
+	case "all":
+		opts.mode = runner.ModeAll
+	case "any":
+		opts.mode = runner.ModeAny
+	default:
+		return opts, fmt.Errorf("invalid mode %q", mode)
+	}
+	if opts.timeout <= 0 {
+		return opts, fmt.Errorf("timeout must be positive")
+	}
+	if opts.interval <= 0 {
+		return opts, fmt.Errorf("interval must be positive")
+	}
+	if opts.perAttemptTimeout < 0 {
+		return opts, fmt.Errorf("attempt-timeout cannot be negative")
+	}
+	return opts, nil
+}
+
 func parseGlobal(args []string) (globalOptions, []string, error) {
 	opts := globalOptions{
 		timeout:  5 * time.Minute,
@@ -159,51 +185,33 @@ func parseGlobal(args []string) (globalOptions, []string, error) {
 		mode:     runner.ModeAll,
 	}
 
-	idx := firstBackendIndex(args)
-	if idx < 0 {
-		return opts, nil, fmt.Errorf("missing condition backend")
-	}
-
 	fs := pflag.NewFlagSet("waitfor", pflag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	// Stop at the first non-flag argument (the backend name). This means flag
+	// values that happen to be backend names are consumed correctly by pflag
+	// rather than being misidentified as condition starts.
+	fs.SetInterspersed(false)
 	var format string
 	var mode string
 	fs.DurationVar(&opts.timeout, "timeout", opts.timeout, "global deadline")
 	fs.DurationVar(&opts.interval, "interval", opts.interval, "poll interval")
-	fs.DurationVar(&opts.perAttemptTimeout, "attempt-timeout", 0, "per-attempt deadline; 0 uses the global remaining time")
+	fs.DurationVar(&opts.perAttemptTimeout, "attempt-timeout", 0, "per-attempt deadline; 0 disables per-attempt limit (global timeout still applies)")
 	fs.StringVar(&format, "output", string(opts.format), "output format: text|json")
 	fs.StringVar(&mode, "mode", "all", "condition mode: all|any")
 	fs.BoolVar(&opts.verbose, "verbose", false, "show every attempt")
-	if err := fs.Parse(args[:idx]); err != nil {
+	var err error
+	if err = fs.Parse(args); err != nil {
 		return opts, nil, err
 	}
-	if len(fs.Args()) != 0 {
-		return opts, nil, fmt.Errorf("unexpected global arguments: %s", strings.Join(fs.Args(), " "))
+	rest := fs.Args()
+	if len(rest) == 0 {
+		return opts, nil, fmt.Errorf("missing condition backend")
 	}
-	switch output.Format(format) {
-	case output.FormatText, output.FormatJSON:
-		opts.format = output.Format(format)
-	default:
-		return opts, nil, fmt.Errorf("invalid output format %q", format)
+	opts, err = applyFormatAndMode(opts, format, mode)
+	if err != nil {
+		return opts, nil, err
 	}
-	switch mode {
-	case "all":
-		opts.mode = runner.ModeAll
-	case "any":
-		opts.mode = runner.ModeAny
-	default:
-		return opts, nil, fmt.Errorf("invalid mode %q", mode)
-	}
-	if opts.timeout <= 0 {
-		return opts, nil, fmt.Errorf("timeout must be positive")
-	}
-	if opts.interval <= 0 {
-		return opts, nil, fmt.Errorf("interval must be positive")
-	}
-	if opts.perAttemptTimeout < 0 {
-		return opts, nil, fmt.Errorf("attempt-timeout cannot be negative")
-	}
-	return opts, args[idx:], nil
+	return opts, rest, nil
 }
 
 func parseConditions(args []string) ([]condition.Condition, error) {
@@ -242,6 +250,66 @@ func parseCondition(segment []string) (condition.Condition, error) {
 	}
 }
 
+func validateHTTPURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("invalid http URL %q", rawURL)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("http URL must use http or https")
+	}
+	return nil
+}
+
+func parseBodyContent(body, bodyFile string) ([]byte, error) {
+	if body != "" && bodyFile != "" {
+		return nil, fmt.Errorf("--body and --body-file are mutually exclusive")
+	}
+	if body != "" {
+		return []byte(body), nil
+	}
+	if bodyFile != "" {
+		data, err := os.ReadFile(bodyFile)
+		if err != nil {
+			return nil, fmt.Errorf("read body file: %w", err)
+		}
+		return data, nil
+	}
+	return nil, nil
+}
+
+func parseHTTPHeaders(rawHeaders []string) (map[string]string, error) {
+	headers := make(map[string]string, len(rawHeaders))
+	for _, raw := range rawHeaders {
+		key, value, ok := splitHeader(raw)
+		if !ok {
+			return nil, fmt.Errorf("invalid header %q", raw)
+		}
+		headers[key] = value
+	}
+	return headers, nil
+}
+
+func compileHTTPBodyMatchers(bodyMatches, jsonpath string) (*regexp.Regexp, *expr.Expression, error) {
+	var bodyRegex *regexp.Regexp
+	if bodyMatches != "" {
+		var err error
+		bodyRegex, err = regexp.Compile(bodyMatches)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid body regex: %w", err)
+		}
+	}
+	var bodyExpr *expr.Expression
+	if jsonpath != "" {
+		var err error
+		bodyExpr, err = expr.Compile(jsonpath)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return bodyRegex, bodyExpr, nil
+}
+
 func parseHTTPCondition(segment []string) (condition.Condition, error) {
 	fs := pflag.NewFlagSet("http", pflag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -254,7 +322,7 @@ func parseHTTPCondition(segment []string) (condition.Condition, error) {
 	jsonpath := ""
 	insecure := false
 	noRedirects := false
-	headers := []string{}
+	var rawHeaders []string
 	fs.StringVar(&method, "method", method, "HTTP method")
 	fs.StringVar(&status, "status", status, "expected HTTP status or class, such as 200 or 2xx")
 	fs.StringVar(&body, "body", "", "request body")
@@ -264,7 +332,7 @@ func parseHTTPCondition(segment []string) (condition.Condition, error) {
 	fs.StringVar(&jsonpath, "jsonpath", jsonpath, "JSON expression")
 	fs.BoolVar(&insecure, "insecure", insecure, "skip TLS verification")
 	fs.BoolVar(&noRedirects, "no-follow-redirects", noRedirects, "do not follow HTTP redirects")
-	fs.StringArrayVar(&headers, "header", nil, "request header, as Key: Value or Key=Value")
+	fs.StringArrayVar(&rawHeaders, "header", nil, "request header, as Key: Value or Key=Value")
 	if err := fs.Parse(segment[1:]); err != nil {
 		return nil, err
 	}
@@ -272,62 +340,35 @@ func parseHTTPCondition(segment []string) (condition.Condition, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("http requires exactly one URL")
 	}
-	parsed, err := url.Parse(args[0])
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, fmt.Errorf("invalid http URL %q", args[0])
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("http URL must use http or https")
+	if err := validateHTTPURL(args[0]); err != nil {
+		return nil, err
 	}
 	statusMatcher, err := condition.ParseHTTPStatusMatcher(status)
 	if err != nil {
 		return nil, err
 	}
-	if body != "" && bodyFile != "" {
-		return nil, fmt.Errorf("--body and --body-file are mutually exclusive")
+	requestBody, err := parseBodyContent(body, bodyFile)
+	if err != nil {
+		return nil, err
 	}
-	var requestBody []byte
-	if body != "" {
-		requestBody = []byte(body)
+	bodyRegex, bodyExpr, err := compileHTTPBodyMatchers(bodyMatches, jsonpath)
+	if err != nil {
+		return nil, err
 	}
-	if bodyFile != "" {
-		requestBody, err = os.ReadFile(bodyFile)
-		if err != nil {
-			return nil, fmt.Errorf("read body file: %w", err)
-		}
-	}
-	var bodyRegex *regexp.Regexp
-	if bodyMatches != "" {
-		bodyRegex, err = regexp.Compile(bodyMatches)
-		if err != nil {
-			return nil, fmt.Errorf("invalid body regex: %w", err)
-		}
-	}
-	var bodyExpr *expr.Expression
-	if jsonpath != "" {
-		bodyExpr, err = expr.Compile(jsonpath)
-		if err != nil {
-			return nil, err
-		}
+	headers, err := parseHTTPHeaders(rawHeaders)
+	if err != nil {
+		return nil, err
 	}
 	cond := condition.NewHTTP(args[0])
 	cond.Method = method
 	cond.StatusMatcher = statusMatcher
 	cond.RequestBody = requestBody
 	cond.BodyContains = bodyContains
-	cond.BodyMatches = bodyMatches
 	cond.BodyRegex = bodyRegex
-	cond.BodyJSONPath = jsonpath
 	cond.BodyJSONExpr = bodyExpr
 	cond.Insecure = insecure
 	cond.NoRedirects = noRedirects
-	for _, header := range headers {
-		key, value, ok := splitHeader(header)
-		if !ok {
-			return nil, fmt.Errorf("invalid header %q", header)
-		}
-		cond.Headers[key] = value
-	}
+	cond.Headers = headers
 	return cond, nil
 }
 
@@ -357,7 +398,7 @@ func parseFileCondition(segment []string) (condition.Condition, error) {
 	}
 	args := fs.Args()
 	if len(args) < 1 || len(args) > 2 {
-		return nil, fmt.Errorf("file requires path and optional state")
+		return nil, fmt.Errorf("file requires PATH [exists|deleted|nonempty]")
 	}
 	state := condition.FileExists
 	if len(args) == 2 {
@@ -366,7 +407,7 @@ func parseFileCondition(segment []string) (condition.Condition, error) {
 	switch state {
 	case condition.FileExists, condition.FileDeleted, condition.FileNonEmpty:
 	default:
-		return nil, fmt.Errorf("invalid file state %q", state)
+		return nil, fmt.Errorf("invalid file state %q: must be exists, deleted, or nonempty", state)
 	}
 	cond := condition.NewFile(args[0], state)
 	cond.Contains = contains
@@ -388,147 +429,92 @@ func parseKubernetesCondition(segment []string) (condition.Condition, error) {
 		return nil, err
 	}
 	args := fs.Args()
-	if len(args) < 1 || len(args) > 2 {
-		return nil, fmt.Errorf("k8s requires resource and optional condition")
+	if len(args) != 1 {
+		return nil, fmt.Errorf("k8s requires exactly one RESOURCE (e.g. pod/myapp, deployment/api)")
 	}
-	if len(args) == 2 {
-		conditionName = args[1]
+	if conditionName != "" && jsonpath != "" {
+		return nil, fmt.Errorf("--condition and --jsonpath are mutually exclusive")
+	}
+	var jsonExpr *expr.Expression
+	if jsonpath != "" {
+		var err error
+		jsonExpr, err = expr.Compile(jsonpath)
+		if err != nil {
+			return nil, err
+		}
 	}
 	cond := condition.NewKubernetes(args[0])
 	cond.Namespace = namespace
 	cond.Condition = conditionName
-	cond.JSONPath = jsonpath
+	cond.JSONExpr = jsonExpr
 	cond.Kubeconfig = kubeconfig
 	return cond, nil
 }
 
-type execOptions struct {
-	expectedExitCode int
-	outputContains   string
-	jsonpath         string
-	jsonExpr         *expr.Expression
-	cwd              string
-	env              []string
-	maxOutputBytes   int64
+func validateEnvVars(env []string) error {
+	for _, e := range env {
+		if !strings.Contains(e, "=") {
+			return fmt.Errorf("--env must use KEY=VALUE, got %q", e)
+		}
+	}
+	return nil
 }
 
 func parseExecCondition(segment []string) (condition.Condition, error) {
-	tokens := append([]string(nil), segment[1:]...)
-	opts := execOptions{}
-
+	tokens := segment[1:]
 	separator := indexOf(tokens, "--")
-	var command []string
 	if separator < 0 {
 		return nil, fmt.Errorf("exec requires -- before command")
 	}
-
-	before := tokens[:separator]
-	after := tokens[separator+1:]
-	var err error
-	opts, before, err = extractExecFlags(before, opts)
-	if err != nil {
-		return nil, err
-	}
-	if len(before) != 0 {
-		return nil, fmt.Errorf("exec flags must precede --")
-	}
-	command = after
-
+	command := tokens[separator+1:]
 	if len(command) == 0 {
 		return nil, fmt.Errorf("exec requires a command; use: waitfor exec [flags] -- command [args...]")
 	}
+
+	fs := pflag.NewFlagSet("exec", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	exitCode := 0
+	outputContains := ""
+	jsonpath := ""
+	cwd := ""
+	var env []string
+	maxOutputBytes := int64(0)
+	fs.IntVar(&exitCode, "exit-code", exitCode, "expected exit code")
+	fs.StringVar(&outputContains, "output-contains", outputContains, "required output substring")
+	fs.StringVar(&jsonpath, "jsonpath", jsonpath, "JSON expression")
+	fs.StringVar(&cwd, "cwd", cwd, "working directory")
+	fs.StringArrayVar(&env, "env", nil, "extra environment variable (KEY=VALUE)")
+	fs.Int64Var(&maxOutputBytes, "max-output-bytes", maxOutputBytes, "max output bytes to capture")
+	if err := fs.Parse(tokens[:separator]); err != nil {
+		return nil, err
+	}
+	if args := fs.Args(); len(args) != 0 {
+		return nil, fmt.Errorf("exec flags must precede --: unexpected args: %s", strings.Join(args, " "))
+	}
+	if err := validateEnvVars(env); err != nil {
+		return nil, err
+	}
+	var outputExpr *expr.Expression
+	if jsonpath != "" {
+		var err error
+		outputExpr, err = expr.Compile(jsonpath)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	cond := condition.NewExec(command)
-	cond.ExpectedExitCode = opts.expectedExitCode
-	cond.OutputContains = opts.outputContains
-	cond.OutputJSONPath = opts.jsonpath
-	cond.OutputJSONExpr = opts.jsonExpr
-	cond.Cwd = opts.cwd
-	cond.Env = opts.env
-	cond.MaxOutputBytes = opts.maxOutputBytes
+	cond.ExpectedExitCode = exitCode
+	cond.OutputContains = outputContains
+	cond.OutputJSONExpr = outputExpr
+	cond.Cwd = cwd
+	cond.Env = env
+	cond.MaxOutputBytes = maxOutputBytes
 	return cond, nil
 }
 
-func extractExecFlags(tokens []string, opts execOptions) (execOptions, []string, error) {
-	remaining := make([]string, 0, len(tokens))
-	for i := 0; i < len(tokens); i++ {
-		token := tokens[i]
-		name, value, hasValue := strings.Cut(token, "=")
-		switch name {
-		case "--exit-code":
-			if !hasValue {
-				i++
-				if i >= len(tokens) {
-					return opts, nil, fmt.Errorf("--exit-code requires a value")
-				}
-				value = tokens[i]
-			}
-			code, err := strconv.Atoi(value)
-			if err != nil {
-				return opts, nil, fmt.Errorf("invalid --exit-code %q", value)
-			}
-			opts.expectedExitCode = code
-		case "--output-contains":
-			if !hasValue {
-				i++
-				if i >= len(tokens) {
-					return opts, nil, fmt.Errorf("--output-contains requires a value")
-				}
-				value = tokens[i]
-			}
-			opts.outputContains = value
-		case "--jsonpath":
-			if !hasValue {
-				i++
-				if i >= len(tokens) {
-					return opts, nil, fmt.Errorf("--jsonpath requires a value")
-				}
-				value = tokens[i]
-			}
-			opts.jsonpath = value
-			expression, err := expr.Compile(value)
-			if err != nil {
-				return opts, nil, err
-			}
-			opts.jsonExpr = expression
-		case "--cwd":
-			if !hasValue {
-				i++
-				if i >= len(tokens) {
-					return opts, nil, fmt.Errorf("--cwd requires a value")
-				}
-				value = tokens[i]
-			}
-			opts.cwd = value
-		case "--env":
-			if !hasValue {
-				i++
-				if i >= len(tokens) {
-					return opts, nil, fmt.Errorf("--env requires a value")
-				}
-				value = tokens[i]
-			}
-			if !strings.Contains(value, "=") {
-				return opts, nil, fmt.Errorf("--env must use KEY=VALUE")
-			}
-			opts.env = append(opts.env, value)
-		case "--max-output-bytes":
-			if !hasValue {
-				i++
-				if i >= len(tokens) {
-					return opts, nil, fmt.Errorf("--max-output-bytes requires a value")
-				}
-				value = tokens[i]
-			}
-			n, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || n < 0 {
-				return opts, nil, fmt.Errorf("invalid --max-output-bytes %q", value)
-			}
-			opts.maxOutputBytes = n
-		default:
-			remaining = append(remaining, token)
-		}
-	}
-	return opts, remaining, nil
+func isSeparatorBefore(args []string, i int) bool {
+	return args[i] == "--" && i+1 < len(args) && isBackend(args[i+1])
 }
 
 func splitConditionSegments(args []string) ([][]string, error) {
@@ -544,7 +530,7 @@ func splitConditionSegments(args []string) ([][]string, error) {
 	var segments [][]string
 	var current []string
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--" && i+1 < len(args) && isBackend(args[i+1]) {
+		if isSeparatorBefore(args, i) {
 			if len(current) == 0 {
 				return nil, fmt.Errorf("empty condition before --")
 			}
@@ -559,19 +545,6 @@ func splitConditionSegments(args []string) ([][]string, error) {
 	}
 	segments = append(segments, current)
 	return segments, nil
-}
-
-func firstBackendIndex(args []string) int {
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if arg == "--" {
-			return -1
-		}
-		if isBackend(arg) {
-			return i
-		}
-	}
-	return -1
 }
 
 func isBackend(arg string) bool {
@@ -594,7 +567,7 @@ func reportFromOutcome(out runner.Outcome) output.Report {
 	report := output.Report{
 		Status:          string(out.Status),
 		Satisfied:       out.Satisfied(),
-		Mode:            out.Mode.String(),
+		Mode:            string(out.Mode),
 		ElapsedSeconds:  output.Seconds(out.Elapsed),
 		TimeoutSeconds:  output.Seconds(out.Timeout),
 		IntervalSeconds: output.Seconds(out.Interval),
@@ -650,56 +623,65 @@ Usage:
   waitfor [flags] <backend> ... -- <backend> ...
 
 Global flags:
-  --timeout duration     Global deadline (default: 5m)
-  --interval duration    Poll interval (default: 2s)
+  --timeout duration       Global deadline (default: 5m)
+  --interval duration      Poll interval (default: 2s)
   --attempt-timeout duration
-                         Per-attempt deadline (default: global remaining time)
-  --output string        Output format: text|json (default: text)
-  --mode string          Condition mode: all|any (default: all)
-  --verbose              Show each attempt
+                           Per-attempt deadline; 0 disables (default: 0)
+  --output text|json       Output format (default: text); JSON goes to stdout
+  --mode all|any           Condition mode (default: all)
+  --verbose                Show each poll attempt
 
 HTTP:
-  waitfor http URL [flags]
-  --status 200|2xx          Expected status code or class
-  --method GET              HTTP method
-  --body text               Request body
-  --body-file path          Request body from file
-  --body-contains text      Required response substring
-  --body-matches regex      Required response regex
-  --jsonpath expr           Required JSON expression
-  --header K=V              Request header
-  --no-follow-redirects     Do not follow redirects
+  waitfor http [flags] URL
+  --status 200|2xx         Expected status code or class (default: 200)
+  --method GET             HTTP method (default: GET)
+  --body text              Request body string
+  --body-file path         Request body from file (mutually exclusive with --body)
+  --body-contains text     Required response body substring
+  --body-matches regex     Required response body regex
+  --jsonpath expr          Required JSON expression on response body
+  --header Key=Value       Request header (repeatable; Key: Value also accepted)
+  --insecure               Skip TLS certificate verification
+  --no-follow-redirects    Do not follow HTTP redirects
 
 TCP:
   waitfor tcp HOST:PORT
 
 Exec:
   waitfor exec [flags] -- COMMAND [ARGS...]
-  --exit-code 0             Expected exit code
-  --output-contains text    Required stdout/stderr substring
-  --jsonpath expr           Required stdout JSON expression
-  --cwd path                Working directory
-  --env K=V                 Extra environment variable
-  --max-output-bytes N      Capture at most N bytes
+  --exit-code 0            Expected exit code (default: 0)
+  --output-contains text   Required stdout/stderr substring
+  --jsonpath expr          Required JSON expression on stdout
+  --cwd path               Working directory for the command
+  --env KEY=VALUE          Extra environment variable (repeatable)
+  --max-output-bytes N     Capture at most N bytes of output (default: unlimited)
 
 File:
-  waitfor file PATH [exists|deleted|nonempty] [--contains text]
+  waitfor file PATH [exists|deleted|nonempty]
+  --contains text          Required file content substring (only with exists/nonempty)
 
 Kubernetes:
-  waitfor k8s RESOURCE [--condition Ready] [--namespace default] [--jsonpath expr] [--kubeconfig path]
+  waitfor k8s [flags] RESOURCE
+  RESOURCE format: kind/name  (e.g. pod/myapp, deployment/api, job/migrate)
+  --condition type         Condition type to check (default: Ready)
+  --jsonpath expr          JSON expression on the resource (mutually exclusive with --condition)
+  --namespace ns           Namespace (default: default)
+  --kubeconfig path        Path to kubeconfig file
 
 Examples:
   waitfor http https://api.example.com/health --status 200
   waitfor tcp localhost:5432
   waitfor file /tmp/ready.flag exists
   waitfor exec --output-contains Running -- kubectl get pod myapp
+  waitfor k8s deployment/api --condition Available
   waitfor --timeout 10m http https://api.example.com/health -- tcp localhost:5432
 
 Exit codes:
-  0    conditions satisfied
-  1    timeout
+  0    all (or any) conditions satisfied
+  1    timeout expired
   2    invalid arguments or configuration
-  3    unrecoverable condition failure
-  130  cancelled by SIGINT, SIGTERM, or parent context
+  3    unrecoverable condition failure (e.g. command not found, bad k8s config)
+  130  cancelled by SIGINT or parent context cancellation
+  143  cancelled by SIGTERM
 `
 }

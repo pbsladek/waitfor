@@ -3,26 +3,18 @@ package runner
 import (
 	"context"
 	"errors"
-	"sync"
 	"time"
 
 	"github.com/pbsladek/wait-for/internal/condition"
 	"golang.org/x/sync/errgroup"
 )
 
-type Mode int
+type Mode string
 
 const (
-	ModeAll Mode = iota
-	ModeAny
+	ModeAll Mode = "all"
+	ModeAny Mode = "any"
 )
-
-func (m Mode) String() string {
-	if m == ModeAny {
-		return "any"
-	}
-	return "all"
-}
 
 type Status string
 
@@ -89,18 +81,40 @@ func (o Outcome) Fatal() bool {
 	return o.Status == StatusFatal
 }
 
-func Run(ctx context.Context, cfg Config) (Outcome, error) {
+func validateRunConfig(cfg Config) error {
 	if len(cfg.Conditions) == 0 {
-		return Outcome{}, errors.New("at least one condition is required")
+		return errors.New("at least one condition is required")
 	}
 	if cfg.Timeout <= 0 {
-		return Outcome{}, errors.New("timeout must be positive")
+		return errors.New("timeout must be positive")
 	}
 	if cfg.Interval <= 0 {
-		return Outcome{}, errors.New("interval must be positive")
+		return errors.New("interval must be positive")
 	}
 	if cfg.PerAttemptTimeout < 0 {
-		return Outcome{}, errors.New("per-attempt timeout cannot be negative")
+		return errors.New("per-attempt timeout cannot be negative")
+	}
+	return nil
+}
+
+func finalStatus(ctx context.Context, records []ConditionResult, mode Mode) Status {
+	if outcomeSatisfied(records, mode) {
+		return StatusSatisfied
+	}
+	for _, rec := range records {
+		if rec.Fatal {
+			return StatusFatal
+		}
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return StatusTimeout
+	}
+	return StatusCancelled
+}
+
+func Run(ctx context.Context, cfg Config) (Outcome, error) {
+	if err := validateRunConfig(cfg); err != nil {
+		return Outcome{}, err
 	}
 	if cfg.PerAttemptTimeout > cfg.Timeout {
 		cfg.PerAttemptTimeout = cfg.Timeout
@@ -118,21 +132,17 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 		records[i].Name = desc.DisplayName()
 	}
 
-	var mu sync.Mutex
 	g, runCtx := errgroup.WithContext(ctx)
-
 	for i, cond := range cfg.Conditions {
 		i := i
 		cond := cond
 		g.Go(func() error {
-			runCondition(runCtx, cond, cfg, start, &records[i], &mu, cancel)
+			runCondition(runCtx, cond, cfg, start, &records[i], cancel)
 			return nil
 		})
 	}
-
 	_ = g.Wait()
 
-	mu.Lock()
 	out := Outcome{
 		Mode:              cfg.Mode,
 		Elapsed:           time.Since(start),
@@ -140,30 +150,66 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 		Interval:          cfg.Interval,
 		PerAttemptTimeout: cfg.PerAttemptTimeout,
 		Conditions:        append([]ConditionResult(nil), records...),
+		Status:            finalStatus(ctx, records, cfg.Mode),
 	}
-	mu.Unlock()
-
-	fatal := false
-	for _, rec := range out.Conditions {
-		if rec.Fatal {
-			fatal = true
-			break
-		}
-	}
-	if fatal {
-		out.Status = StatusFatal
-		return out, nil
-	}
-	if outcomeSatisfied(out.Conditions, cfg.Mode) {
-		out.Status = StatusSatisfied
-		return out, nil
-	}
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		out.Status = StatusTimeout
-		return out, nil
-	}
-	out.Status = StatusCancelled
 	return out, nil
+}
+
+// makeAttemptContext returns a child context with a per-attempt deadline.
+// When timeout is 0, it returns ctx and a no-op cancel.
+func makeAttemptContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout > 0 {
+		return context.WithTimeout(ctx, timeout)
+	}
+	return ctx, func() {}
+}
+
+// updateRecord writes a single check result into the per-condition record.
+func updateRecord(record *ConditionResult, result condition.Result, conditionStart, globalStart time.Time) {
+	record.Elapsed = time.Since(conditionStart)
+	record.Detail = result.Detail
+	if result.Err != nil {
+		record.LastError = result.Err.Error()
+	}
+	if result.Status == condition.CheckFatal {
+		record.Fatal = true
+	}
+	if result.Status == condition.CheckSatisfied {
+		record.Satisfied = true
+	}
+}
+
+// buildAttemptEvent constructs the callback payload for one check attempt.
+func buildAttemptEvent(record *ConditionResult, attempt int, result condition.Result, globalStart time.Time) AttemptEvent {
+	event := AttemptEvent{
+		Name:      record.Name,
+		Attempt:   attempt,
+		Satisfied: result.Status == condition.CheckSatisfied,
+		Detail:    result.Detail,
+		Elapsed:   time.Since(globalStart),
+	}
+	if result.Err != nil {
+		event.Error = result.Err.Error()
+	}
+	return event
+}
+
+// waitInterval blocks until the poll interval elapses or ctx is cancelled.
+// Returns true if the interval completed normally, false if ctx was cancelled.
+func waitInterval(ctx context.Context, timer *time.Timer, interval time.Duration) bool {
+	timer.Reset(interval)
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		return false
+	}
 }
 
 func runCondition(
@@ -172,10 +218,14 @@ func runCondition(
 	cfg Config,
 	start time.Time,
 	record *ConditionResult,
-	mu *sync.Mutex,
 	cancel context.CancelFunc,
 ) {
 	conditionStart := time.Now()
+	timer := time.NewTimer(cfg.Interval)
+	if !timer.Stop() {
+		<-timer.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -183,71 +233,30 @@ func runCondition(
 		default:
 		}
 
-		attempt := 0
-		mu.Lock()
 		record.Attempts++
-		attempt = record.Attempts
-		mu.Unlock()
+		attempt := record.Attempts
 
-		attemptCtx := ctx
-		attemptCancel := func() {}
-		if cfg.PerAttemptTimeout > 0 {
-			attemptCtx, attemptCancel = context.WithTimeout(ctx, cfg.PerAttemptTimeout)
-		}
+		attemptCtx, attemptCancel := makeAttemptContext(ctx, cfg.PerAttemptTimeout)
 		result := cond.Check(attemptCtx)
 		attemptCancel()
-		checkSatisfied := result.Status == condition.CheckSatisfied
-		checkFatal := result.Status == condition.CheckFatal
-		event := AttemptEvent{
-			Name:      record.Name,
-			Attempt:   attempt,
-			Satisfied: checkSatisfied,
-			Detail:    result.Detail,
-			Elapsed:   time.Since(start),
-		}
-		if result.Err != nil {
-			event.Error = result.Err.Error()
-		}
 
-		mu.Lock()
-		record.Elapsed = time.Since(conditionStart)
-		record.Detail = result.Detail
-		if result.Err != nil {
-			record.LastError = result.Err.Error()
-		}
-		if checkFatal {
-			record.Fatal = true
-		}
-		if checkSatisfied {
-			record.Satisfied = true
-		}
-		mu.Unlock()
-
+		updateRecord(record, result, conditionStart, start)
 		if cfg.OnAttempt != nil {
-			cfg.OnAttempt(event)
+			cfg.OnAttempt(buildAttemptEvent(record, attempt, result, start))
 		}
 
-		if checkFatal {
+		switch result.Status {
+		case condition.CheckFatal:
 			cancel()
 			return
-		}
-		if checkSatisfied {
+		case condition.CheckSatisfied:
 			if cfg.Mode == ModeAny {
 				cancel()
 			}
 			return
 		}
 
-		timer := time.NewTimer(cfg.Interval)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+		if !waitInterval(ctx, timer, cfg.Interval) {
 			return
 		}
 	}

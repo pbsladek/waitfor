@@ -94,7 +94,7 @@ func TestExecuteHTTP(t *testing.T) {
 			t.Fatalf("body = %q, want ping", string(body))
 		}
 		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprint(w, `{"ready":true,"message":"ok"}`)
+		_, _ = fmt.Fprint(w, `{"ready":true,"message":"ok"}`)
 	}))
 	defer server.Close()
 
@@ -125,7 +125,7 @@ func TestExecuteHTTPBodyFile(t *testing.T) {
 			t.Fatalf("body = %q, want from-file", string(body))
 		}
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 	}))
 	defer server.Close()
 
@@ -150,7 +150,7 @@ func TestExecuteTCP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	accepted := make(chan struct{})
 	go func() {
@@ -278,7 +278,6 @@ func TestExecuteParserEdgeCases(t *testing.T) {
 		args []string
 	}{
 		{name: "trailing separator", args: []string{"file", "README.md", "exists", "--"}},
-		{name: "empty segment", args: []string{"--", "file", "README.md", "exists"}},
 		{name: "unknown backend", args: []string{"nope", "target"}},
 		{name: "global flag after backend", args: []string{"file", "README.md", "exists", "--timeout", "1s"}},
 		{name: "exec missing separator", args: []string{"exec", "/bin/echo", "ready"}},
@@ -303,5 +302,174 @@ func TestExecuteMalformedGlobalFlagReportsFlagError(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "--timeout") {
 		t.Fatalf("stderr = %q, want timeout flag error", stderr.String())
+	}
+}
+
+// ── parseGlobal ───────────────────────────────────────────────────────────────
+
+func TestParseGlobalErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{"invalid output format", []string{"--output", "xml", "file", "x"}, "invalid output format"},
+		{"invalid mode", []string{"--mode", "bogus", "file", "x"}, "invalid mode"},
+		{"zero timeout", []string{"--timeout", "0s", "file", "x"}, "timeout must be positive"},
+		{"zero interval", []string{"--interval", "0s", "file", "x"}, "interval must be positive"},
+		{"negative attempt-timeout", []string{"--attempt-timeout=-1ns", "file", "x"}, "attempt-timeout cannot be negative"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := parseGlobal(tt.args)
+			if err == nil {
+				t.Fatalf("parseGlobal() expected error %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("parseGlobal() err = %q, want to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// ── parseKubernetesCondition ──────────────────────────────────────────────────
+
+func TestParseKubernetesConditionSuccess(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment []string
+		wantNS  string
+	}{
+		{"default namespace", []string{"k8s", "pod/myapp"}, "default"},
+		{"explicit namespace", []string{"k8s", "pod/myapp", "--namespace", "prod"}, "prod"},
+		{"with condition flag", []string{"k8s", "deployment/api", "--condition", "Available"}, "default"},
+		{"with kubeconfig flag", []string{"k8s", "pod/myapp", "--kubeconfig", "/tmp/kube"}, "default"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond, err := parseKubernetesCondition(tt.segment)
+			if err != nil {
+				t.Fatalf("parseKubernetesCondition() error = %v", err)
+			}
+			if cond == nil {
+				t.Fatal("parseKubernetesCondition() returned nil condition")
+			}
+		})
+	}
+}
+
+func TestParseKubernetesConditionWithJSONPath(t *testing.T) {
+	cond, err := parseKubernetesCondition([]string{"k8s", "pod/myapp", "--jsonpath", ".status.phase == Running"})
+	if err != nil {
+		t.Fatalf("parseKubernetesCondition() error = %v", err)
+	}
+	if cond == nil {
+		t.Fatal("parseKubernetesCondition() returned nil condition")
+	}
+}
+
+func TestParseKubernetesConditionErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment []string
+		wantErr string
+	}{
+		{"missing resource", []string{"k8s"}, "exactly one RESOURCE"},
+		{"too many args", []string{"k8s", "pod/a", "extra"}, "exactly one RESOURCE"},
+		{"mutual exclusion", []string{"k8s", "pod/a", "--condition", "Ready", "--jsonpath", ".x"}, "mutually exclusive"},
+		{"bad jsonpath", []string{"k8s", "pod/a", "--jsonpath", "  "}, "required"},
+		{"unknown flag", []string{"k8s", "pod/a", "--no-such-flag"}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseKubernetesCondition(tt.segment)
+			if err == nil {
+				t.Fatal("parseKubernetesCondition() expected error, got nil")
+			}
+			if tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("parseKubernetesCondition() err = %q, want to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// ── parseTCPCondition ─────────────────────────────────────────────────────────
+
+func TestParseTCPConditionNoArgs(t *testing.T) {
+	_, err := parseTCPCondition([]string{"tcp"})
+	if err == nil {
+		t.Fatal("parseTCPCondition() expected error for no args, got nil")
+	}
+}
+
+// ── splitConditionSegments ────────────────────────────────────────────────────
+
+func TestSplitConditionSegmentsLeadingDash(t *testing.T) {
+	_, err := splitConditionSegments([]string{"--", "http", "http://x"})
+	if err == nil {
+		t.Fatal("splitConditionSegments() expected error for leading --, got nil")
+	}
+}
+
+// ── exitError ─────────────────────────────────────────────────────────────────
+
+func TestExitErrorMethod(t *testing.T) {
+	e := exitError{code: 2, err: fmt.Errorf("something went wrong")}
+	if got := e.Error(); got != "something went wrong" {
+		t.Fatalf("exitError.Error() = %q, want %q", got, "something went wrong")
+	}
+	nilErr := exitError{code: 1, err: nil}
+	if got := nilErr.Error(); got != "" {
+		t.Fatalf("exitError.Error() (nil err) = %q, want empty", got)
+	}
+}
+
+// ── splitHeader ───────────────────────────────────────────────────────────────
+
+func TestSplitHeaderEmptyKey(t *testing.T) {
+	_, _, ok := splitHeader("=value")
+	if ok {
+		t.Fatal("splitHeader('=value') should return ok=false for empty key")
+	}
+}
+
+func TestSplitHeaderNoSeparator(t *testing.T) {
+	_, _, ok := splitHeader("plain-value-no-separator")
+	if ok {
+		t.Fatal("splitHeader without separator should return ok=false")
+	}
+}
+
+// ── Execute k8s integration paths ────────────────────────────────────────────
+
+func TestExecuteK8sMissingResource(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"k8s"}, nil, &stdout, &stderr)
+	if code != ExitInvalid {
+		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitInvalid, stderr.String())
+	}
+}
+
+func TestExecuteK8sBadJSONPath(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"k8s", "pod/myapp", "--jsonpath", "  "}, nil, &stdout, &stderr)
+	if code != ExitInvalid {
+		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitInvalid, stderr.String())
+	}
+}
+
+func TestExecuteGlobalInvalidOutput(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"--output", "xml", "file", "x", "exists"}, nil, &stdout, &stderr)
+	if code != ExitInvalid {
+		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitInvalid, stderr.String())
+	}
+}
+
+func TestExecuteGlobalInvalidMode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"--mode", "bogus", "file", "x", "exists"}, nil, &stdout, &stderr)
+	if code != ExitInvalid {
+		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitInvalid, stderr.String())
 	}
 }

@@ -41,8 +41,11 @@ func TestMainSignalCancellation(t *testing.T) {
 	if !ok {
 		t.Fatalf("error = %T %v, want *exec.ExitError", err, err)
 	}
-	if code := exitErr.ExitCode(); code != 130 {
-		t.Fatalf("exit code = %d, want 130", code)
+	// ExitCode() == -1 means the process was killed by a signal (re-raised SIGTERM).
+	// ExitCode() == 143 means the fallback os.Exit(143) fired before the signal landed.
+	code := exitErr.ExitCode()
+	if code != -1 && code != 143 {
+		t.Fatalf("exit code = %d, want -1 (signal-killed) or 143 (128+SIGTERM)", code)
 	}
 }
 

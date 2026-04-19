@@ -2,7 +2,6 @@ package condition
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"time"
 )
@@ -17,7 +16,7 @@ func NewTCP(address string) *TCPCondition {
 }
 
 func (c *TCPCondition) Descriptor() Descriptor {
-	return Descriptor{Backend: "tcp", Target: c.Address, Name: fmt.Sprintf("tcp %s", c.Address)}
+	return Descriptor{Backend: "tcp", Target: c.Address}
 }
 
 func (c *TCPCondition) Check(ctx context.Context) Result {

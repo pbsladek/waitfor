@@ -5,7 +5,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strings"
 	"testing"
+
+	"github.com/pbsladek/wait-for/internal/expr"
 )
 
 func TestHTTPConditionSatisfied(t *testing.T) {
@@ -14,14 +18,14 @@ func TestHTTPConditionSatisfied(t *testing.T) {
 			t.Fatalf("header = %q, want yes", got)
 		}
 		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprint(w, `{"ready":true,"message":"ok"}`)
+		_, _ = fmt.Fprint(w, `{"ready":true,"message":"ok"}`)
 	}))
 	defer server.Close()
 
 	cond := NewHTTP(server.URL)
 	cond.ExpectedStatus = http.StatusAccepted
 	cond.BodyContains = "ok"
-	cond.BodyJSONPath = ".ready == true"
+	cond.BodyJSONExpr = expr.MustCompile(".ready == true")
 	cond.Headers["X-Test"] = "yes"
 
 	result := cond.Check(t.Context())
@@ -43,7 +47,7 @@ func TestHTTPConditionStatusRangeRequestBodyAndRegex(t *testing.T) {
 			t.Fatalf("body = %q, want ping", string(body))
 		}
 		w.WriteHeader(http.StatusCreated)
-		fmt.Fprint(w, "service ready")
+		_, _ = fmt.Fprint(w, "service ready")
 	}))
 	defer server.Close()
 
@@ -55,7 +59,7 @@ func TestHTTPConditionStatusRangeRequestBodyAndRegex(t *testing.T) {
 	cond.Method = http.MethodPost
 	cond.StatusMatcher = status
 	cond.RequestBody = []byte("ping")
-	cond.BodyMatches = `ready$`
+	cond.BodyRegex = regexp.MustCompile(`ready$`)
 
 	result := cond.Check(t.Context())
 	if result.Status != CheckSatisfied {
@@ -117,5 +121,78 @@ func TestHTTPConditionStatusMismatch(t *testing.T) {
 	}
 	if result.Err == nil {
 		t.Fatal("Err = nil, want status error")
+	}
+}
+
+func TestHTTPStatusMismatchLongBody(t *testing.T) {
+	long := strings.Repeat("x", 250)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, long, http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	result := NewHTTP(server.URL).Check(t.Context())
+	if result.Status == CheckSatisfied {
+		t.Fatal("expected unsatisfied")
+	}
+	// firstLine truncates to 200 chars
+	if len(result.Detail) > 300 {
+		t.Fatalf("detail too long (%d chars), expected truncation", len(result.Detail))
+	}
+}
+
+func TestParseHTTPStatusMatcherInvalid(t *testing.T) {
+	tests := []string{"999", "abc", "0", "6xx", ""}
+	for _, raw := range tests {
+		m, err := ParseHTTPStatusMatcher(raw)
+		switch raw {
+		case "": // empty becomes "200" — valid
+			if err != nil {
+				t.Fatalf("ParseHTTPStatusMatcher(%q) err = %v, want nil for empty (defaults to 200)", raw, err)
+			}
+		default:
+			if err == nil {
+				t.Fatalf("ParseHTTPStatusMatcher(%q) expected error, got matcher %+v", raw, m)
+			}
+		}
+	}
+}
+
+func TestHTTPStatusMatcherStringBranches(t *testing.T) {
+	// Branch 1: raw is set (normal case)
+	m1, _ := ParseHTTPStatusMatcher("2xx")
+	if m1.String() != "2xx" {
+		t.Fatalf("String() = %q, want 2xx", m1.String())
+	}
+
+	// Branch 2: zero value → default "200"
+	var zero HTTPStatusMatcher
+	if zero.String() != "200" {
+		t.Fatalf("zero.String() = %q, want 200", zero.String())
+	}
+
+	// Branch 3: exact set but raw empty — construct directly
+	withExact := HTTPStatusMatcher{exact: 404}
+	if withExact.String() != "404" {
+		t.Fatalf("withExact.String() = %q, want 404", withExact.String())
+	}
+}
+
+func TestHTTPConditionFatalBadURL(t *testing.T) {
+	cond := NewHTTP("://bad-url")
+	result := cond.Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("expected Fatal for bad URL, got %s", result.Status)
+	}
+}
+
+func TestHTTPDescriptor(t *testing.T) {
+	cond := NewHTTP("http://example.com")
+	d := cond.Descriptor()
+	if d.Backend != "http" {
+		t.Fatalf("Backend = %q, want http", d.Backend)
+	}
+	if d.Target != "http://example.com" {
+		t.Fatalf("Target = %q, want http://example.com", d.Target)
 	}
 }

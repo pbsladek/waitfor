@@ -24,10 +24,8 @@ type HTTPCondition struct {
 	StatusMatcher  HTTPStatusMatcher
 	RequestBody    []byte
 	BodyContains   string
-	BodyMatches    string
-	BodyRegex      *regexp.Regexp
-	BodyJSONPath   string
-	BodyJSONExpr   *expr.Expression
+	BodyRegex      *regexp.Regexp   // pre-compiled; use BodyRegex.String() for display
+	BodyJSONExpr   *expr.Expression // pre-compiled; use BodyJSONExpr.String() for display
 	Insecure       bool
 	NoRedirects    bool
 	Headers        map[string]string
@@ -80,15 +78,14 @@ func (m HTTPStatusMatcher) String() string {
 
 func NewHTTP(url string) *HTTPCondition {
 	return &HTTPCondition{
-		URL:            url,
-		Method:         http.MethodGet,
-		ExpectedStatus: http.StatusOK,
-		Headers:        map[string]string{},
+		URL:     url,
+		Method:  http.MethodGet,
+		Headers: map[string]string{},
 	}
 }
 
 func (c *HTTPCondition) Descriptor() Descriptor {
-	return Descriptor{Backend: "http", Target: c.URL, Name: fmt.Sprintf("http %s", c.URL)}
+	return Descriptor{Backend: "http", Target: c.URL}
 }
 
 func (c *HTTPCondition) Check(ctx context.Context) Result {
@@ -98,7 +95,11 @@ func (c *HTTPCondition) Check(ctx context.Context) Result {
 	}
 	statusMatcher := c.statusMatcher()
 
-	req, err := http.NewRequestWithContext(ctx, method, c.URL, bytes.NewReader(c.RequestBody))
+	var reqBody io.Reader
+	if len(c.RequestBody) > 0 {
+		reqBody = bytes.NewReader(c.RequestBody)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.URL, reqBody)
 	if err != nil {
 		return Fatal(err)
 	}
@@ -110,15 +111,14 @@ func (c *HTTPCondition) Check(ctx context.Context) Result {
 	if err != nil {
 		return Unsatisfied("", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	bodyNeeded := c.BodyContains != "" || c.BodyMatches != "" || c.BodyRegex != nil || c.BodyJSONPath != "" || c.BodyJSONExpr != nil || !statusMatcher.Match(resp.StatusCode)
-	var body []byte
-	if bodyNeeded {
-		body, err = io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
-		if err != nil {
-			return Unsatisfied("", err)
-		}
+	// Always read the full body (capped at 10 MB) so the connection is
+	// returned to the keep-alive pool. Closing without draining discards
+	// the connection on every poll cycle.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	if err != nil {
+		return Unsatisfied("", err)
 	}
 
 	if !statusMatcher.Match(resp.StatusCode) {
@@ -129,46 +129,33 @@ func (c *HTTPCondition) Check(ctx context.Context) Result {
 		return Unsatisfied(detail, errors.New(detail))
 	}
 
-	details := []string{fmt.Sprintf("status %d", resp.StatusCode)}
+	return c.checkResponseBody(body, resp.StatusCode)
+}
+
+func (c *HTTPCondition) checkResponseBody(body []byte, statusCode int) Result {
+	details := []string{fmt.Sprintf("status %d", statusCode)}
 	if c.BodyContains != "" {
 		if !bytes.Contains(body, []byte(c.BodyContains)) {
 			return Unsatisfied("body substring not found", fmt.Errorf("body does not contain %q", c.BodyContains))
 		}
 		details = append(details, fmt.Sprintf("body contains %q", c.BodyContains))
 	}
-	bodyRegex := c.BodyRegex
-	if bodyRegex == nil && c.BodyMatches != "" {
-		var err error
-		bodyRegex, err = regexp.Compile(c.BodyMatches)
-		if err != nil {
-			return Fatal(err)
+	if c.BodyRegex != nil {
+		if !c.BodyRegex.Match(body) {
+			return Unsatisfied("body regex not matched", fmt.Errorf("body does not match %q", c.BodyRegex.String()))
 		}
+		details = append(details, fmt.Sprintf("body matches %q", c.BodyRegex.String()))
 	}
-	if bodyRegex != nil {
-		if !bodyRegex.Match(body) {
-			return Unsatisfied("body regex not matched", fmt.Errorf("body does not match %q", bodyRegex.String()))
-		}
-		details = append(details, fmt.Sprintf("body matches %q", bodyRegex.String()))
-	}
-	bodyExpr := c.BodyJSONExpr
-	if bodyExpr == nil && c.BodyJSONPath != "" {
-		var err error
-		bodyExpr, err = expr.Compile(c.BodyJSONPath)
-		if err != nil {
-			return Fatal(err)
-		}
-	}
-	if bodyExpr != nil {
-		ok, detail, err := bodyExpr.EvaluateJSON(body)
+	if c.BodyJSONExpr != nil {
+		ok, detail, err := c.BodyJSONExpr.EvaluateJSON(body)
 		if err != nil {
 			return Fatal(err)
 		}
 		if !ok {
-			return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied: %s", c.BodyJSONPath))
+			return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied: %s", c.BodyJSONExpr))
 		}
 		details = append(details, detail)
 	}
-
 	return Satisfied(strings.Join(details, ", "))
 }
 
@@ -183,6 +170,17 @@ func (c *HTTPCondition) statusMatcher() HTTPStatusMatcher {
 	return status
 }
 
+func buildInsecureTransport() http.RoundTripper {
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		cloned := base.Clone()
+		cloned.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+		return cloned
+	}
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+	}
+}
+
 func (c *HTTPCondition) client() *http.Client {
 	if c.Client != nil {
 		return c.Client
@@ -193,9 +191,7 @@ func (c *HTTPCondition) client() *http.Client {
 	c.clientOnce.Do(func() {
 		transport := http.DefaultTransport
 		if c.Insecure {
-			transport = &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			}
+			transport = buildInsecureTransport()
 		}
 		c.clientCache = &http.Client{
 			Timeout:   30 * time.Second,

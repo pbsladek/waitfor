@@ -42,3 +42,54 @@ func TestFileConditionNonEmptyWaitsForContent(t *testing.T) {
 		t.Fatal("Satisfied = true, want false")
 	}
 }
+
+func TestFileExistsNotFound(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing")
+	result := NewFile(path, FileExists).Check(t.Context())
+	if result.Status == CheckSatisfied {
+		t.Fatal("exists for missing file should not be satisfied")
+	}
+}
+
+func TestFileDeletedButStillExists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "persistent")
+	if err := os.WriteFile(path, []byte("still here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := NewFile(path, FileDeleted).Check(t.Context())
+	if result.Status == CheckSatisfied {
+		t.Fatal("deleted for existing file should not be satisfied")
+	}
+}
+
+func TestFileContainsNotFound(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log")
+	if err := os.WriteFile(path, []byte("nothing here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := NewFile(path, FileExists)
+	c.Contains = "missing-string"
+	result := c.Check(t.Context())
+	if result.Status == CheckSatisfied {
+		t.Fatal("contains for absent substring should not be satisfied")
+	}
+}
+
+func TestFileNonEmptyMissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ghost")
+	result := NewFile(path, FileNonEmpty).Check(t.Context())
+	if result.Status == CheckSatisfied {
+		t.Fatal("nonempty for missing file should not be satisfied")
+	}
+}
+
+func TestFileDescriptor(t *testing.T) {
+	c := NewFile("/tmp/f", FileExists)
+	d := c.Descriptor()
+	if d.Backend != "file" {
+		t.Fatalf("Backend = %q, want file", d.Backend)
+	}
+	if d.Target != "/tmp/f" {
+		t.Fatalf("Target = %q, want /tmp/f", d.Target)
+	}
+}

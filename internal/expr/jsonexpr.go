@@ -9,8 +9,11 @@ import (
 )
 
 type Expression struct {
+	raw        string
 	comparison jsonComparison
 }
+
+func (e *Expression) String() string { return e.raw }
 
 type jsonComparison struct {
 	path string
@@ -26,7 +29,17 @@ func Compile(raw string) (*Expression, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Expression{comparison: cmp}, nil
+	return &Expression{raw: raw, comparison: cmp}, nil
+}
+
+// MustCompile compiles a JSONPath expression and panics on error.
+// Intended for use in tests and package-level variables.
+func MustCompile(raw string) *Expression {
+	e, err := Compile(raw)
+	if err != nil {
+		panic("expr: MustCompile(" + raw + "): " + err.Error())
+	}
+	return e
 }
 
 func (e *Expression) EvaluateJSON(body []byte) (bool, string, error) {
@@ -62,14 +75,6 @@ func (e *Expression) Evaluate(doc any) (bool, string, error) {
 	return matched, fmt.Sprintf("%s %s %v", cmp.path, cmp.op, want), nil
 }
 
-func EvaluateJSON(body []byte, raw string) (bool, string, error) {
-	expression, err := Compile(raw)
-	if err != nil {
-		return false, "", err
-	}
-	return expression.EvaluateJSON(body)
-}
-
 func parseJSONComparison(expr string) (jsonComparison, error) {
 	expr = strings.TrimSpace(expr)
 	expr = strings.Trim(expr, "'\"")
@@ -78,30 +83,57 @@ func parseJSONComparison(expr string) (jsonComparison, error) {
 	}
 
 	operators := []string{">=", "<=", "==", "!=", ">", "<", "="}
-	for _, op := range operators {
-		if idx := strings.Index(expr, op); idx >= 0 {
-			path := strings.TrimSpace(expr[:idx])
-			want := strings.TrimSpace(expr[idx+len(op):])
-			path = strings.TrimPrefix(strings.TrimSuffix(strings.TrimPrefix(path, "{"), "}"), "{")
-			path = strings.TrimSuffix(path, "}")
-			if path == "" || want == "" {
-				return jsonComparison{}, fmt.Errorf("invalid jsonpath comparison %q", expr)
-			}
-			if op == "=" {
-				op = "=="
-			}
-			return jsonComparison{path: normalizeJSONPath(path), op: op, want: want}, nil
+	if idx, op := findOperator(expr, operators); idx >= 0 {
+		path := strings.TrimSpace(expr[:idx])
+		want := strings.TrimSpace(expr[idx+len(op):])
+		if path == "" || want == "" {
+			return jsonComparison{}, fmt.Errorf("invalid jsonpath comparison %q", expr)
 		}
+		if op == "=" {
+			op = "=="
+		}
+		return jsonComparison{path: normalizeJSONPath(path), op: op, want: want}, nil
 	}
 
 	return jsonComparison{path: normalizeJSONPath(expr)}, nil
 }
 
 func normalizeJSONPath(path string) string {
-	path = strings.TrimSpace(path)
-	path = strings.TrimPrefix(path, "{")
-	path = strings.TrimSuffix(path, "}")
-	return path
+	return strings.Trim(strings.TrimSpace(path), "{}")
+}
+
+// findOperator scans s left-to-right and returns the index and value of the
+// first occurrence of any operator. Longer operators take priority at each
+// position, so ">=" is matched before ">" when both start at the same index.
+func findOperator(s string, operators []string) (int, string) {
+	for i := 0; i < len(s); i++ {
+		for _, op := range operators {
+			if strings.HasPrefix(s[i:], op) {
+				return i, op
+			}
+		}
+	}
+	return -1, ""
+}
+
+func traverseField(cur any, field string) (any, bool) {
+	obj, ok := cur.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	val, ok := obj[field]
+	return val, ok
+}
+
+func traverseIndexes(cur any, indexes []int) (any, bool) {
+	for _, idx := range indexes {
+		arr, ok := cur.([]any)
+		if !ok || idx < 0 || idx >= len(arr) {
+			return nil, false
+		}
+		cur = arr[idx]
+	}
+	return cur, true
 }
 
 func lookupJSONPath(doc any, path string) (any, bool, error) {
@@ -117,21 +149,16 @@ func lookupJSONPath(doc any, path string) (any, bool, error) {
 			return nil, false, err
 		}
 		if field != "" {
-			obj, ok := cur.(map[string]any)
-			if !ok {
-				return nil, false, nil
-			}
-			cur, ok = obj[field]
+			var ok bool
+			cur, ok = traverseField(cur, field)
 			if !ok {
 				return nil, false, nil
 			}
 		}
-		for _, idx := range indexes {
-			arr, ok := cur.([]any)
-			if !ok || idx < 0 || idx >= len(arr) {
-				return nil, false, nil
-			}
-			cur = arr[idx]
+		var ok bool
+		cur, ok = traverseIndexes(cur, indexes)
+		if !ok {
+			return nil, false, nil
 		}
 		remaining = rest
 	}
@@ -179,62 +206,82 @@ func parseLiteral(raw string) (any, error) {
 
 func compareValues(got any, want any, op string) (bool, error) {
 	if got == nil || want == nil {
-		switch op {
-		case "==":
-			return got == want, nil
-		case "!=":
-			return got != want, nil
-		default:
-			return false, fmt.Errorf("cannot compare null with %s", op)
-		}
+		return compareNullable(got, want, op)
 	}
-
 	if gn, ok := asFloat(got); ok {
 		wn, ok := asFloat(want)
 		if !ok {
 			return false, nil
 		}
-		switch op {
-		case "==":
-			return gn == wn, nil
-		case "!=":
-			return gn != wn, nil
-		case ">=":
-			return gn >= wn, nil
-		case "<=":
-			return gn <= wn, nil
-		case ">":
-			return gn > wn, nil
-		case "<":
-			return gn < wn, nil
-		}
+		return compareFloat64(gn, wn, op)
 	}
-
 	if gb, ok := got.(bool); ok {
 		wb, ok := want.(bool)
 		if !ok {
 			return false, nil
 		}
-		switch op {
-		case "==":
-			return gb == wb, nil
-		case "!=":
-			return gb != wb, nil
-		default:
-			return false, fmt.Errorf("operator %s is not supported for booleans", op)
-		}
+		return compareBool(gb, wb, op)
 	}
+	return compareString(toString(got), toString(want), op)
+}
 
-	gs := fmt.Sprint(got)
-	ws := fmt.Sprint(want)
+func compareNullable(got, want any, op string) (bool, error) {
 	switch op {
 	case "==":
-		return gs == ws, nil
+		return got == want, nil
 	case "!=":
-		return gs != ws, nil
+		return got != want, nil
+	default:
+		return false, fmt.Errorf("cannot compare null with %s", op)
+	}
+}
+
+func compareFloat64(a, b float64, op string) (bool, error) {
+	switch op {
+	case "==":
+		return a == b, nil
+	case "!=":
+		return a != b, nil
+	case ">=":
+		return a >= b, nil
+	case "<=":
+		return a <= b, nil
+	case ">":
+		return a > b, nil
+	case "<":
+		return a < b, nil
+	default:
+		return false, fmt.Errorf("operator %s is not supported for numbers", op)
+	}
+}
+
+func compareBool(a, b bool, op string) (bool, error) {
+	switch op {
+	case "==":
+		return a == b, nil
+	case "!=":
+		return a != b, nil
+	default:
+		return false, fmt.Errorf("operator %s is not supported for booleans", op)
+	}
+}
+
+func compareString(a, b, op string) (bool, error) {
+	switch op {
+	case "==":
+		return a == b, nil
+	case "!=":
+		return a != b, nil
 	default:
 		return false, fmt.Errorf("operator %s is only supported for numbers", op)
 	}
+}
+
+func toString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprint(v)
 }
 
 func asFloat(v any) (float64, bool) {
@@ -266,6 +313,10 @@ func truthy(v any) bool {
 		return t != ""
 	case float64:
 		return t != 0
+	case map[string]any:
+		return len(t) > 0
+	case []any:
+		return len(t) > 0
 	default:
 		return !reflect.ValueOf(v).IsZero()
 	}

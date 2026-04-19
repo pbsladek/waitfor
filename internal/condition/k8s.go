@@ -2,14 +2,14 @@ package condition
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
 
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	"github.com/pbsladek/wait-for/internal/expr"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
@@ -26,7 +26,7 @@ type KubernetesCondition struct {
 	Resource   string
 	Namespace  string
 	Condition  string
-	JSONPath   string
+	JSONExpr   *expr.Expression // pre-compiled; use JSONExpr.String() for display
 	Kubeconfig string
 	Getter     KubernetesGetter
 	getterOnce sync.Once
@@ -39,45 +39,64 @@ func NewKubernetes(resource string) *KubernetesCondition {
 }
 
 func (c *KubernetesCondition) Descriptor() Descriptor {
-	return Descriptor{Backend: "k8s", Target: c.Resource, Name: fmt.Sprintf("k8s %s", c.Resource)}
+	return Descriptor{Backend: "k8s", Target: c.Resource}
 }
 
 func (c *KubernetesCondition) Check(ctx context.Context) Result {
-	getter := c.Getter
-	if getter == nil {
-		c.getterOnce.Do(func() {
-			c.getter, c.getterErr = NewDynamicKubernetesGetter(c.Kubeconfig)
-		})
-		if c.getterErr != nil {
-			return Fatal(c.getterErr)
-		}
-		getter = c.getter
+	if err := validateK8sResource(c.Resource); err != nil {
+		return Fatal(err)
 	}
-
+	getter, err := c.resolveGetter()
+	if err != nil {
+		return Fatal(err)
+	}
 	obj, err := getter.Get(ctx, c.Resource, c.Namespace)
 	if err != nil {
 		return Unsatisfied("", err)
 	}
-
-	if c.JSONPath != "" {
-		body, err := json.Marshal(obj)
-		if err != nil {
-			return Fatal(err)
-		}
-		ok, detail, err := EvaluateJSONExpression(body, c.JSONPath)
-		if err != nil {
-			return Fatal(err)
-		}
-		if !ok {
-			return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied: %s", c.JSONPath))
-		}
-		return Satisfied(detail)
+	if c.JSONExpr != nil {
+		return checkK8sJSONExpr(obj, c.JSONExpr)
 	}
-
 	conditionName := c.Condition
 	if conditionName == "" {
 		conditionName = "Ready"
 	}
+	return checkK8sNamedCondition(obj, conditionName)
+}
+
+func validateK8sResource(resource string) error {
+	kind, _, err := splitKubernetesResource(resource)
+	if err != nil {
+		return err
+	}
+	if _, _, err := gvrForKind(kind); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *KubernetesCondition) resolveGetter() (KubernetesGetter, error) {
+	if c.Getter != nil {
+		return c.Getter, nil
+	}
+	c.getterOnce.Do(func() {
+		c.getter, c.getterErr = NewDynamicKubernetesGetter(c.Kubeconfig)
+	})
+	return c.getter, c.getterErr
+}
+
+func checkK8sJSONExpr(obj map[string]any, jsonExpr *expr.Expression) Result {
+	ok, detail, err := jsonExpr.Evaluate(obj)
+	if err != nil {
+		return Fatal(err)
+	}
+	if !ok {
+		return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied: %s", jsonExpr))
+	}
+	return Satisfied(detail)
+}
+
+func checkK8sNamedCondition(obj map[string]any, conditionName string) Result {
 	conditions, ok, err := unstructured.NestedSlice(obj, "status", "conditions")
 	if err != nil {
 		return Fatal(err)

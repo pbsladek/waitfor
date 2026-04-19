@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"time"
 )
@@ -65,7 +66,7 @@ func (p *Printer) Start(count int, timeout time.Duration, interval time.Duration
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	fmt.Fprintf(p.w, "[waitfor] checking %d condition(s) (timeout: %s, interval: %s)\n", count, timeout, interval)
+	_, _ = fmt.Fprintf(p.w, "[waitfor] checking %d condition(s) (timeout: %s, interval: %s)\n", count, timeout, interval)
 }
 
 func (p *Printer) Attempt(event Attempt) {
@@ -78,14 +79,14 @@ func (p *Printer) Attempt(event Attempt) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if event.Satisfied {
-		fmt.Fprintf(p.w, "[waitfor] [ok] %s (attempt %d, %.1fs) %s\n", event.Name, event.Attempt, event.Elapsed.Seconds(), event.Detail)
+		_, _ = fmt.Fprintf(p.w, "[waitfor] [ok] %s (attempt %d, %.1fs) %s\n", event.Name, event.Attempt, event.Elapsed.Seconds(), event.Detail)
 		return
 	}
 	if event.Error != "" {
-		fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", event.Name, event.Attempt, event.Error)
+		_, _ = fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", event.Name, event.Attempt, event.Error)
 		return
 	}
-	fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", event.Name, event.Attempt, event.Detail)
+	_, _ = fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", event.Name, event.Attempt, event.Detail)
 }
 
 func (p *Printer) Outcome(report Report) error {
@@ -94,26 +95,30 @@ func (p *Printer) Outcome(report Report) error {
 	}
 	switch report.Status {
 	case "satisfied":
-		fmt.Fprintf(p.w, "[waitfor] conditions satisfied in %.3fs\n", report.ElapsedSeconds)
+		_, _ = fmt.Fprintf(p.w, "[waitfor] conditions satisfied in %.3fs\n", report.ElapsedSeconds)
 		return nil
 	case "fatal":
-		fmt.Fprintf(p.w, "[waitfor] stopped after %.3fs due to unrecoverable error\n", report.ElapsedSeconds)
+		_, _ = fmt.Fprintf(p.w, "[waitfor] stopped after %.3fs due to unrecoverable error\n", report.ElapsedSeconds)
 	case "cancelled":
-		fmt.Fprintf(p.w, "[waitfor] cancelled after %.3fs\n", report.ElapsedSeconds)
+		_, _ = fmt.Fprintf(p.w, "[waitfor] cancelled after %.3fs\n", report.ElapsedSeconds)
 	default:
-		fmt.Fprintf(p.w, "[waitfor] timeout after %.3fs\n", report.ElapsedSeconds)
+		_, _ = fmt.Fprintf(p.w, "[waitfor] timeout after %.3fs\n", report.ElapsedSeconds)
 	}
-	for _, rec := range report.Conditions {
+	p.printUnsatisfiedConditions(report.Conditions)
+	return nil
+}
+
+func (p *Printer) printUnsatisfiedConditions(conditions []ConditionReport) {
+	for _, rec := range conditions {
 		if rec.Satisfied {
 			continue
 		}
 		if rec.LastError != "" {
-			fmt.Fprintf(p.w, "[waitfor] unsatisfied: %s: %s\n", rec.Name, rec.LastError)
+			_, _ = fmt.Fprintf(p.w, "[waitfor] unsatisfied: %s: %s\n", rec.Name, rec.LastError)
 		} else {
-			fmt.Fprintf(p.w, "[waitfor] unsatisfied: %s\n", rec.Name)
+			_, _ = fmt.Fprintf(p.w, "[waitfor] unsatisfied: %s\n", rec.Name)
 		}
 	}
-	return nil
 }
 
 func WriteJSON(w io.Writer, report Report) error {
@@ -123,7 +128,7 @@ func WriteJSON(w io.Writer, report Report) error {
 }
 
 func roundSeconds(v float64) float64 {
-	return float64(int(v*1000+0.5)) / 1000
+	return math.Round(v*1000) / 1000
 }
 
 func Seconds(d time.Duration) float64 {

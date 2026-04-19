@@ -38,36 +38,40 @@ func (c *FileCondition) Check(ctx context.Context) Result {
 
 	info, err := os.Stat(c.Path)
 	if c.State == FileDeleted {
-		if os.IsNotExist(err) {
-			return Satisfied("file is deleted")
-		}
-		if err != nil {
-			return Unsatisfied("", err)
-		}
-		return Unsatisfied("file still exists", fmt.Errorf("file still exists"))
+		return checkFileDeleted(err)
 	}
-
 	if err != nil {
 		if os.IsNotExist(err) {
 			return Unsatisfied("file does not exist", err)
 		}
 		return Unsatisfied("", err)
 	}
-
 	if c.State == FileNonEmpty && info.Size() == 0 {
 		return Unsatisfied("file is empty", fmt.Errorf("file is empty"))
 	}
-
 	if c.Contains != "" {
-		body, err := os.ReadFile(c.Path)
-		if err != nil {
-			return Unsatisfied("", err)
-		}
-		if !bytes.Contains(body, []byte(c.Contains)) {
-			return Unsatisfied("file substring not found", fmt.Errorf("file does not contain %q", c.Contains))
-		}
-		return Satisfied(fmt.Sprintf("file contains %q", c.Contains))
+		return checkFileContent(c.Path, c.Contains)
 	}
-
 	return Satisfied(string(c.State))
+}
+
+func checkFileDeleted(statErr error) Result {
+	if os.IsNotExist(statErr) {
+		return Satisfied("file is deleted")
+	}
+	if statErr != nil {
+		return Unsatisfied("", statErr)
+	}
+	return Unsatisfied("file still exists", fmt.Errorf("file still exists"))
+}
+
+func checkFileContent(path, contains string) Result {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return Unsatisfied("", err)
+	}
+	if !bytes.Contains(body, []byte(contains)) {
+		return Unsatisfied("file substring not found", fmt.Errorf("file does not contain %q", contains))
+	}
+	return Satisfied(fmt.Sprintf("file contains %q", contains))
 }

@@ -17,8 +17,7 @@ type ExecCondition struct {
 	Command          []string
 	ExpectedExitCode int
 	OutputContains   string
-	OutputJSONPath   string
-	OutputJSONExpr   *expr.Expression
+	OutputJSONExpr   *expr.Expression // pre-compiled; use OutputJSONExpr.String() for display
 	Cwd              string
 	Env              []string
 	MaxOutputBytes   int64
@@ -30,11 +29,11 @@ func NewExec(command []string) *ExecCondition {
 
 func (c *ExecCondition) Descriptor() Descriptor {
 	target := strings.Join(c.Command, " ")
-	return Descriptor{Backend: "exec", Target: target, Name: "exec " + target}
+	return Descriptor{Backend: "exec", Target: target}
 }
 
 func (c *ExecCondition) Check(ctx context.Context) Result {
-	if len(c.Command) == 0 {
+	if len(c.Command) == 0 || c.Command[0] == "" {
 		return Fatal(fmt.Errorf("exec command is required"))
 	}
 
@@ -45,19 +44,12 @@ func (c *ExecCondition) Check(ctx context.Context) Result {
 	}
 	var output limitedBuffer
 	output.limit = c.MaxOutputBytes
-	writer := io.Writer(&output)
-	cmd.Stdout = writer
-	cmd.Stderr = writer
-	err := cmd.Run()
+	cmd.Stdout = io.Writer(&output)
+	cmd.Stderr = io.Writer(&output)
 
-	exitCode := 0
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		} else {
-			return Fatal(err)
-		}
+	exitCode, earlyResult := classifyRunError(cmd.Run(), ctx.Err())
+	if earlyResult != nil {
+		return *earlyResult
 	}
 
 	if exitCode != c.ExpectedExitCode {
@@ -65,9 +57,32 @@ func (c *ExecCondition) Check(ctx context.Context) Result {
 		return Unsatisfied(detail, errors.New(detail))
 	}
 
-	out := output.Bytes()
+	return checkExecOutput(output.Bytes(), output.truncated, exitCode, c)
+}
+
+// classifyRunError maps the error from cmd.Run() to either:
+//   - (exitCode, nil): process exited with non-zero; caller checks exit code
+//   - (0, &Result): a fatal or context-cancelled result; caller should return it
+func classifyRunError(runErr, ctxErr error) (int, *Result) {
+	if runErr == nil {
+		return 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return exitErr.ExitCode(), nil
+	}
+	if ctxErr != nil {
+		r := Unsatisfied("", ctxErr)
+		return 0, &r
+	}
+	r := Fatal(runErr)
+	return 0, &r
+}
+
+// checkExecOutput evaluates the captured output against any configured matchers.
+func checkExecOutput(out []byte, truncated bool, exitCode int, c *ExecCondition) Result {
 	details := []string{fmt.Sprintf("exit code %d", exitCode)}
-	if output.truncated {
+	if truncated {
 		details = append(details, fmt.Sprintf("output truncated to %d bytes", c.MaxOutputBytes))
 	}
 	if c.OutputContains != "" {
@@ -76,25 +91,16 @@ func (c *ExecCondition) Check(ctx context.Context) Result {
 		}
 		details = append(details, fmt.Sprintf("output contains %q", c.OutputContains))
 	}
-	if c.OutputJSONPath != "" || c.OutputJSONExpr != nil {
-		outputExpr := c.OutputJSONExpr
-		if outputExpr == nil {
-			var err error
-			outputExpr, err = expr.Compile(c.OutputJSONPath)
-			if err != nil {
-				return Fatal(err)
-			}
-		}
-		ok, detail, err := outputExpr.EvaluateJSON(out)
+	if c.OutputJSONExpr != nil {
+		ok, detail, err := c.OutputJSONExpr.EvaluateJSON(out)
 		if err != nil {
 			return Fatal(err)
 		}
 		if !ok {
-			return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied: %s", c.OutputJSONPath))
+			return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied: %s", c.OutputJSONExpr))
 		}
 		details = append(details, detail)
 	}
-
 	return Satisfied(strings.Join(details, ", "))
 }
 
@@ -108,7 +114,7 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 	if b.limit <= 0 {
 		return b.Buffer.Write(p)
 	}
-	remaining := b.limit - int64(b.Buffer.Len())
+	remaining := b.limit - int64(b.Len())
 	if remaining <= 0 {
 		b.truncated = true
 		return len(p), nil
