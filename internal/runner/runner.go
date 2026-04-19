@@ -98,13 +98,13 @@ func validateRunConfig(cfg Config) error {
 }
 
 func finalStatus(ctx context.Context, records []ConditionResult, mode Mode) Status {
-	if outcomeSatisfied(records, mode) {
-		return StatusSatisfied
-	}
 	for _, rec := range records {
 		if rec.Fatal {
 			return StatusFatal
 		}
+	}
+	if outcomeSatisfied(records, mode) {
+		return StatusSatisfied
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return StatusTimeout

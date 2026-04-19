@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/pbsladek/wait-for/internal/condition"
 )
 
 func TestExecuteFileJSON(t *testing.T) {
@@ -248,6 +250,17 @@ func TestExecuteInvalidArgs(t *testing.T) {
 	}
 }
 
+func TestExecuteInvalidHTTPURLDoesNotEchoSensitiveInput(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"http", "https://user:pass@"}, nil, &stdout, &stderr)
+	if code != ExitInvalid {
+		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitInvalid, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "user") || strings.Contains(stderr.String(), "pass") {
+		t.Fatalf("stderr = %q leaked sensitive URL input", stderr.String())
+	}
+}
+
 func TestSplitConditionSegments(t *testing.T) {
 	tests := []struct {
 		name string
@@ -257,6 +270,8 @@ func TestSplitConditionSegments(t *testing.T) {
 		{name: "single", args: []string{"file", "README.md", "exists"}, want: 1},
 		{name: "multiple", args: []string{"file", "README.md", "exists", "--", "tcp", "127.0.0.1:1"}, want: 2},
 		{name: "bare separator inside exec command", args: []string{"exec", "--", "/bin/echo", "--", "not-a-backend"}, want: 1},
+		{name: "exec command named backend", args: []string{"exec", "--", "http", "--version"}, want: 1},
+		{name: "condition after exec command", args: []string{"exec", "--", "/bin/true", "--", "http", "http://example.com"}, want: 2},
 	}
 
 	for _, tt := range tests {
@@ -269,6 +284,27 @@ func TestSplitConditionSegments(t *testing.T) {
 				t.Fatalf("len(splitConditionSegments()) = %d, want %d: %#v", len(got), tt.want, got)
 			}
 		})
+	}
+}
+
+func TestParseExecConditionCommandNamedBackend(t *testing.T) {
+	segments, err := splitConditionSegments([]string{"exec", "--", "http", "--version"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 {
+		t.Fatalf("len(segments) = %d, want 1: %#v", len(segments), segments)
+	}
+	cond, err := parseExecCondition(segments[0])
+	if err != nil {
+		t.Fatalf("parseExecCondition() error = %v", err)
+	}
+	execCond, ok := cond.(*condition.ExecCondition)
+	if !ok {
+		t.Fatalf("condition type = %T, want *condition.ExecCondition", cond)
+	}
+	if got := strings.Join(execCond.Command, " "); got != "http --version" {
+		t.Fatalf("command = %q, want %q", got, "http --version")
 	}
 }
 
@@ -329,6 +365,54 @@ func TestParseGlobalErrors(t *testing.T) {
 				t.Fatalf("parseGlobal() err = %q, want to contain %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestParseBodyContentRejectsOversizedBodyFile(t *testing.T) {
+	bodyPath := filepath.Join(t.TempDir(), "body.txt")
+	body := bytes.Repeat([]byte("x"), maxHTTPBodyFileBytes+1)
+	if err := os.WriteFile(bodyPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := parseBodyContent("", bodyPath)
+	if err == nil {
+		t.Fatal("parseBodyContent() expected oversized body file error, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("parseBodyContent() err = %q, want size error", err)
+	}
+}
+
+func TestParseBodyContentRejectsNonRegularBodyFile(t *testing.T) {
+	_, err := parseBodyContent("", t.TempDir())
+	if err == nil {
+		t.Fatal("parseBodyContent() expected non-regular body file error, got nil")
+	}
+	if !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("parseBodyContent() err = %q, want regular file error", err)
+	}
+}
+
+func TestExecuteExecRejectsZeroMaxOutputBytes(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{
+		"exec", "--max-output-bytes", "0", "--", "/bin/sh", "-c", "printf ok",
+	}, nil, &stdout, &stderr)
+	if code != ExitInvalid {
+		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitInvalid, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "max-output-bytes") {
+		t.Fatalf("stderr = %q, want max-output-bytes error", stderr.String())
+	}
+}
+
+func TestValidateEnvVarsDoesNotEchoSensitiveInput(t *testing.T) {
+	err := validateEnvVars([]string{"super-secret-token"})
+	if err == nil {
+		t.Fatal("validateEnvVars() expected error, got nil")
+	}
+	if strings.Contains(err.Error(), "super-secret-token") {
+		t.Fatalf("err = %q leaked invalid env input", err)
 	}
 }
 

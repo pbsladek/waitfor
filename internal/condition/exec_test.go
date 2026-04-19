@@ -39,6 +39,13 @@ func TestExecConditionExpectedExitCode(t *testing.T) {
 	}
 }
 
+func TestExecConditionDefaultOutputLimit(t *testing.T) {
+	cond := NewExec([]string{"/bin/sh", "-c", "printf ok"})
+	if cond.MaxOutputBytes != DefaultMaxOutputBytes {
+		t.Fatalf("MaxOutputBytes = %d, want %d", cond.MaxOutputBytes, DefaultMaxOutputBytes)
+	}
+}
+
 func TestExecConditionCwdEnvAndOutputLimit(t *testing.T) {
 	dir := t.TempDir()
 	cond := NewExec([]string{"/bin/sh", "-c", "printf '%s:%s:abcdef' \"$PWD\" \"$WAITFOR_TEST\""})
@@ -63,6 +70,9 @@ func TestExecConditionCommandNotFoundIsFatal(t *testing.T) {
 	if result.Status != CheckFatal {
 		t.Fatalf("Status = %s, want %s", result.Status, CheckFatal)
 	}
+	if strings.Contains(result.Err.Error(), "/definitely/missing/waitfor-command") {
+		t.Fatalf("Err = %q leaked command path", result.Err)
+	}
 }
 
 func TestExecDescriptor(t *testing.T) {
@@ -73,6 +83,54 @@ func TestExecDescriptor(t *testing.T) {
 	}
 	if !strings.Contains(d.Target, "/bin/sh") {
 		t.Fatalf("Target = %q, want to contain /bin/sh", d.Target)
+	}
+	if strings.Contains(d.Target, "exit 0") {
+		t.Fatalf("Target = %q leaked command args", d.Target)
+	}
+}
+
+func TestExecDescriptorRedactsAllArgs(t *testing.T) {
+	cond := NewExec([]string{
+		"deploy",
+		"--token", "secret-token",
+		"--password=secret-password",
+		"Authorization: Bearer abc",
+	})
+	d := cond.Descriptor()
+	for _, leaked := range []string{"secret-token", "secret-password", "Bearer abc"} {
+		if strings.Contains(d.Target, leaked) {
+			t.Fatalf("Target = %q leaked %q", d.Target, leaked)
+		}
+	}
+	if d.Target != "deploy [args redacted]" {
+		t.Fatalf("Target = %q, want executable with args redacted", d.Target)
+	}
+}
+
+func TestExecOutputContainsDetailDoesNotExposeSecret(t *testing.T) {
+	cond := NewExec([]string{"/bin/sh", "-c", "printf secret-token"})
+	cond.OutputContains = "secret-token"
+	result := cond.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("Status = %s, err = %v", result.Status, result.Err)
+	}
+	if strings.Contains(result.Detail, "secret-token") {
+		t.Fatalf("Detail = %q leaked secret", result.Detail)
+	}
+}
+
+func TestExecJSONPathErrorDoesNotExposeExpressionValue(t *testing.T) {
+	cond := NewExec([]string{"/bin/sh", "-c", `printf '{"token":"actual"}'`})
+	cond.OutputJSONExpr = expr.MustCompile(".token == expected-secret")
+	result := cond.Check(t.Context())
+	if result.Status != CheckUnsatisfied {
+		t.Fatalf("Status = %s, want %s", result.Status, CheckUnsatisfied)
+	}
+	if result.Err == nil {
+		t.Fatal("Err = nil, want jsonpath unsatisfied error")
+	}
+	if strings.Contains(result.Err.Error(), "expected-secret") || strings.Contains(result.Detail, "expected-secret") {
+		t.Fatalf("jsonpath output leaked expected value: detail=%q err=%q", result.Detail, result.Err)
 	}
 }
 

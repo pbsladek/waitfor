@@ -3,6 +3,7 @@ package condition
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -72,6 +73,47 @@ func TestFileContainsNotFound(t *testing.T) {
 	result := c.Check(t.Context())
 	if result.Status == CheckSatisfied {
 		t.Fatal("contains for absent substring should not be satisfied")
+	}
+	if result.Err == nil {
+		t.Fatal("Err = nil, want missing substring error")
+	}
+	if strings.Contains(result.Err.Error(), "missing-string") {
+		t.Fatalf("Err = %q leaked requested substring", result.Err)
+	}
+}
+
+func TestFileContainsDoesNotReadPastLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxFileContainsBytes); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte("needle"), maxFileContainsBytes); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewFile(path, FileExists)
+	c.Contains = "needle"
+	result := c.Check(t.Context())
+	if result.Status == CheckSatisfied {
+		t.Fatal("contains past scan limit should not be satisfied")
+	}
+}
+
+func TestFileContainsRejectsDirectory(t *testing.T) {
+	c := NewFile(t.TempDir(), FileExists)
+	c.Contains = "needle"
+	result := c.Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("Status = %s, want %s", result.Status, CheckFatal)
 	}
 }
 

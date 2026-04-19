@@ -1,7 +1,7 @@
 BINARY := waitfor
 PKG := ./cmd/waitfor
 
-.PHONY: build build-linux build-arm test test-e2e lint coverage release clean
+.PHONY: build build-linux build-arm test test-e2e test-integration test-integration-k8s lint coverage release clean
 
 build:
 	go build -o bin/$(BINARY) $(PKG)
@@ -17,6 +17,12 @@ test:
 
 test-e2e:
 	go test -v ./e2e/...
+
+test-integration:
+	WAITFOR_BLACKBOX=1 go test -count=1 -v ./integration/...
+
+test-integration-k8s:
+	WAITFOR_BLACKBOX=1 WAITFOR_BLACKBOX_K8S=1 go test -count=1 -v ./integration/...
 
 lint:
 	golangci-lint run

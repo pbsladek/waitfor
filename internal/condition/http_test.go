@@ -1,10 +1,12 @@
 package condition
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strings"
 	"testing"
@@ -125,9 +127,9 @@ func TestHTTPConditionStatusMismatch(t *testing.T) {
 }
 
 func TestHTTPStatusMismatchLongBody(t *testing.T) {
-	long := strings.Repeat("x", 250)
+	secretBody := "secret-token-" + strings.Repeat("x", 250)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, long, http.StatusServiceUnavailable)
+		http.Error(w, secretBody, http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
 
@@ -135,10 +137,87 @@ func TestHTTPStatusMismatchLongBody(t *testing.T) {
 	if result.Status == CheckSatisfied {
 		t.Fatal("expected unsatisfied")
 	}
-	// firstLine truncates to 200 chars
-	if len(result.Detail) > 300 {
-		t.Fatalf("detail too long (%d chars), expected truncation", len(result.Detail))
+	if strings.Contains(result.Detail, "secret-token") || strings.Contains(result.Err.Error(), "secret-token") {
+		t.Fatalf("status mismatch leaked response body: detail=%q err=%q", result.Detail, result.Err)
 	}
+}
+
+func TestHTTPMatcherDetailsDoNotExposeSecrets(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "secret-token")
+	}))
+	defer server.Close()
+
+	contains := NewHTTP(server.URL)
+	contains.BodyContains = "secret-token"
+	result := contains.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("contains status = %s, err = %v", result.Status, result.Err)
+	}
+	if strings.Contains(result.Detail, "secret-token") {
+		t.Fatalf("contains detail leaked secret: %q", result.Detail)
+	}
+
+	regex := NewHTTP(server.URL)
+	regex.BodyRegex = regexp.MustCompile("secret-token")
+	result = regex.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("regex status = %s, err = %v", result.Status, result.Err)
+	}
+	if strings.Contains(result.Detail, "secret-token") {
+		t.Fatalf("regex detail leaked secret: %q", result.Detail)
+	}
+}
+
+func TestHTTPJSONPathErrorDoesNotExposeExpressionValue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"token":"actual"}`)
+	}))
+	defer server.Close()
+
+	cond := NewHTTP(server.URL)
+	cond.BodyJSONExpr = expr.MustCompile(".token == expected-secret")
+	result := cond.Check(t.Context())
+	if result.Status != CheckUnsatisfied {
+		t.Fatalf("Status = %s, want %s", result.Status, CheckUnsatisfied)
+	}
+	if result.Err == nil {
+		t.Fatal("Err = nil, want jsonpath unsatisfied error")
+	}
+	if strings.Contains(result.Err.Error(), "expected-secret") || strings.Contains(result.Detail, "expected-secret") {
+		t.Fatalf("jsonpath output leaked expected value: detail=%q err=%q", result.Detail, result.Err)
+	}
+}
+
+func TestHTTPErrorRedactsSensitiveURLParts(t *testing.T) {
+	rawURL := "https://user:pass@example.com/health?token=secret&ready=true"
+	cond := NewHTTP(rawURL)
+	cond.Client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, &url.Error{Op: "Get", URL: rawURL, Err: errors.New("dial " + rawURL)}
+	})}
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckUnsatisfied {
+		t.Fatalf("Status = %s, want %s", result.Status, CheckUnsatisfied)
+	}
+	if result.Err == nil {
+		t.Fatal("Err = nil, want redacted URL error")
+	}
+	got := result.Err.Error()
+	for _, leaked := range []string{"user", "pass", "secret"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("error = %q leaked %q", got, leaked)
+		}
+	}
+	if strings.Contains(got, "ready=true") {
+		t.Fatalf("error = %q leaked query value", got)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func TestParseHTTPStatusMatcherInvalid(t *testing.T) {
@@ -194,5 +273,18 @@ func TestHTTPDescriptor(t *testing.T) {
 	}
 	if d.Target != "http://example.com" {
 		t.Fatalf("Target = %q, want http://example.com", d.Target)
+	}
+}
+
+func TestHTTPDescriptorRedactsSensitiveURLParts(t *testing.T) {
+	cond := NewHTTP("https://user:pass@example.com/health?token=secret&ready=true&api_key=k")
+	d := cond.Descriptor()
+	if strings.Contains(d.Target, "user") || strings.Contains(d.Target, "pass") ||
+		strings.Contains(d.Target, "secret") || strings.Contains(d.Target, "api_key=k") ||
+		strings.Contains(d.Target, "ready=true") {
+		t.Fatalf("Target = %q, want sensitive values redacted", d.Target)
+	}
+	if !strings.Contains(d.Target, "ready=REDACTED") {
+		t.Fatalf("Target = %q, want query values redacted", d.Target)
 	}
 }

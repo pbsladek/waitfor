@@ -2,6 +2,7 @@ package expr
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -47,6 +48,28 @@ func TestEvaluateJSONRejectsInvalidPath(t *testing.T) {
 	_, _, err = expression.EvaluateJSON([]byte(`{"ready":true}`))
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestEvaluateDetailsDoNotExposeValues(t *testing.T) {
+	body := []byte(`{"token":"super-secret","ready":true}`)
+
+	truthyExpr := MustCompile(".token")
+	_, detail, err := truthyExpr.EvaluateJSON(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(detail, "super-secret") {
+		t.Fatalf("detail = %q, want secret value redacted", detail)
+	}
+
+	compareExpr := MustCompile(".token == super-secret")
+	_, detail, err = compareExpr.EvaluateJSON(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(detail, "super-secret") {
+		t.Fatalf("detail = %q, want expected value redacted", detail)
 	}
 }
 

@@ -61,7 +61,7 @@ func (e *Expression) Evaluate(doc any) (bool, string, error) {
 	}
 
 	if cmp.op == "" {
-		return truthy(got), fmt.Sprintf("%s is %v", cmp.path, got), nil
+		return truthy(got), fmt.Sprintf("%s is truthy", cmp.path), nil
 	}
 
 	want, err := parseLiteral(cmp.want)
@@ -72,7 +72,7 @@ func (e *Expression) Evaluate(doc any) (bool, string, error) {
 	if err != nil {
 		return false, "", err
 	}
-	return matched, fmt.Sprintf("%s %s %v", cmp.path, cmp.op, want), nil
+	return matched, fmt.Sprintf("%s %s expected value", cmp.path, cmp.op), nil
 }
 
 func parseJSONComparison(expr string) (jsonComparison, error) {
@@ -87,7 +87,7 @@ func parseJSONComparison(expr string) (jsonComparison, error) {
 		path := strings.TrimSpace(expr[:idx])
 		want := strings.TrimSpace(expr[idx+len(op):])
 		if path == "" || want == "" {
-			return jsonComparison{}, fmt.Errorf("invalid jsonpath comparison %q", expr)
+			return jsonComparison{}, fmt.Errorf("invalid jsonpath comparison")
 		}
 		if op == "=" {
 			op = "=="
@@ -138,7 +138,7 @@ func traverseIndexes(cur any, indexes []int) (any, bool) {
 
 func lookupJSONPath(doc any, path string) (any, bool, error) {
 	if !strings.HasPrefix(path, ".") {
-		return nil, false, fmt.Errorf("jsonpath must start with '.' or '{.': %q", path)
+		return nil, false, fmt.Errorf("jsonpath must start with '.' or '{.'")
 	}
 	cur := doc
 	remaining := strings.TrimPrefix(path, ".")
@@ -171,16 +171,16 @@ func splitJSONPathPart(part string) (string, []int, error) {
 	for rest != "" {
 		raw, tail, ok := strings.Cut(rest, "]")
 		if !ok {
-			return "", nil, fmt.Errorf("invalid jsonpath index in %q", part)
+			return "", nil, fmt.Errorf("invalid jsonpath index")
 		}
 		idx, err := strconv.Atoi(raw)
 		if err != nil {
-			return "", nil, fmt.Errorf("invalid jsonpath index %q", raw)
+			return "", nil, fmt.Errorf("invalid jsonpath index")
 		}
 		indexes = append(indexes, idx)
 		rest = strings.TrimPrefix(tail, "[")
 		if tail != "" && !strings.HasPrefix(tail, "[") {
-			return "", nil, fmt.Errorf("invalid jsonpath segment %q", part)
+			return "", nil, fmt.Errorf("invalid jsonpath segment")
 		}
 	}
 	return field, indexes, nil

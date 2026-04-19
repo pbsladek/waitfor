@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 )
+
+const maxFileContainsBytes int64 = 10 * 1024 * 1024
 
 type FileState string
 
@@ -50,7 +53,10 @@ func (c *FileCondition) Check(ctx context.Context) Result {
 		return Unsatisfied("file is empty", fmt.Errorf("file is empty"))
 	}
 	if c.Contains != "" {
-		return checkFileContent(c.Path, c.Contains)
+		if !info.Mode().IsRegular() {
+			return Fatal(fmt.Errorf("file content checks require a regular file"))
+		}
+		return checkFileContent(ctx, c.Path, c.Contains)
 	}
 	return Satisfied(string(c.State))
 }
@@ -65,13 +71,28 @@ func checkFileDeleted(statErr error) Result {
 	return Unsatisfied("file still exists", fmt.Errorf("file still exists"))
 }
 
-func checkFileContent(path, contains string) Result {
-	body, err := os.ReadFile(path)
+func checkFileContent(ctx context.Context, path, contains string) Result {
+	select {
+	case <-ctx.Done():
+		return Unsatisfied("", ctx.Err())
+	default:
+	}
+	body, err := readFileContentLimit(path, maxFileContainsBytes)
 	if err != nil {
 		return Unsatisfied("", err)
 	}
 	if !bytes.Contains(body, []byte(contains)) {
-		return Unsatisfied("file substring not found", fmt.Errorf("file does not contain %q", contains))
+		return Unsatisfied("file substring not found", fmt.Errorf("file does not contain required substring"))
 	}
-	return Satisfied(fmt.Sprintf("file contains %q", contains))
+	return Satisfied("file contains required substring")
+}
+
+func readFileContentLimit(path string, limit int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+
+	return io.ReadAll(io.LimitReader(file, limit))
 }

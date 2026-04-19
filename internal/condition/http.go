@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -40,6 +41,8 @@ type HTTPStatusMatcher struct {
 	class int
 }
 
+var userinfoInURLPattern = regexp.MustCompile(`://[^/\s"@]+@`)
+
 func ParseHTTPStatusMatcher(raw string) (HTTPStatusMatcher, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -50,7 +53,7 @@ func ParseHTTPStatusMatcher(raw string) (HTTPStatusMatcher, error) {
 	}
 	code, err := strconv.Atoi(raw)
 	if err != nil || code < 100 || code > 599 {
-		return HTTPStatusMatcher{}, fmt.Errorf("invalid HTTP status %q", raw)
+		return HTTPStatusMatcher{}, fmt.Errorf("invalid HTTP status")
 	}
 	return HTTPStatusMatcher{raw: raw, exact: code}, nil
 }
@@ -85,7 +88,7 @@ func NewHTTP(url string) *HTTPCondition {
 }
 
 func (c *HTTPCondition) Descriptor() Descriptor {
-	return Descriptor{Backend: "http", Target: c.URL}
+	return Descriptor{Backend: "http", Target: redactHTTPURL(c.URL)}
 }
 
 func (c *HTTPCondition) Check(ctx context.Context) Result {
@@ -101,7 +104,7 @@ func (c *HTTPCondition) Check(ctx context.Context) Result {
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.URL, reqBody)
 	if err != nil {
-		return Fatal(err)
+		return Fatal(redactHTTPError(err))
 	}
 	for key, value := range c.Headers {
 		req.Header.Set(key, value)
@@ -109,7 +112,7 @@ func (c *HTTPCondition) Check(ctx context.Context) Result {
 
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return Unsatisfied("", err)
+		return Unsatisfied("", redactHTTPError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -123,9 +126,6 @@ func (c *HTTPCondition) Check(ctx context.Context) Result {
 
 	if !statusMatcher.Match(resp.StatusCode) {
 		detail := fmt.Sprintf("status %d, expected %s", resp.StatusCode, statusMatcher.String())
-		if trimmed := strings.TrimSpace(string(body)); trimmed != "" {
-			detail = fmt.Sprintf("%s: %s", detail, firstLine(trimmed))
-		}
 		return Unsatisfied(detail, errors.New(detail))
 	}
 
@@ -136,15 +136,15 @@ func (c *HTTPCondition) checkResponseBody(body []byte, statusCode int) Result {
 	details := []string{fmt.Sprintf("status %d", statusCode)}
 	if c.BodyContains != "" {
 		if !bytes.Contains(body, []byte(c.BodyContains)) {
-			return Unsatisfied("body substring not found", fmt.Errorf("body does not contain %q", c.BodyContains))
+			return Unsatisfied("body substring not found", fmt.Errorf("body does not contain required substring"))
 		}
-		details = append(details, fmt.Sprintf("body contains %q", c.BodyContains))
+		details = append(details, "body contains required substring")
 	}
 	if c.BodyRegex != nil {
 		if !c.BodyRegex.Match(body) {
-			return Unsatisfied("body regex not matched", fmt.Errorf("body does not match %q", c.BodyRegex.String()))
+			return Unsatisfied("body regex not matched", fmt.Errorf("body does not match required regex"))
 		}
-		details = append(details, fmt.Sprintf("body matches %q", c.BodyRegex.String()))
+		details = append(details, "body matches required regex")
 	}
 	if c.BodyJSONExpr != nil {
 		ok, detail, err := c.BodyJSONExpr.EvaluateJSON(body)
@@ -152,7 +152,7 @@ func (c *HTTPCondition) checkResponseBody(body []byte, statusCode int) Result {
 			return Fatal(err)
 		}
 		if !ok {
-			return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied: %s", c.BodyJSONExpr))
+			return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied"))
 		}
 		details = append(details, detail)
 	}
@@ -206,10 +206,66 @@ func (c *HTTPCondition) client() *http.Client {
 	return c.clientCache
 }
 
-func firstLine(s string) string {
-	line, _, _ := strings.Cut(s, "\n")
-	if len(line) > 200 {
-		return line[:200]
+func redactHTTPURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
 	}
-	return line
+	if parsed.User != nil {
+		parsed.User = url.User("REDACTED")
+	}
+	query := parsed.Query()
+	changed := false
+	for key := range query {
+		query.Set(key, "REDACTED")
+		changed = true
+	}
+	if changed {
+		parsed.RawQuery = query.Encode()
+	}
+	return parsed.String()
+}
+
+func redactHTTPError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		msg := redactHTTPErrorText(urlErr.Err.Error(), urlErr.URL)
+		return fmt.Errorf("%s %q: %s", urlErr.Op, redactHTTPURL(urlErr.URL), msg)
+	}
+	return err
+}
+
+func redactHTTPErrorText(text, rawURL string) string {
+	redactedURL := redactHTTPURL(rawURL)
+	text = strings.ReplaceAll(text, rawURL, redactedURL)
+	text = userinfoInURLPattern.ReplaceAllString(text, "://REDACTED@")
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return text
+	}
+	text = redactParsedURLUserinfo(text, parsed)
+	return redactQueryValues(text, parsed)
+}
+
+func redactParsedURLUserinfo(text string, parsed *url.URL) string {
+	if parsed.User != nil {
+		if username := parsed.User.Username(); username != "" {
+			text = strings.ReplaceAll(text, username, "REDACTED")
+		}
+		if password, ok := parsed.User.Password(); ok && password != "" {
+			text = strings.ReplaceAll(text, password, "REDACTED")
+		}
+	}
+	return text
+}
+
+func redactQueryValues(text string, parsed *url.URL) string {
+	for _, values := range parsed.Query() {
+		for _, value := range values {
+			if value != "" {
+				text = strings.ReplaceAll(text, value, "REDACTED")
+			}
+		}
+	}
+	return text
 }

@@ -91,7 +91,7 @@ func checkK8sJSONExpr(obj map[string]any, jsonExpr *expr.Expression) Result {
 		return Fatal(err)
 	}
 	if !ok {
-		return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied: %s", jsonExpr))
+		return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied"))
 	}
 	return Satisfied(detail)
 }

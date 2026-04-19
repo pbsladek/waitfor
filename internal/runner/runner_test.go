@@ -172,6 +172,16 @@ func TestRunRecordedFatalTakesPrecedenceOverSatisfaction(t *testing.T) {
 	}
 }
 
+func TestFinalStatusFatalTakesPrecedenceOverModeAnySatisfaction(t *testing.T) {
+	status := finalStatus(t.Context(), []ConditionResult{
+		{Name: "ready", Satisfied: true},
+		{Name: "fatal", Fatal: true},
+	}, ModeAny)
+	if status != StatusFatal {
+		t.Fatalf("Status = %s, want %s", status, StatusFatal)
+	}
+}
+
 type fatalSatisfiedCondition struct{}
 
 func (fatalSatisfiedCondition) Descriptor() condition.Descriptor {

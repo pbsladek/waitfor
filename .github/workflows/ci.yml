@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test
@@ -26,10 +29,37 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Black-box binary integration tests
+        run: make test-integration
+
+  kubernetes-integration:
+    name: Kubernetes Binary Integration
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.2'
+          cache: true
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          wait: 120s
+
+      - name: Kubernetes black-box binary integration tests
+        run: make test-integration-k8s
+
   build:
     name: Build
     runs-on: ubuntu-latest
-    needs: test
+    needs:
+      - test
+      - kubernetes-integration
     strategy:
       matrix:
         include:

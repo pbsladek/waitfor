@@ -26,6 +26,8 @@ const (
 	ExitInvalid   = 2
 	ExitFatal     = 3
 	ExitCancelled = 130
+
+	maxHTTPBodyFileBytes = 10 * 1024 * 1024
 )
 
 type exitError struct {
@@ -253,7 +255,7 @@ func parseCondition(segment []string) (condition.Condition, error) {
 func validateHTTPURL(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return fmt.Errorf("invalid http URL %q", rawURL)
+		return fmt.Errorf("invalid http URL")
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return fmt.Errorf("http URL must use http or https")
@@ -269,7 +271,7 @@ func parseBodyContent(body, bodyFile string) ([]byte, error) {
 		return []byte(body), nil
 	}
 	if bodyFile != "" {
-		data, err := os.ReadFile(bodyFile)
+		data, err := readFileLimit(bodyFile, maxHTTPBodyFileBytes)
 		if err != nil {
 			return nil, fmt.Errorf("read body file: %w", err)
 		}
@@ -283,7 +285,7 @@ func parseHTTPHeaders(rawHeaders []string) (map[string]string, error) {
 	for _, raw := range rawHeaders {
 		key, value, ok := splitHeader(raw)
 		if !ok {
-			return nil, fmt.Errorf("invalid header %q", raw)
+			return nil, fmt.Errorf("invalid header; must use Key: Value or Key=Value")
 		}
 		headers[key] = value
 	}
@@ -296,7 +298,7 @@ func compileHTTPBodyMatchers(bodyMatches, jsonpath string) (*regexp.Regexp, *exp
 		var err error
 		bodyRegex, err = regexp.Compile(bodyMatches)
 		if err != nil {
-			return nil, nil, fmt.Errorf("invalid body regex: %w", err)
+			return nil, nil, fmt.Errorf("invalid body regex")
 		}
 	}
 	var bodyExpr *expr.Expression
@@ -454,7 +456,7 @@ func parseKubernetesCondition(segment []string) (condition.Condition, error) {
 func validateEnvVars(env []string) error {
 	for _, e := range env {
 		if !strings.Contains(e, "=") {
-			return fmt.Errorf("--env must use KEY=VALUE, got %q", e)
+			return fmt.Errorf("--env must use KEY=VALUE")
 		}
 	}
 	return nil
@@ -478,7 +480,7 @@ func parseExecCondition(segment []string) (condition.Condition, error) {
 	jsonpath := ""
 	cwd := ""
 	var env []string
-	maxOutputBytes := int64(0)
+	maxOutputBytes := condition.DefaultMaxOutputBytes
 	fs.IntVar(&exitCode, "exit-code", exitCode, "expected exit code")
 	fs.StringVar(&outputContains, "output-contains", outputContains, "required output substring")
 	fs.StringVar(&jsonpath, "jsonpath", jsonpath, "JSON expression")
@@ -489,10 +491,13 @@ func parseExecCondition(segment []string) (condition.Condition, error) {
 		return nil, err
 	}
 	if args := fs.Args(); len(args) != 0 {
-		return nil, fmt.Errorf("exec flags must precede --: unexpected args: %s", strings.Join(args, " "))
+		return nil, fmt.Errorf("exec flags must precede --")
 	}
 	if err := validateEnvVars(env); err != nil {
 		return nil, err
+	}
+	if maxOutputBytes <= 0 {
+		return nil, fmt.Errorf("--max-output-bytes must be positive")
 	}
 	var outputExpr *expr.Expression
 	if jsonpath != "" {
@@ -513,8 +518,18 @@ func parseExecCondition(segment []string) (condition.Condition, error) {
 	return cond, nil
 }
 
-func isSeparatorBefore(args []string, i int) bool {
-	return args[i] == "--" && i+1 < len(args) && isBackend(args[i+1])
+func isSeparatorBefore(args []string, i int, current []string) bool {
+	if args[i] != "--" || i+1 >= len(args) || !isBackend(args[i+1]) {
+		return false
+	}
+	return !isExecCommandSeparator(current)
+}
+
+func isExecCommandSeparator(current []string) bool {
+	if len(current) == 0 || current[0] != "exec" {
+		return false
+	}
+	return indexOf(current[1:], "--") < 0
 }
 
 func splitConditionSegments(args []string) ([][]string, error) {
@@ -530,7 +545,7 @@ func splitConditionSegments(args []string) ([][]string, error) {
 	var segments [][]string
 	var current []string
 	for i := 0; i < len(args); i++ {
-		if isSeparatorBefore(args, i) {
+		if isSeparatorBefore(args, i, current) {
 			if len(current) == 0 {
 				return nil, fmt.Errorf("empty condition before --")
 			}
@@ -615,6 +630,30 @@ func indexOf(items []string, want string) int {
 	return -1
 }
 
+func readFileLimit(path string, limit int64) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("file must be a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("file exceeds %d bytes", limit)
+	}
+	return data, nil
+}
+
 func helpText() string {
 	return `waitfor - semantic condition poller
 
@@ -636,7 +675,7 @@ HTTP:
   --status 200|2xx         Expected status code or class (default: 200)
   --method GET             HTTP method (default: GET)
   --body text              Request body string
-  --body-file path         Request body from file (mutually exclusive with --body)
+  --body-file path         Request body from file, capped at 10 MiB (mutually exclusive with --body)
   --body-contains text     Required response body substring
   --body-matches regex     Required response body regex
   --jsonpath expr          Required JSON expression on response body
@@ -654,11 +693,11 @@ Exec:
   --jsonpath expr          Required JSON expression on stdout
   --cwd path               Working directory for the command
   --env KEY=VALUE          Extra environment variable (repeatable)
-  --max-output-bytes N     Capture at most N bytes of output (default: unlimited)
+  --max-output-bytes N     Capture at most N bytes of output (default: 1048576)
 
 File:
   waitfor file PATH [exists|deleted|nonempty]
-  --contains text          Required file content substring (only with exists/nonempty)
+  --contains text          Required file content substring in first 10 MiB (only with exists/nonempty)
 
 Kubernetes:
   waitfor k8s [flags] RESOURCE

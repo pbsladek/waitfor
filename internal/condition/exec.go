@@ -13,6 +13,8 @@ import (
 	"github.com/pbsladek/wait-for/internal/expr"
 )
 
+const DefaultMaxOutputBytes int64 = 1024 * 1024
+
 type ExecCondition struct {
 	Command          []string
 	ExpectedExitCode int
@@ -24,11 +26,11 @@ type ExecCondition struct {
 }
 
 func NewExec(command []string) *ExecCondition {
-	return &ExecCondition{Command: command}
+	return &ExecCondition{Command: command, MaxOutputBytes: DefaultMaxOutputBytes}
 }
 
 func (c *ExecCondition) Descriptor() Descriptor {
-	target := strings.Join(c.Command, " ")
+	target := commandTarget(c.Command)
 	return Descriptor{Backend: "exec", Target: target}
 }
 
@@ -75,7 +77,7 @@ func classifyRunError(runErr, ctxErr error) (int, *Result) {
 		r := Unsatisfied("", ctxErr)
 		return 0, &r
 	}
-	r := Fatal(runErr)
+	r := Fatal(errors.New("exec command failed to start"))
 	return 0, &r
 }
 
@@ -87,9 +89,9 @@ func checkExecOutput(out []byte, truncated bool, exitCode int, c *ExecCondition)
 	}
 	if c.OutputContains != "" {
 		if !bytes.Contains(out, []byte(c.OutputContains)) {
-			return Unsatisfied("output substring not found", fmt.Errorf("output does not contain %q", c.OutputContains))
+			return Unsatisfied("output substring not found", fmt.Errorf("output does not contain required substring"))
 		}
-		details = append(details, fmt.Sprintf("output contains %q", c.OutputContains))
+		details = append(details, "output contains required substring")
 	}
 	if c.OutputJSONExpr != nil {
 		ok, detail, err := c.OutputJSONExpr.EvaluateJSON(out)
@@ -97,11 +99,21 @@ func checkExecOutput(out []byte, truncated bool, exitCode int, c *ExecCondition)
 			return Fatal(err)
 		}
 		if !ok {
-			return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied: %s", c.OutputJSONExpr))
+			return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied"))
 		}
 		details = append(details, detail)
 	}
 	return Satisfied(strings.Join(details, ", "))
+}
+
+func commandTarget(command []string) string {
+	if len(command) == 0 {
+		return ""
+	}
+	if len(command) == 1 {
+		return command[0]
+	}
+	return command[0] + " [args redacted]"
 }
 
 type limitedBuffer struct {
