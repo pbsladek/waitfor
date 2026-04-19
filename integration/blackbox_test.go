@@ -577,20 +577,18 @@ metadata:
   name: %s
   namespace: %s
 spec:
+  backoffLimit: 0
   template:
     spec:
       restartPolicy: Never
       containers:
         - name: migrate
-          image: registry.k8s.io/pause:3.10
+          image: registry.k8s.io/e2e-test-images/busybox:1.29-4
+          command: ["sh", "-c", "true"]
 `, job, ns))
 
-	patchErr := patchKubernetesStatusAfter(300*time.Millisecond,
-		"job", job, ns,
-		`{"status":{"succeeded":1,"conditions":[{"type":"Complete","status":"True"}]}}`)
-
 	args := appendKubeconfig([]string{
-		"--timeout", "10s",
+		"--timeout", "30s",
 		"--interval", "200ms",
 		"k8s", "job/" + job,
 		"--namespace", ns,
@@ -598,7 +596,6 @@ spec:
 	})
 	result := runWaitfor(t, args...)
 	requireExitCode(t, result, 0)
-	requireAsyncKubectl(t, patchErr, "patch job status")
 }
 
 func TestBinaryKubernetesStatefulSetJSONPath(t *testing.T) {
