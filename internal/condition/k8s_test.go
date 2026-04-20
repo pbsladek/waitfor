@@ -58,6 +58,36 @@ func TestKubernetesConditionNotReady(t *testing.T) {
 	if result.Status == CheckSatisfied {
 		t.Fatal("Satisfied = true, want false")
 	}
+	if result.Detail != "condition Ready=False" {
+		t.Fatalf("detail = %q, want condition Ready=False", result.Detail)
+	}
+}
+
+func TestKubernetesConditionUnknownUnsatisfied(t *testing.T) {
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme(), podObject("Unknown"))
+	cond := NewKubernetes("pod/myapp")
+	cond.Getter = NewDynamicKubernetesGetterWithClient(client)
+	cond.Condition = "Ready"
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckUnsatisfied {
+		t.Fatalf("status = %s, want unsatisfied", result.Status)
+	}
+	if result.Detail != "condition Ready=Unknown" {
+		t.Fatalf("detail = %q, want condition Ready=Unknown", result.Detail)
+	}
+}
+
+func TestKubernetesConditionNestedJSONPathListIndex(t *testing.T) {
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme(), podObjectWithContainerReady(true))
+	cond := NewKubernetes("pod/myapp")
+	cond.Getter = NewDynamicKubernetesGetterWithClient(client)
+	cond.JSONExpr = expr.MustCompile(".status.containerStatuses[0].ready == true")
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("status = %s, err = %v, detail = %q", result.Status, result.Err, result.Detail)
+	}
 }
 
 func TestKubernetesConditionDefaultConditionReady(t *testing.T) {
@@ -101,6 +131,9 @@ func TestKubernetesConditionNoStatusConditions(t *testing.T) {
 	result := cond.Check(t.Context())
 	if result.Status == CheckSatisfied {
 		t.Fatal("expected unsatisfied when status.conditions missing")
+	}
+	if result.Detail != "status.conditions not found" {
+		t.Fatalf("detail = %q, want status.conditions not found", result.Detail)
 	}
 }
 
@@ -264,6 +297,15 @@ func podObject(ready string) *unstructured.Unstructured {
 		},
 	}}
 	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"})
+	return obj
+}
+
+func podObjectWithContainerReady(ready bool) *unstructured.Unstructured {
+	obj := podObject("True")
+	status := obj.Object["status"].(map[string]any)
+	status["containerStatuses"] = []any{
+		map[string]any{"name": "app", "ready": ready},
+	}
 	return obj
 }
 

@@ -141,7 +141,7 @@ func TestPrinterTextUnsatisfiedConditionsListed(t *testing.T) {
 	var buf bytes.Buffer
 	p := NewPrinter(&buf, FormatText, false)
 	if err := p.Outcome(Report{
-		Status:        "timeout",
+		Status:         "timeout",
 		ElapsedSeconds: 5,
 		Conditions: []ConditionReport{
 			{Name: "http svc", Satisfied: false, LastError: "connection refused"},
@@ -166,16 +166,19 @@ func TestPrinterTextUnsatisfiedNoError(t *testing.T) {
 	var buf bytes.Buffer
 	p := NewPrinter(&buf, FormatText, false)
 	if err := p.Outcome(Report{
-		Status:        "timeout",
+		Status:         "timeout",
 		ElapsedSeconds: 1,
 		Conditions: []ConditionReport{
-			{Name: "file /tmp/f", Satisfied: false},
+			{Name: "file /tmp/f", Satisfied: false, Detail: "file is empty"},
 		},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(buf.String(), "file /tmp/f") {
 		t.Fatalf("output %q missing unsatisfied condition name", buf.String())
+	}
+	if !strings.Contains(buf.String(), "file is empty") {
+		t.Fatalf("output %q missing unsatisfied condition detail", buf.String())
 	}
 }
 

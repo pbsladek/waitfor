@@ -149,7 +149,7 @@ func (c *HTTPCondition) checkResponseBody(body []byte, statusCode int) Result {
 	if c.BodyJSONExpr != nil {
 		ok, detail, err := c.BodyJSONExpr.EvaluateJSON(body)
 		if err != nil {
-			return Fatal(err)
+			return Unsatisfied("jsonpath evaluation failed", err)
 		}
 		if !ok {
 			return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied"))

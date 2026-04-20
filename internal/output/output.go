@@ -113,12 +113,18 @@ func (p *Printer) printUnsatisfiedConditions(conditions []ConditionReport) {
 		if rec.Satisfied {
 			continue
 		}
-		if rec.LastError != "" {
-			_, _ = fmt.Fprintf(p.w, "[waitfor] unsatisfied: %s: %s\n", rec.Name, rec.LastError)
-		} else {
-			_, _ = fmt.Fprintf(p.w, "[waitfor] unsatisfied: %s\n", rec.Name)
-		}
+		_, _ = fmt.Fprintf(p.w, "[waitfor] unsatisfied: %s%s\n", rec.Name, conditionIssue(rec))
 	}
+}
+
+func conditionIssue(rec ConditionReport) string {
+	if rec.LastError != "" {
+		return ": " + rec.LastError
+	}
+	if rec.Detail != "" {
+		return ": " + rec.Detail
+	}
+	return ""
 }
 
 func WriteJSON(w io.Writer, report Report) error {

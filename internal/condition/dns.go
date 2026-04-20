@@ -128,7 +128,57 @@ func (c *DNSCondition) validate() error {
 	if !validDNSRecordType(c.recordType()) {
 		return fmt.Errorf("unsupported dns record type %q", c.RecordType)
 	}
-	if c.resolverMode() == DNSResolverSystem && !systemSupportsRecordType(c.recordType()) {
+	if err := c.validateResolverOptions(); err != nil {
+		return err
+	}
+	if err := c.validateMatchers(); err != nil {
+		return err
+	}
+	return c.validateSystemResolverOptions()
+}
+
+func (c *DNSCondition) validateResolverOptions() error {
+	switch c.resolverMode() {
+	case DNSResolverSystem, DNSResolverWire:
+	default:
+		return fmt.Errorf("unsupported dns resolver %q", c.ResolverMode)
+	}
+	if !validDNSAbsentMode(c.absentMode()) {
+		return fmt.Errorf("unsupported dns absent mode %q", c.AbsentMode)
+	}
+	if !validDNSTransport(c.transport()) {
+		return fmt.Errorf("unsupported dns transport %q", c.Transport)
+	}
+	if c.RCode != "" && !ValidDNSRCode(c.RCode) {
+		return fmt.Errorf("unsupported dns rcode %q", c.RCode)
+	}
+	if c.resolverMode() == DNSResolverWire && c.Server == "" && c.WireExchange == nil {
+		return fmt.Errorf("dns wire resolver requires a server")
+	}
+	return nil
+}
+
+func (c *DNSCondition) validateMatchers() error {
+	if c.MinCount < 0 {
+		return fmt.Errorf("dns min-count cannot be negative")
+	}
+	if c.Absent && (c.Contains != "" || len(c.Equals) > 0 || c.MinCount > 0) {
+		return fmt.Errorf("dns absent cannot be combined with contains, equals, or min-count")
+	}
+	return nil
+}
+
+func (c *DNSCondition) validateSystemResolverOptions() error {
+	if c.resolverMode() != DNSResolverSystem {
+		return nil
+	}
+	if c.RCode != "" {
+		return fmt.Errorf("dns rcode checks require resolver wire")
+	}
+	if c.absentMode() != DNSAbsentAny {
+		return fmt.Errorf("dns absent mode %s requires resolver wire", c.absentMode())
+	}
+	if !systemSupportsRecordType(c.recordType()) {
 		return fmt.Errorf("dns record type %s requires --resolver wire", c.recordType())
 	}
 	return nil
@@ -141,6 +191,9 @@ func (c *DNSCondition) evaluate(response dnsLookupResponse) Result {
 	if c.Absent {
 		return c.checkAbsent(response)
 	}
+	if c.rcodeOnly() {
+		return Satisfied(fmt.Sprintf("rcode %s", response.RCode))
+	}
 	if len(response.Values) == 0 {
 		return Unsatisfied("no records found", fmt.Errorf("no dns records found"))
 	}
@@ -148,6 +201,10 @@ func (c *DNSCondition) evaluate(response dnsLookupResponse) Result {
 		return result
 	}
 	return Satisfied(fmt.Sprintf("%s record found", c.recordType()))
+}
+
+func (c *DNSCondition) rcodeOnly() bool {
+	return c.RCode != "" && c.Contains == "" && len(c.Equals) == 0 && c.MinCount == 0
 }
 
 func (c *DNSCondition) checkRCode(response dnsLookupResponse) (Result, bool) {
@@ -231,17 +288,28 @@ func (c *DNSCondition) lookupWire(ctx context.Context) (dnsLookupResponse, error
 	if c.EDNS0 || c.UDPSize > 0 {
 		msg.UDPSize = c.udpSize()
 	}
-	response, err := c.exchangeWire(ctx, msg, string(c.transport()))
+	response, err := c.exchangeWireResponse(ctx, msg, c.transport())
 	if err != nil {
 		return dnsLookupResponse{}, err
 	}
 	if response.Truncated && c.transport() == DNSTransportUDP {
-		response, err = c.exchangeWire(ctx, msg, string(DNSTransportTCP))
+		response, err = c.exchangeWireResponse(ctx, msg, DNSTransportTCP)
 		if err != nil {
 			return dnsLookupResponse{}, err
 		}
 	}
 	return c.responseFromWire(response), nil
+}
+
+func (c *DNSCondition) exchangeWireResponse(ctx context.Context, msg *wdns.Msg, transport DNSTransport) (*wdns.Msg, error) {
+	response, err := c.exchangeWire(ctx, msg, string(transport))
+	if err != nil {
+		return nil, err
+	}
+	if response == nil {
+		return nil, fmt.Errorf("empty dns response")
+	}
+	return response, nil
 }
 
 func (c *DNSCondition) exchangeWire(ctx context.Context, msg *wdns.Msg, network string) (*wdns.Msg, error) {
@@ -253,7 +321,7 @@ func (c *DNSCondition) exchangeWire(ctx context.Context, msg *wdns.Msg, network 
 }
 
 func (c *DNSCondition) responseFromWire(msg *wdns.Msg) dnsLookupResponse {
-	values := dnsValuesFromRRs(msg.Answer)
+	values := dnsValuesFromRRs(msg.Answer, c.recordType())
 	return dnsLookupResponse{
 		Values:    values,
 		RCode:     dnsRCodeString(msg.Rcode),
@@ -263,12 +331,22 @@ func (c *DNSCondition) responseFromWire(msg *wdns.Msg) dnsLookupResponse {
 	}
 }
 
-func dnsValuesFromRRs(records []wdns.RR) []string {
+func dnsValuesFromRRs(records []wdns.RR, recordType DNSRecordType) []string {
 	values := make([]string, 0, len(records))
 	for _, rr := range records {
+		if !dnsRRMatchesType(rr, recordType) {
+			continue
+		}
 		values = append(values, dnsValueFromRR(rr))
 	}
 	return values
+}
+
+func dnsRRMatchesType(rr wdns.RR, recordType DNSRecordType) bool {
+	if recordType == DNSRecordANY {
+		return true
+	}
+	return wdns.RRToType(rr) == dnsWireTypes[recordType]
 }
 
 func dnsValueFromRR(rr wdns.RR) string {
@@ -354,6 +432,39 @@ func (c *DNSCondition) wireType() uint16 {
 func validDNSRecordType(recordType DNSRecordType) bool {
 	_, ok := dnsWireTypes[recordType]
 	return ok
+}
+
+func validDNSAbsentMode(absentMode DNSAbsentMode) bool {
+	switch absentMode {
+	case DNSAbsentAny, DNSAbsentNXDomain, DNSAbsentNODATA:
+		return true
+	default:
+		return false
+	}
+}
+
+func validDNSTransport(transport DNSTransport) bool {
+	switch transport {
+	case DNSTransportUDP, DNSTransportTCP:
+		return true
+	default:
+		return false
+	}
+}
+
+func ValidDNSRCode(rcode string) bool {
+	_, ok := dnsRCodeValue(rcode)
+	return ok
+}
+
+func dnsRCodeValue(rcode string) (uint16, bool) {
+	want := strings.ToUpper(strings.TrimSpace(rcode))
+	for code, value := range wdns.RcodeToString {
+		if value == want {
+			return code, true
+		}
+	}
+	return 0, false
 }
 
 func systemSupportsRecordType(recordType DNSRecordType) bool {

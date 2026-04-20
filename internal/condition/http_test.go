@@ -189,6 +189,23 @@ func TestHTTPJSONPathErrorDoesNotExposeExpressionValue(t *testing.T) {
 	}
 }
 
+func TestHTTPInvalidJSONBodyUnsatisfied(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "warming up")
+	}))
+	defer server.Close()
+
+	cond := NewHTTP(server.URL)
+	cond.BodyJSONExpr = expr.MustCompile(".ready == true")
+	result := cond.Check(t.Context())
+	if result.Status != CheckUnsatisfied {
+		t.Fatalf("status = %s, want unsatisfied", result.Status)
+	}
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "parse json") {
+		t.Fatalf("err = %v, want parse json error", result.Err)
+	}
+}
+
 func TestHTTPErrorRedactsSensitiveURLParts(t *testing.T) {
 	rawURL := "https://user:pass@example.com/health?token=secret&ready=true"
 	cond := NewHTTP(rawURL)

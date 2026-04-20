@@ -13,8 +13,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pbsladek/wait-for/internal/condition"
+	"github.com/pbsladek/wait-for/internal/output"
+	"github.com/pbsladek/wait-for/internal/runner"
 )
 
 func TestExecuteFileJSON(t *testing.T) {
@@ -37,6 +40,40 @@ func TestExecuteFileJSON(t *testing.T) {
 	}
 	if payload["satisfied"] != true {
 		t.Fatalf("satisfied = %v, want true", payload["satisfied"])
+	}
+}
+
+func TestReportFromOutcomeIncludesCurrentBackendDetails(t *testing.T) {
+	report := reportFromOutcome(runner.Outcome{
+		Status:   runner.StatusTimeout,
+		Mode:     runner.ModeAll,
+		Elapsed:  100 * time.Millisecond,
+		Timeout:  1 * time.Second,
+		Interval: 10 * time.Millisecond,
+		Conditions: []runner.ConditionResult{
+			{Backend: "dns", Target: "example.com", Name: "dns example.com", Attempts: 2, Detail: "rcode NOERROR"},
+			{Backend: "docker", Target: "api", Name: "docker api", Attempts: 1, LastError: "docker container not found: api"},
+			{Backend: "k8s", Target: "pod/api", Name: "k8s pod/api", Attempts: 3, Detail: "condition Ready=False"},
+		},
+	})
+	if len(report.Conditions) != 3 {
+		t.Fatalf("len(conditions) = %d, want 3", len(report.Conditions))
+	}
+	assertConditionReport(t, report.Conditions[0], "dns", "example.com", "rcode NOERROR")
+	assertConditionReport(t, report.Conditions[1], "docker", "api", "docker container not found: api")
+	assertConditionReport(t, report.Conditions[2], "k8s", "pod/api", "condition Ready=False")
+}
+
+func assertConditionReport(t *testing.T, got output.ConditionReport, backend, target, detail string) {
+	t.Helper()
+	if got.Backend != backend {
+		t.Fatalf("backend = %q, want %q", got.Backend, backend)
+	}
+	if got.Target != target {
+		t.Fatalf("target = %q, want %q", got.Target, target)
+	}
+	if got.Detail != detail && got.LastError != detail {
+		t.Fatalf("detail/last_error = %q/%q, want %q", got.Detail, got.LastError, detail)
 	}
 }
 
@@ -272,6 +309,7 @@ func TestSplitConditionSegments(t *testing.T) {
 		{name: "bare separator inside exec command", args: []string{"exec", "--", "/bin/echo", "--", "not-a-backend"}, want: 1},
 		{name: "exec command named backend", args: []string{"exec", "--", "http", "--version"}, want: 1},
 		{name: "condition after exec command", args: []string{"exec", "--", "/bin/true", "--", "http", "http://example.com"}, want: 2},
+		{name: "literal separator flag value before backend token", args: []string{"file", "README.md", "--contains", "--", "http"}, want: 1},
 	}
 
 	for _, tt := range tests {
@@ -284,6 +322,16 @@ func TestSplitConditionSegments(t *testing.T) {
 				t.Fatalf("len(splitConditionSegments()) = %d, want %d: %#v", len(got), tt.want, got)
 			}
 		})
+	}
+}
+
+func TestParseExecConditionRejectsNegativeExitCode(t *testing.T) {
+	_, err := parseExecCondition([]string{"exec", "--exit-code", "-1", "--", "/bin/sh", "-c", "exit 0"})
+	if err == nil {
+		t.Fatal("parseExecCondition() expected negative exit-code error, got nil")
+	}
+	if !strings.Contains(err.Error(), "--exit-code cannot be negative") {
+		t.Fatalf("err = %q, want negative exit-code error", err)
 	}
 }
 
@@ -493,7 +541,7 @@ func TestParseDNSConditionSuccess(t *testing.T) {
 		{"dns", "example.com"},
 		{"dns", "example.com", "--type", "AAAA"},
 		{"dns", "example.com", "--type", "txt", "--contains", "ready"},
-		{"dns", "example.com", "--equals", "192.0.2.10", "--min-count", "1"},
+		{"dns", "example.com", "--equals", "192.0.2.10", "--equals", "192.0.2.11", "--min-count", "1"},
 		{"dns", "example.com", "--absent"},
 		{"dns", "example.com", "--server", "1.1.1.1"},
 		{"dns", "example.com", "--resolver", "wire", "--server", "1.1.1.1", "--type", "MX", "--rcode", "NOERROR"},
@@ -508,6 +556,17 @@ func TestParseDNSConditionSuccess(t *testing.T) {
 		if cond == nil {
 			t.Fatalf("parseDNSCondition(%v) returned nil", segment)
 		}
+	}
+}
+
+func TestParseDNSConditionRepeatableEquals(t *testing.T) {
+	cond, err := parseDNSCondition([]string{"dns", "example.com", "--equals", "192.0.2.10", "--equals", "192.0.2.11"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dnsCond := cond.(*condition.DNSCondition)
+	if got := strings.Join(dnsCond.Equals, ","); got != "192.0.2.10,192.0.2.11" {
+		t.Fatalf("equals = %q, want both values", got)
 	}
 }
 
@@ -527,6 +586,7 @@ func TestParseDNSConditionErrors(t *testing.T) {
 		{"bad absent mode", []string{"dns", "example.com", "--absent-mode", "gone"}, "invalid dns absent-mode"},
 		{"wire-only absent mode", []string{"dns", "example.com", "--absent-mode", "nxdomain"}, "--absent-mode requires"},
 		{"bad transport", []string{"dns", "example.com", "--resolver", "wire", "--server", "1.1.1.1", "--transport", "quic"}, "invalid dns transport"},
+		{"bad rcode", []string{"dns", "example.com", "--resolver", "wire", "--server", "1.1.1.1", "--rcode", "READY"}, "invalid dns rcode"},
 		{"wire-only rcode", []string{"dns", "example.com", "--rcode", "NOERROR"}, "require --resolver wire"},
 		{"bad udp size", []string{"dns", "example.com", "--resolver", "wire", "--server", "1.1.1.1", "--udp-size", "70000"}, "udp-size"},
 		{"wire missing server", []string{"dns", "example.com", "--resolver", "wire"}, "--resolver wire requires --server"},

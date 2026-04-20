@@ -38,8 +38,12 @@ func (c *ExecCondition) Check(ctx context.Context) Result {
 	if len(c.Command) == 0 || c.Command[0] == "" {
 		return Fatal(fmt.Errorf("exec command is required"))
 	}
+	if c.ExpectedExitCode < 0 {
+		return Fatal(fmt.Errorf("exec exit code cannot be negative"))
+	}
 
 	cmd := exec.CommandContext(ctx, c.Command[0], c.Command[1:]...)
+	prepareExecCommand(cmd)
 	cmd.Dir = c.Cwd
 	if len(c.Env) > 0 {
 		cmd.Env = append(os.Environ(), c.Env...)
@@ -69,13 +73,13 @@ func classifyRunError(runErr, ctxErr error) (int, *Result) {
 	if runErr == nil {
 		return 0, nil
 	}
-	var exitErr *exec.ExitError
-	if errors.As(runErr, &exitErr) {
-		return exitErr.ExitCode(), nil
-	}
 	if ctxErr != nil {
 		r := Unsatisfied("", ctxErr)
 		return 0, &r
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return exitErr.ExitCode(), nil
 	}
 	r := Fatal(errors.New("exec command failed to start"))
 	return 0, &r
@@ -96,7 +100,7 @@ func checkExecOutput(out []byte, truncated bool, exitCode int, c *ExecCondition)
 	if c.OutputJSONExpr != nil {
 		ok, detail, err := c.OutputJSONExpr.EvaluateJSON(out)
 		if err != nil {
-			return Fatal(err)
+			return Unsatisfied("jsonpath evaluation failed", err)
 		}
 		if !ok {
 			return Unsatisfied(detail, fmt.Errorf("jsonpath condition not satisfied"))

@@ -78,11 +78,13 @@ supports `A`, `AAAA`, `CNAME`, `TXT`, and `ANY`, including absence checks where
 "not found" is enough. Use `--resolver wire --server ADDRESS` for lower-level
 DNS checks that need exact response codes, NXDOMAIN vs NODATA absence modes,
 transport selection, EDNS0, or record types such as `MX`, `SRV`, `NS`, `CAA`,
-`HTTPS`, and `SVCB`.
+`HTTPS`, and `SVCB`. `--rcode` accepts known DNS response codes and can be used
+by itself to wait for responses such as `SERVFAIL`, `REFUSED`, or `NXDOMAIN`.
 
 Docker polling shells out to the Docker CLI and inspects container state. A
-missing Docker binary is fatal; missing containers or containers in the wrong
-state remain retryable until the timeout.
+missing Docker binary is fatal; missing containers, daemon connection failures,
+or containers in the wrong state remain retryable until the timeout and are
+reported with the last observed inspect detail.
 
 ## JSON Expressions
 

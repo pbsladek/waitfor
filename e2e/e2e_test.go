@@ -720,6 +720,23 @@ func TestDNSLocalhost(t *testing.T) {
 	mustCode(t, cli.ExitSatisfied, "dns", "localhost", "--type", "ANY", "--equals", "127.0.0.1", "--min-count", "1")
 }
 
+func TestDNSJSONOutput(t *testing.T) {
+	stdout, stderr := mustCode(t, cli.ExitSatisfied, "--output", "json", "dns", "localhost", "--type", "ANY", "--min-count", "1")
+	if stderr != "" {
+		t.Fatalf("stderr should be empty in JSON mode, got %q", stderr)
+	}
+	var report output.Report
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, stdout)
+	}
+	if report.Conditions[0].Backend != "dns" {
+		t.Fatalf("backend = %q, want dns", report.Conditions[0].Backend)
+	}
+	if report.Conditions[0].Detail == "" {
+		t.Fatal("dns detail is empty")
+	}
+}
+
 func TestDNSInvalidType(t *testing.T) {
 	code, _, stderr := execute(t, "dns", "localhost", "--type", "BOGUS")
 	if code != cli.ExitInvalid {
@@ -727,6 +744,16 @@ func TestDNSInvalidType(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "invalid dns record type") {
 		t.Fatalf("stderr %q does not mention invalid dns record type", stderr)
+	}
+}
+
+func TestDNSInvalidRCode(t *testing.T) {
+	code, _, stderr := execute(t, "dns", "localhost", "--resolver", "wire", "--server", "1.1.1.1", "--rcode", "READY")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "invalid dns rcode") {
+		t.Fatalf("stderr %q does not mention invalid dns rcode", stderr)
 	}
 }
 

@@ -1,8 +1,12 @@
 package condition
 
 import (
+	"context"
+	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pbsladek/wait-for/internal/expr"
 )
@@ -39,6 +43,37 @@ func TestExecConditionExpectedExitCode(t *testing.T) {
 	}
 }
 
+func TestExecConditionNegativeExpectedExitCodeFatal(t *testing.T) {
+	cond := NewExec([]string{"/bin/sh", "-c", "exit 0"})
+	cond.ExpectedExitCode = -1
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("status = %s, want fatal", result.Status)
+	}
+}
+
+func TestClassifyRunErrorContextCancellationBeatsExitError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 1")
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("cmd.Run() error = nil, want cancellation error")
+	}
+	_, result := classifyRunError(err, ctx.Err())
+	if result == nil {
+		t.Fatal("classifyRunError result = nil, want cancellation result")
+	}
+	if result.Status != CheckUnsatisfied {
+		t.Fatalf("status = %s, want unsatisfied", result.Status)
+	}
+}
+
 func TestExecConditionDefaultOutputLimit(t *testing.T) {
 	cond := NewExec([]string{"/bin/sh", "-c", "printf ok"})
 	if cond.MaxOutputBytes != DefaultMaxOutputBytes {
@@ -57,6 +92,19 @@ func TestExecConditionCwdEnvAndOutputLimit(t *testing.T) {
 	result := cond.Check(t.Context())
 	if result.Status != CheckSatisfied {
 		t.Fatalf("Satisfied = false, err = %v, detail = %q", result.Err, result.Detail)
+	}
+}
+
+func TestExecConditionInvalidJSONOutputUnsatisfied(t *testing.T) {
+	cond := NewExec([]string{"/bin/sh", "-c", "printf 'warming up'"})
+	cond.OutputJSONExpr = expr.MustCompile(".ready == true")
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckUnsatisfied {
+		t.Fatalf("status = %s, want unsatisfied", result.Status)
+	}
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "parse json") {
+		t.Fatalf("err = %v, want parse json error", result.Err)
 	}
 }
 

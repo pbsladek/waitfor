@@ -44,6 +44,11 @@ literal token pair `-- file`, `-- http`, `-- tcp`, `-- dns`, `-- docker`,
 `-- exec`, or `-- k8s` cannot be followed unambiguously by more waitfor
 conditions.
 
+A literal `--` used as the value for a value-taking backend flag is treated as
+that flag's value, not as a condition separator. To continue with another
+condition after such a value, provide a second separator: `--contains -- --
+http https://example.com`.
+
 Global flags:
 
 | Flag | Default | Meaning |
@@ -88,7 +93,9 @@ k8s RESOURCE [--condition TYPE] [--jsonpath EXPR]
 `http` performs one request per check. Network errors, non-matching statuses,
 and body matcher failures are retryable. Invalid URLs, invalid status matchers,
 invalid headers, invalid body regexes, unreadable body files, or invalid JSON
-expressions are argument errors during parsing.
+expressions are argument errors during parsing. Runtime JSON parse or expression
+evaluation failures are retryable because a service may emit non-JSON startup
+output before becoming ready.
 
 The default method is `GET`, default status matcher is `200`, redirects are
 followed unless `--no-follow-redirects` is set, and TLS verification is enabled
@@ -128,7 +135,7 @@ DNS matchers:
 | `--absent-mode any` | Default. Satisfied by NXDOMAIN, NODATA, no answer values, or system resolver "not found" errors. |
 | `--absent-mode nxdomain` | Wire-only. Satisfied only by NXDOMAIN. |
 | `--absent-mode nodata` | Wire-only. Satisfied only by NOERROR with no matching answers. |
-| `--rcode CODE` | Wire-only. Response code must match, such as `NOERROR` or `NXDOMAIN`. |
+| `--rcode CODE` | Wire-only. Response code must be a known DNS RCODE and match, such as `NOERROR`, `SERVFAIL`, `REFUSED`, or `NXDOMAIN`. If no other positive matcher is set, the RCODE match alone satisfies the condition. |
 
 Wire resolver options are valid only with `--resolver wire`. `--server` accepts
 hostnames, IPv4 addresses, bracketed IPv6 addresses, bare IPv6 addresses, or
@@ -136,6 +143,21 @@ explicit `host:port`; the port defaults to `53`. `--transport` is `udp` by
 default. If a UDP response is truncated, the wire resolver retries the query
 over TCP. `--edns0` enables an OPT record; `--udp-size` sets the EDNS0 UDP
 payload size and must be between `0` and `65535`.
+
+Wire answers are filtered to the requested RR type before value matching, except
+for `ANY`, which exposes every answer. CNAME records in an A/AAAA response do
+not satisfy A/AAAA value checks unless a matching address answer is also present.
+Canonical answer values are:
+
+| Type | Value format |
+| ---- | ------------ |
+| `A`, `AAAA` | IP string, such as `192.0.2.10` or `2001:db8::1`. |
+| `CNAME`, `NS` | DNS name with the library's trailing-dot form. Equality ignores case and one trailing dot. |
+| `TXT` | TXT chunks joined without separators. |
+| `MX` | `preference exchange`, such as `10 mail.example.test.` |
+| `SRV` | `priority weight port target`, such as `1 2 443 target.example.test.` |
+| `CAA` | `flag tag value`, such as `0 issue letsencrypt.org`. |
+| `HTTPS`, `SVCB` | DNS library SVCB data string, such as `1 svc.example.test. alpn="h2"`. |
 
 DNS lookup failures are retryable except for validation errors. The backend does
 not write output; answer details flow through the normal runner event and result
@@ -150,8 +172,9 @@ docker inspect --type container --format "{{json .State}}" CONTAINER
 ```
 
 The command output is parsed as Docker's container `.State` object. A missing
-Docker binary is fatal. Missing containers, daemon errors, and non-matching
-state or health are retryable until the global timeout.
+Docker binary is fatal. Missing containers, daemon connection failures, inspect
+errors, and non-matching state or health are retryable until the global timeout.
+Inspect stderr/stdout is capped and included in the last observed error detail.
 
 Valid statuses are `any`, `created`, `running`, `paused`, `restarting`,
 `removing`, `exited`, and `dead`. The default is `running`; `any` disables the
@@ -164,7 +187,9 @@ has no health object.
 `exec` starts the requested command with the attempt context. A missing binary or
 spawn failure is fatal. Non-matching exit codes, output substring failures, and
 JSON expression failures are retryable. Output may be capped with
-`--max-output-bytes`.
+`--max-output-bytes`. `--exit-code` must be non-negative and defaults to `0`.
+On Unix-like platforms, commands are started in a separate process group so
+attempt cancellation kills shell descendants as well as the direct child.
 
 ### File
 
@@ -260,7 +285,10 @@ Text output is optimized for humans. JSON output is stable for scripts:
 ```
 
 Human-readable progress and text summaries are emitted on stderr. JSON output is
-emitted on stdout without progress lines.
+emitted on stdout without progress lines. Timeout, fatal, and cancelled text
+summaries list each unsatisfied condition with the last observed error when
+available, otherwise the last observed detail. JSON condition records carry both
+`detail` and `last_error` when present.
 
 ## Exit Codes
 

@@ -549,6 +549,9 @@ func validateDNSTransportOptions(opts dnsParseOptions) error {
 	if opts.transport != "udp" && opts.transport != "tcp" {
 		return fmt.Errorf("invalid dns transport %q", opts.transport)
 	}
+	if opts.rcode != "" && !condition.ValidDNSRCode(opts.rcode) {
+		return fmt.Errorf("invalid dns rcode %q", strings.ToUpper(opts.rcode))
+	}
 	if usesWireOnlyOptions(opts) && opts.resolverMode != string(condition.DNSResolverWire) {
 		return fmt.Errorf("--rcode, --transport, --edns0, and --udp-size require --resolver wire")
 	}
@@ -716,6 +719,19 @@ func validateEnvVars(env []string) error {
 	return nil
 }
 
+func validateExecOptions(env []string, exitCode int, maxOutputBytes int64) error {
+	if err := validateEnvVars(env); err != nil {
+		return err
+	}
+	if exitCode < 0 {
+		return fmt.Errorf("--exit-code cannot be negative")
+	}
+	if maxOutputBytes <= 0 {
+		return fmt.Errorf("--max-output-bytes must be positive")
+	}
+	return nil
+}
+
 func parseExecCondition(segment []string) (condition.Condition, error) {
 	tokens := segment[1:]
 	separator := indexOf(tokens, "--")
@@ -747,11 +763,8 @@ func parseExecCondition(segment []string) (condition.Condition, error) {
 	if args := fs.Args(); len(args) != 0 {
 		return nil, fmt.Errorf("exec flags must precede --")
 	}
-	if err := validateEnvVars(env); err != nil {
+	if err := validateExecOptions(env, exitCode, maxOutputBytes); err != nil {
 		return nil, err
-	}
-	if maxOutputBytes <= 0 {
-		return nil, fmt.Errorf("--max-output-bytes must be positive")
 	}
 	var outputExpr *expr.Expression
 	if jsonpath != "" {
@@ -776,7 +789,51 @@ func isSeparatorBefore(args []string, i int, current []string) bool {
 	if args[i] != "--" || i+1 >= len(args) || !isBackend(args[i+1]) {
 		return false
 	}
+	if isValueForPreviousFlag(args, i) {
+		return false
+	}
 	return !isExecCommandSeparator(current)
+}
+
+func isValueForPreviousFlag(args []string, i int) bool {
+	if i == 0 {
+		return false
+	}
+	prev := args[i-1]
+	if strings.Contains(prev, "=") {
+		return false
+	}
+	return conditionValueFlags[prev]
+}
+
+var conditionValueFlags = map[string]bool{
+	"--method":           true,
+	"--status":           true,
+	"--header":           true,
+	"--body":             true,
+	"--body-file":        true,
+	"--body-contains":    true,
+	"--body-matches":     true,
+	"--jsonpath":         true,
+	"--type":             true,
+	"--resolver":         true,
+	"--contains":         true,
+	"--equals":           true,
+	"--min-count":        true,
+	"--absent-mode":      true,
+	"--server":           true,
+	"--rcode":            true,
+	"--transport":        true,
+	"--udp-size":         true,
+	"--health":           true,
+	"--namespace":        true,
+	"--condition":        true,
+	"--kubeconfig":       true,
+	"--exit-code":        true,
+	"--output-contains":  true,
+	"--cwd":              true,
+	"--env":              true,
+	"--max-output-bytes": true,
 }
 
 func isExecCommandSeparator(current []string) bool {

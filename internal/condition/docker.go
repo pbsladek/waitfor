@@ -38,6 +38,12 @@ func (c *DockerCondition) Check(ctx context.Context) Result {
 	if strings.TrimSpace(c.Container) == "" {
 		return Fatal(fmt.Errorf("docker container is required"))
 	}
+	if !validDockerStatus(c.status()) {
+		return Fatal(fmt.Errorf("invalid docker status %q", c.Status))
+	}
+	if !validDockerHealth(c.health()) {
+		return Fatal(fmt.Errorf("invalid docker health %q", c.Health))
+	}
 	state, err := c.inspect(ctx)
 	if err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
@@ -59,9 +65,9 @@ func (c *DockerCondition) inspect(ctx context.Context) (DockerState, error) {
 		return c.Inspect(ctx, c.Container)
 	}
 	cmd := exec.CommandContext(ctx, "docker", "inspect", "--type", "container", "--format", "{{json .State}}", c.Container)
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return DockerState{}, err
+		return DockerState{}, classifyDockerInspectError(err, string(out))
 	}
 	var state DockerState
 	if err := json.Unmarshal(out, &state); err != nil {
@@ -75,6 +81,28 @@ func (c *DockerCondition) status() string {
 		return "running"
 	}
 	return strings.ToLower(c.Status)
+}
+
+func (c *DockerCondition) health() string {
+	return strings.ToLower(c.Health)
+}
+
+func validDockerStatus(status string) bool {
+	switch status {
+	case "any", "created", "running", "paused", "restarting", "removing", "exited", "dead":
+		return true
+	default:
+		return false
+	}
+}
+
+func validDockerHealth(health string) bool {
+	switch health {
+	case "", "healthy", "unhealthy", "starting", "none":
+		return true
+	default:
+		return false
+	}
 }
 
 func checkDockerStatus(state DockerState, want string) *Result {
@@ -121,4 +149,36 @@ func dockerDetail(state DockerState) string {
 		detail += ", health " + state.Health.Status
 	}
 	return detail
+}
+
+func classifyDockerInspectError(err error, output string) error {
+	if errors.Is(err, exec.ErrNotFound) {
+		return err
+	}
+	detail := dockerInspectOutput(output)
+	lower := strings.ToLower(detail)
+	switch {
+	case strings.Contains(lower, "cannot connect to the docker daemon"),
+		strings.Contains(lower, "is the docker daemon running"):
+		return fmt.Errorf("docker daemon not running: %s", detail)
+	case strings.Contains(lower, "no such object"),
+		strings.Contains(lower, "no such container"):
+		return fmt.Errorf("docker container not found: %s", detail)
+	case detail != "":
+		return fmt.Errorf("docker inspect failed: %s", detail)
+	default:
+		return fmt.Errorf("docker inspect failed: %w", err)
+	}
+}
+
+func dockerInspectOutput(output string) string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return ""
+	}
+	const maxDockerErrorDetail = 500
+	if len(output) <= maxDockerErrorDetail {
+		return output
+	}
+	return output[:maxDockerErrorDetail] + "...(truncated)"
 }
