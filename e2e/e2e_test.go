@@ -267,17 +267,17 @@ func TestFileExists(t *testing.T) {
 	if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mustCode(t, cli.ExitSatisfied, "file", path, "exists")
+	mustCode(t, cli.ExitSatisfied, "file", path, "--exists")
 }
 
 func TestFileExistsTimeout(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing")
-	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms", "file", path, "exists")
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms", "file", path, "--exists")
 }
 
 func TestFileDeleted(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "will-be-deleted")
-	mustCode(t, cli.ExitSatisfied, "file", path, "deleted")
+	mustCode(t, cli.ExitSatisfied, "file", path, "--deleted")
 }
 
 func TestFileDeletedTimeout(t *testing.T) {
@@ -285,7 +285,7 @@ func TestFileDeletedTimeout(t *testing.T) {
 	if err := os.WriteFile(path, []byte("still here"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms", "file", path, "deleted")
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms", "file", path, "--deleted")
 }
 
 func TestFileNonEmpty(t *testing.T) {
@@ -293,7 +293,7 @@ func TestFileNonEmpty(t *testing.T) {
 	if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mustCode(t, cli.ExitSatisfied, "file", path, "nonempty")
+	mustCode(t, cli.ExitSatisfied, "file", path, "--nonempty")
 }
 
 func TestFileNonEmptyEmptyFileTimeout(t *testing.T) {
@@ -301,7 +301,7 @@ func TestFileNonEmptyEmptyFileTimeout(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms", "file", path, "nonempty")
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms", "file", path, "--nonempty")
 }
 
 func TestFileContains(t *testing.T) {
@@ -314,11 +314,188 @@ func TestFileContains(t *testing.T) {
 		"file", path, "--contains", "not-in-file")
 }
 
-func TestFileInvalidState(t *testing.T) {
+func TestFileMutuallyExclusiveStateFlags(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "f")
-	_, stderr := mustCode(t, cli.ExitInvalid, "file", path, "badstate")
-	if !strings.Contains(stderr, "must be exists, deleted, or nonempty") {
-		t.Fatalf("stderr %q does not mention valid states", stderr)
+	_, stderr := mustCode(t, cli.ExitInvalid, "file", path, "--exists", "--deleted")
+	if !strings.Contains(stderr, "mutually exclusive") {
+		t.Fatalf("stderr %q does not mention mutually exclusive", stderr)
+	}
+}
+
+// ── Log ─────────────────────────────────────────────────────────────────────
+
+func TestLogContainsSatisfied(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("service: ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitSatisfied, "log", path, "--contains", "ready", "--from-start")
+}
+
+func TestLogContainsTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("service: starting\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"log", path, "--contains", "ready", "--from-start")
+}
+
+func TestLogMatchesSatisfied(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("2024-01-01 ERROR: connection timeout\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitSatisfied, "log", path, "--matches", `ERROR:.*timeout`, "--from-start")
+}
+
+func TestLogJSONExprSatisfied(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	lines := `{"level":"info","msg":"starting"}` + "\n" + `{"level":"ready","msg":"up"}` + "\n"
+	if err := os.WriteFile(path, []byte(lines), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitSatisfied, "log", path, "--jsonpath", `.level == "ready"`, "--from-start")
+}
+
+func TestLogNewContentOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	// Write "ready" before waitfor starts — should be skipped without --from-start.
+	if err := os.WriteFile(path, []byte("service: ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"log", path, "--contains", "ready")
+}
+
+func TestLogTailsNewLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("old line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Append matching content after a short delay.
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return
+		}
+		defer func() { _ = f.Close() }()
+		_, _ = f.WriteString("service: ready\n")
+	}()
+
+	mustCode(t, cli.ExitSatisfied, "--timeout", "2s", "--interval", "10ms",
+		"log", path, "--contains", "ready")
+}
+
+func TestLogMissingMatcherIsInvalid(t *testing.T) {
+	mustCode(t, cli.ExitInvalid, "log", "/tmp/app.log")
+}
+
+func TestLogInvalidRegex(t *testing.T) {
+	mustCode(t, cli.ExitInvalid, "log", "/tmp/app.log", "--matches", "[invalid")
+}
+
+func TestLogTailLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	// "ready" is on line 3 of 4; --tail 2 covers lines 3 and 4.
+	content := "line one\nline two\nline three: ready\nline four\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitSatisfied, "log", path, "--contains", "ready", "--tail", "2")
+}
+
+func TestLogTailExcludesOlderLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	// "ready" is only in line one; --tail 2 should not reach it.
+	content := "line one: ready\nline two\nline three\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"log", path, "--contains", "ready", "--tail", "2")
+}
+
+func TestLogFromStartAndTailMutuallyExclusive(t *testing.T) {
+	mustCode(t, cli.ExitInvalid, "log", "/tmp/app.log", "--contains", "x",
+		"--from-start", "--tail", "5")
+}
+
+func TestLogMinMatches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	// Write 3 matching lines up front; --min-matches 3 should be satisfied in one poll.
+	if err := os.WriteFile(path, []byte("heartbeat\nheartbeat\nheartbeat\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitSatisfied, "log", path, "--contains", "heartbeat",
+		"--min-matches", "3", "--from-start")
+}
+
+func TestLogMinMatchesAcrossPolls(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("heartbeat\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Append two more matches after a short delay.
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return
+		}
+		defer func() { _ = f.Close() }()
+		_, _ = f.WriteString("heartbeat\nheartbeat\n")
+	}()
+
+	mustCode(t, cli.ExitSatisfied, "--timeout", "2s", "--interval", "10ms",
+		"log", path, "--contains", "heartbeat", "--min-matches", "3", "--from-start")
+}
+
+func TestLogMinMatchesTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("heartbeat\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"log", path, "--contains", "heartbeat", "--min-matches", "3", "--from-start")
+}
+
+func TestLogExclude(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	// "ready" appears on DEBUG lines (excluded) and one INFO line (matches).
+	content := "DEBUG ready check\nINFO service ready\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitSatisfied, "log", path,
+		"--contains", "ready", "--exclude", `^DEBUG`, "--from-start")
+}
+
+func TestLogExcludeBlocksAllLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("DEBUG ready\nDEBUG ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"log", path, "--contains", "ready", "--exclude", `^DEBUG`, "--from-start")
+}
+
+func TestLogInvalidExcludeRegex(t *testing.T) {
+	mustCode(t, cli.ExitInvalid, "log", "/tmp/app.log", "--contains", "x", "--exclude", "[bad")
+}
+
+func TestLogMatchedLineInJSONDetail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("service ready at port 8080\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _ := mustCode(t, cli.ExitSatisfied, "--output", "json",
+		"log", path, "--contains", "ready", "--from-start")
+	if !strings.Contains(stdout, "port 8080") {
+		t.Fatalf("JSON output %q does not contain matched line content", stdout)
 	}
 }
 
@@ -385,7 +562,7 @@ func TestExecTimeout(t *testing.T) {
 func TestGlobalTimeout(t *testing.T) {
 	start := time.Now()
 	mustCode(t, cli.ExitTimeout, "--timeout", "100ms", "--interval", "50ms",
-		"file", filepath.Join(t.TempDir(), "missing"), "exists")
+		"file", filepath.Join(t.TempDir(), "missing"), "--exists")
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("took %s, expected close to 100ms", elapsed)
 	}
@@ -436,7 +613,7 @@ func TestModeAnyFirstSatisfies(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
 	mustCode(t, cli.ExitSatisfied, "--mode", "any", "--timeout", "2s",
 		"http", server.URL,
-		"--", "file", missing, "exists")
+		"--", "file", missing, "--exists")
 }
 
 func TestModeAllTimeout(t *testing.T) {
@@ -447,7 +624,7 @@ func TestModeAllTimeout(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
 	mustCode(t, cli.ExitTimeout, "--mode", "all", "--timeout", "100ms", "--interval", "20ms",
 		"http", server.URL,
-		"--", "file", missing, "exists")
+		"--", "file", missing, "--exists")
 }
 
 func TestVerboseShowsAttempts(t *testing.T) {
@@ -455,7 +632,7 @@ func TestVerboseShowsAttempts(t *testing.T) {
 	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, stderr := mustCode(t, cli.ExitSatisfied, "--verbose", "file", path, "exists")
+	_, stderr := mustCode(t, cli.ExitSatisfied, "--verbose", "file", path, "--exists")
 	if !strings.Contains(stderr, "[ok]") {
 		t.Fatalf("verbose stderr %q does not contain [ok]", stderr)
 	}
@@ -466,7 +643,7 @@ func TestJSONOutputToStdout(t *testing.T) {
 	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	stdout, stderr := mustCode(t, cli.ExitSatisfied, "--output", "json", "file", path, "exists")
+	stdout, stderr := mustCode(t, cli.ExitSatisfied, "--output", "json", "file", path, "--exists")
 	if stderr != "" {
 		t.Fatalf("stderr should be empty in JSON mode, got %q", stderr)
 	}
@@ -502,7 +679,7 @@ func TestJSONOutputOnTimeout(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
 	stdout, _ := mustCode(t, cli.ExitTimeout,
 		"--output", "json", "--timeout", "50ms", "--interval", "10ms",
-		"file", missing, "exists")
+		"file", missing, "--exists")
 	var report output.Report
 	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, stdout)
@@ -541,7 +718,7 @@ func TestJSONPerAttemptTimeoutField(t *testing.T) {
 	}
 	stdout, _ := mustCode(t, cli.ExitSatisfied,
 		"--output", "json", "--attempt-timeout", "5s",
-		"file", path, "exists")
+		"file", path, "--exists")
 	var report output.Report
 	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
 		t.Fatalf("invalid JSON: %v", err)
@@ -582,7 +759,7 @@ func TestExitCodeSatisfied(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	code, _, _ := execute(t, "file", path, "exists")
+	code, _, _ := execute(t, "file", path, "--exists")
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
@@ -590,7 +767,7 @@ func TestExitCodeSatisfied(t *testing.T) {
 
 func TestExitCodeTimeout(t *testing.T) {
 	code, _, _ := execute(t, "--timeout", "50ms", "--interval", "10ms",
-		"file", filepath.Join(t.TempDir(), "missing"), "exists")
+		"file", filepath.Join(t.TempDir(), "missing"), "--exists")
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1", code)
 	}
@@ -670,14 +847,14 @@ func TestUnknownBackendError(t *testing.T) {
 func TestTimeoutOnStderr(t *testing.T) {
 	_, stderr := mustCode(t, cli.ExitTimeout,
 		"--timeout", "50ms", "--interval", "10ms",
-		"file", filepath.Join(t.TempDir(), "missing"), "exists")
+		"file", filepath.Join(t.TempDir(), "missing"), "--exists")
 	if !strings.Contains(stderr, "timeout") {
 		t.Fatalf("stderr %q does not mention timeout", stderr)
 	}
 }
 
 func TestInvalidFlagError(t *testing.T) {
-	code, _, stderr := execute(t, "--timeout", "notaduration", "file", "x", "exists")
+	code, _, stderr := execute(t, "--timeout", "notaduration", "file", "x")
 	if code != cli.ExitInvalid {
 		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
 	}

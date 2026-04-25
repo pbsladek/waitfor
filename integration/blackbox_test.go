@@ -39,7 +39,7 @@ func TestMain(m *testing.M) {
 	defer func() { _ = os.RemoveAll(dir) }()
 
 	waitforBinary = filepath.Join(dir, "waitfor")
-	cmd := exec.Command("go", "build", "-o", waitforBinary, "./cmd/waitfor")
+	cmd := exec.Command("go", "build", "-o", waitforBinary, "./cmd/waitfor") // #nosec G204 -- test harness builds the local fixed package path.
 	cmd.Dir = root
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -77,6 +77,22 @@ func requireKubernetesBlackbox(t *testing.T) {
 	}
 }
 
+func requireDockerBlackbox(t *testing.T) {
+	t.Helper()
+	requireBlackbox(t)
+	if os.Getenv("WAITFOR_BLACKBOX_DOCKER") != "1" {
+		t.Skip("set WAITFOR_BLACKBOX_DOCKER=1 to run against a real Docker daemon")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Fatalf("docker is required for Docker black-box test: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := docker(ctx, "info"); err != nil {
+		t.Fatalf("docker daemon is required for Docker black-box test: %v", err)
+	}
+}
+
 type commandResult struct {
 	code   int
 	stdout string
@@ -88,7 +104,7 @@ func runWaitfor(t *testing.T, args ...string) commandResult {
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, waitforBinary, args...)
+	cmd := exec.CommandContext(ctx, waitforBinary, args...) // #nosec G204 -- black-box tests execute the just-built local binary with test-controlled args.
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -123,7 +139,7 @@ func TestBinaryFilePolling(t *testing.T) {
 	})
 	defer timer.Stop()
 
-	result := runWaitfor(t, "--timeout", "2s", "--interval", "25ms", "file", path, "exists")
+	result := runWaitfor(t, "--timeout", "2s", "--interval", "25ms", "file", path, "--exists")
 	requireExitCode(t, result, 0)
 }
 
@@ -135,17 +151,17 @@ func TestBinaryFileStatesAndContains(t *testing.T) {
 	if err := os.WriteFile(ready, []byte("service ready\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	requireExitCode(t, runWaitfor(t, "file", ready, "exists"), 0)
-	requireExitCode(t, runWaitfor(t, "file", ready, "nonempty"), 0)
+	requireExitCode(t, runWaitfor(t, "file", ready, "--exists"), 0)
+	requireExitCode(t, runWaitfor(t, "file", ready, "--nonempty"), 0)
 	requireExitCode(t, runWaitfor(t, "file", ready, "--contains", "ready"), 0)
-	requireExitCode(t, runWaitfor(t, "file", filepath.Join(dir, "missing"), "deleted"), 0)
+	requireExitCode(t, runWaitfor(t, "file", filepath.Join(dir, "missing"), "--deleted"), 0)
 }
 
 func TestBinaryTimeoutExitCode(t *testing.T) {
 	requireBlackbox(t)
 
 	missing := filepath.Join(t.TempDir(), "missing")
-	result := runWaitfor(t, "--timeout", "75ms", "--interval", "20ms", "file", missing, "exists")
+	result := runWaitfor(t, "--timeout", "75ms", "--interval", "20ms", "file", missing, "--exists")
 	requireExitCode(t, result, 1)
 }
 
@@ -288,11 +304,11 @@ func TestBinaryModeAllAndAny(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
 
 	requireExitCode(t, runWaitfor(t, "--mode", "any", "--timeout", "500ms", "--interval", "25ms",
-		"file", missing, "exists",
-		"--", "file", ready, "exists"), 0)
+		"file", missing, "--exists",
+		"--", "file", ready, "--exists"), 0)
 	requireExitCode(t, runWaitfor(t, "--mode", "all", "--timeout", "100ms", "--interval", "25ms",
-		"file", ready, "exists",
-		"--", "file", missing, "exists"), 1)
+		"file", ready, "--exists",
+		"--", "file", missing, "--exists"), 1)
 }
 
 func TestBinaryExecPolling(t *testing.T) {
@@ -307,7 +323,7 @@ func TestBinaryExecPolling(t *testing.T) {
 		"exec", "--jsonpath", ".ready == true", "--", "/bin/sh", "-c", script, "waitfor-exec", counter)
 	requireExitCode(t, result, 0)
 
-	body, err := os.ReadFile(counter)
+	body, err := os.ReadFile(counter) // #nosec G304 -- counter path is created by this test in t.TempDir.
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +350,7 @@ func TestBinaryJSONOutputStreams(t *testing.T) {
 	if err := os.WriteFile(path, []byte("ready\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	result := runWaitfor(t, "--output", "json", "file", path, "exists")
+	result := runWaitfor(t, "--output", "json", "file", path, "--exists")
 	requireExitCode(t, result, 0)
 	if result.stderr != "" {
 		t.Fatalf("stderr = %q, want empty for JSON output", result.stderr)
@@ -368,7 +384,7 @@ func TestShellInvokedBinaryQuoting(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", `"$1" --output json file "$2" exists`, "sh", waitforBinary, path)
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", `"$1" --output json file "$2" --exists`, "sh", waitforBinary, path) // #nosec G204 -- test verifies shell quoting with test-controlled arguments.
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -394,6 +410,34 @@ func TestBinaryInvalidArgsExitCode(t *testing.T) {
 
 	result := runWaitfor(t, "tcp", "not-a-host-port")
 	requireExitCode(t, result, 2)
+}
+
+func TestBinaryDockerContainerStatusAndHealthPolling(t *testing.T) {
+	requireDockerBlackbox(t)
+
+	name := fmt.Sprintf("waitfor-blackbox-%d", time.Now().UnixNano())
+	cleanupDockerContainer(t, name)
+	if err := docker(t.Context(),
+		"run",
+		"--detach",
+		"--name", name,
+		"--health-cmd", "test -f /tmp/ready",
+		"--health-interval", "1s",
+		"--health-retries", "30",
+		"busybox:1.36",
+		"sh", "-c", "sleep 60"); err != nil {
+		t.Fatalf("docker run: %v", err)
+	}
+
+	readyErr := dockerExecAfter(500*time.Millisecond, name, "sh", "-c", "touch /tmp/ready")
+	result := runWaitfor(t,
+		"--timeout", "20s",
+		"--interval", "200ms",
+		"docker", name,
+		"--status", "running",
+		"--health", "healthy")
+	requireExitCode(t, result, 0)
+	requireAsyncDocker(t, readyErr, "mark container healthy")
 }
 
 func TestBinaryKubernetesNamespacePolling(t *testing.T) {
@@ -820,6 +864,45 @@ func appendKubeconfig(args []string) []string {
 	return args
 }
 
+func cleanupDockerContainer(t *testing.T, name string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = docker(ctx, "rm", "--force", name)
+	})
+}
+
+func dockerExecAfter(delay time.Duration, name string, args ...string) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		time.Sleep(delay)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		execArgs := append([]string{"exec", name}, args...)
+		errCh <- docker(ctx, execArgs...)
+	}()
+	return errCh
+}
+
+func requireAsyncDocker(t *testing.T, errCh <-chan error, action string) {
+	t.Helper()
+	if err := <-errCh; err != nil {
+		t.Fatalf("docker %s: %v", action, err)
+	}
+}
+
+func docker(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "docker", args...) // #nosec G204 -- integration helper intentionally drives Docker CLI with test-controlled args.
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %s", err, output.String())
+	}
+	return nil
+}
+
 func applyKubernetesYAML(t *testing.T, manifest string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -857,7 +940,7 @@ func kubectl(ctx context.Context, args ...string) error {
 }
 
 func kubectlWithInput(ctx context.Context, input string, args ...string) error {
-	cmd := exec.CommandContext(ctx, "kubectl", args...)
+	cmd := exec.CommandContext(ctx, "kubectl", args...) // #nosec G204 -- integration helper intentionally drives kubectl with test-controlled args.
 	var output bytes.Buffer
 	if input != "" {
 		cmd.Stdin = bytes.NewBufferString(input)

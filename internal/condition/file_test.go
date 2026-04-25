@@ -84,7 +84,7 @@ func TestFileContainsNotFound(t *testing.T) {
 
 func TestFileContainsDoesNotReadPastLimit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "large")
-	file, err := os.Create(path)
+	file, err := os.Create(path) // #nosec G304 -- test creates this path under t.TempDir.
 	if err != nil {
 		t.Fatal(err)
 	}

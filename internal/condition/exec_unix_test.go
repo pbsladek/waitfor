@@ -34,7 +34,7 @@ func TestExecConditionTimeoutKillsUnixProcessGroup(t *testing.T) {
 
 func readPID(t *testing.T, path string) int {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- pid file path is created by this test in t.TempDir.
 	if err != nil {
 		t.Fatalf("ReadFile(%q): %v", path, err)
 	}

@@ -5,13 +5,18 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '17 9 * * 1'
 
 permissions:
   contents: read
 
+env:
+  GO_VERSION: '1.26.2'
+
 jobs:
-  test:
-    name: Tests
+  unit-tests:
+    name: Unit and e2e tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -20,22 +25,19 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.2'
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
       - name: Download dependencies
         run: go mod download
 
-      - name: Test
+      - name: Run Go tests
         run: go test ./...
 
-      - name: Black-box binary integration tests
-        run: make test-integration
-
-  kubernetes-integration:
-    name: Kubernetes Integration Tests
+  binary-integration:
+    name: Binary integration tests
     runs-on: ubuntu-latest
-    needs: test
+    needs: unit-tests
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,23 +45,136 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.2'
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run binary integration tests
+        run: make test-integration
+
+  docker-integration:
+    name: Docker integration tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Check Docker daemon
+        run: docker info
+
+      - name: Run Docker integration tests
+        run: make test-integration-docker
+
+  kubernetes-integration:
+    name: Kubernetes integration tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
       - name: Create kind cluster
         uses: helm/kind-action@v1
         with:
+          cluster_name: waitfor-integration
           wait: 120s
 
-      - name: Kubernetes black-box binary integration tests
+      - name: Check Kubernetes nodes
+        run: kubectl get nodes
+
+      - name: Run Kubernetes integration tests
         run: make test-integration-k8s
 
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          args: ./...
+
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run gosec
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          args: --enable=gosec ./...
+
+  coverage:
+    name: Coverage report
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Generate coverage
+        run: |
+          go test -count=1 -coverpkg=./... -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tee coverage.txt
+          go tool cover -html=coverage.out -o coverage.html
+          awk '/^total:/ { sub(/%/, "", $3); if ($3 < 90) { printf("coverage %.1f%% is below 90%%\n", $3); exit 1 } }' coverage.txt
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage.out
+            coverage.txt
+            coverage.html
+
   build:
-    name: Build Binaries
+    name: Build binaries
     runs-on: ubuntu-latest
     needs:
-      - test
+      - unit-tests
+      - binary-integration
+      - docker-integration
       - kubernetes-integration
+      - lint
+      - security
+      - coverage
     strategy:
       matrix:
         include:
@@ -78,17 +193,17 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.2'
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Build
+      - name: Build binary
         run: go build -trimpath -o "dist/waitfor-${{ matrix.goos }}-${{ matrix.goarch }}" ./cmd/waitfor
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
 
-      - name: Upload artifact
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: waitfor-${{ matrix.goos }}-${{ matrix.goarch }}
