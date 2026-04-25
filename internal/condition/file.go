@@ -88,7 +88,7 @@ func checkFileContent(ctx context.Context, path, contains string) Result {
 }
 
 func readFileContentLimit(path string, limit int64) ([]byte, error) {
-	file, err := os.Open(path)
+	file, err := os.Open(path) // #nosec G304 -- file polling intentionally reads the user-selected target.
 	if err != nil {
 		return nil, err
 	}

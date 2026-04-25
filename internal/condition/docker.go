@@ -64,7 +64,7 @@ func (c *DockerCondition) inspect(ctx context.Context) (DockerState, error) {
 	if c.Inspect != nil {
 		return c.Inspect(ctx, c.Container)
 	}
-	cmd := exec.CommandContext(ctx, "docker", "inspect", "--type", "container", "--format", "{{json .State}}", c.Container)
+	cmd := exec.CommandContext(ctx, "docker", "inspect", "--type", "container", "--format", "{{json .State}}", c.Container) // #nosec G204 -- Docker backend intentionally shells out to docker inspect with the requested container.
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return DockerState{}, classifyDockerInspectError(err, string(out))

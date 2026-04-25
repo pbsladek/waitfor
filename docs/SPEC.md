@@ -23,7 +23,8 @@ Runs have one final status:
 | `dns` | `waitfor dns api.internal --type A --min-count 1` | Uses the system resolver by default or `--resolver wire` for protocol-level checks via `codeberg.org/miekg/dns`; supports exact values, minimum answer counts, absence, selected RCODEs, transport options, and richer RR types. |
 | `docker` | `waitfor docker postgres --status running --health healthy` | Uses `docker inspect` for local container status and health checks. |
 | `exec` | `waitfor exec --output-contains ok -- COMMAND` | Runs a command with context cancellation and checks exit code, output substring, or JSON expression. Supports cwd, env, and output limits. |
-| `file` | `waitfor file PATH exists` | Supports `exists`, `deleted`, `nonempty`, and substring checks. |
+| `file` | `waitfor file PATH --exists` | Supports `--exists`, `--deleted`, `--nonempty`, and substring checks. |
+| `log` | `waitfor log PATH --contains "ready"` | Tails a file and returns satisfied when a matching line appears. Tracks byte offset across polls; detects rotation via inode change. Supports substring, regex, and JSON expression matchers (AND semantics). Default behaviour skips existing content; `--from-start` scans from byte 0. |
 | `k8s` | `waitfor k8s deployment/myapp --condition Available` | Uses client-go dynamic client and supports common built-in Kubernetes resources. |
 
 ## CLI Grammar
@@ -312,4 +313,6 @@ package-level helpers and cover them directly. Unit tests must not require real
 external services; use fakes, injected functions, or local test servers. Real
 binary and cluster coverage belongs in `integration/blackbox_test.go` behind
 opt-in environment variables such as `WAITFOR_BLACKBOX=1` and
-`WAITFOR_BLACKBOX_K8S=1`.
+`WAITFOR_BLACKBOX_DOCKER=1` and `WAITFOR_BLACKBOX_K8S=1`. CI should publish
+coverage artifacts, enforce total coverage at or above 90%, and keep security
+linting enabled separately from the normal lint pass.

@@ -18,10 +18,10 @@ func TestMainSignalCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(exe, "-test.run=TestMainHelperProcess", "--",
+	cmd := exec.Command(exe, "-test.run=TestMainHelperProcess", "--", // #nosec G204 -- test re-executes the current test binary as a controlled helper process.
 		"--timeout", "5s",
 		"--interval", "50ms",
-		"file", "/tmp/waitfor-signal-test-definitely-missing", "exists",
+		"file", "/tmp/waitfor-signal-test-definitely-missing", "--exists",
 	)
 	cmd.Env = append(os.Environ(), "WAITFOR_HELPER_PROCESS=1")
 	if err := cmd.Start(); err != nil {

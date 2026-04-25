@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/pflag"
 )
 
+
 const (
 	ExitSatisfied = 0
 	ExitTimeout   = 1
@@ -232,28 +233,28 @@ func parseConditions(args []string) ([]condition.Condition, error) {
 	return conditions, nil
 }
 
+type backendParser func([]string) (condition.Condition, error)
+
+var backendParsers = map[string]backendParser{
+	"http":   parseHTTPCondition,
+	"tcp":    parseTCPCondition,
+	"exec":   parseExecCondition,
+	"file":   parseFileCondition,
+	"log":    parseLogCondition,
+	"k8s":    parseKubernetesCondition,
+	"dns":    parseDNSCondition,
+	"docker": parseDockerCondition,
+}
+
 func parseCondition(segment []string) (condition.Condition, error) {
 	if len(segment) == 0 {
 		return nil, fmt.Errorf("empty condition")
 	}
-	switch segment[0] {
-	case "http":
-		return parseHTTPCondition(segment)
-	case "tcp":
-		return parseTCPCondition(segment)
-	case "exec":
-		return parseExecCondition(segment)
-	case "file":
-		return parseFileCondition(segment)
-	case "k8s":
-		return parseKubernetesCondition(segment)
-	case "dns":
-		return parseDNSCondition(segment)
-	case "docker":
-		return parseDockerCondition(segment)
-	default:
+	parser, ok := backendParsers[segment[0]]
+	if !ok {
 		return nil, fmt.Errorf("unknown backend %q", segment[0])
 	}
+	return parser(segment)
 }
 
 func validateHTTPURL(rawURL string) error {
@@ -441,6 +442,10 @@ func parseDNSCondition(segment []string) (condition.Condition, error) {
 	if err != nil {
 		return nil, err
 	}
+	udpSize, err := checkedDNSUDPSize(opts.udpSize)
+	if err != nil {
+		return nil, err
+	}
 	cond := condition.NewDNS(args[0])
 	cond.RecordType = condition.DNSRecordType(opts.recordType)
 	cond.ResolverMode = condition.DNSResolverMode(opts.resolverMode)
@@ -453,8 +458,15 @@ func parseDNSCondition(segment []string) (condition.Condition, error) {
 	cond.RCode = strings.ToUpper(opts.rcode)
 	cond.Transport = condition.DNSTransport(opts.transport)
 	cond.EDNS0 = opts.edns0
-	cond.UDPSize = uint16(opts.udpSize)
+	cond.UDPSize = udpSize
 	return cond, nil
+}
+
+func checkedDNSUDPSize(size int) (uint16, error) {
+	if size < 0 || size > 65535 {
+		return 0, fmt.Errorf("udp-size must be between 0 and 65535")
+	}
+	return uint16(size), nil // #nosec G115 -- range is checked immediately above.
 }
 
 func normalizeDNSOptions(opts dnsParseOptions) (dnsParseOptions, string, error) {
@@ -651,25 +663,111 @@ func parseFileCondition(segment []string) (condition.Condition, error) {
 	fs := pflag.NewFlagSet("file", pflag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	contains := ""
+	existsFlag := false
+	deletedFlag := false
+	nonemptyFlag := false
 	fs.StringVar(&contains, "contains", "", "required file substring")
+	fs.BoolVar(&existsFlag, "exists", false, "wait until the file exists")
+	fs.BoolVar(&deletedFlag, "deleted", false, "wait until the file is deleted")
+	fs.BoolVar(&nonemptyFlag, "nonempty", false, "wait until the file is non-empty")
 	if err := fs.Parse(segment[1:]); err != nil {
 		return nil, err
 	}
 	args := fs.Args()
-	if len(args) < 1 || len(args) > 2 {
-		return nil, fmt.Errorf("file requires PATH [exists|deleted|nonempty]")
+	if len(args) != 1 {
+		return nil, fmt.Errorf("file requires exactly one PATH")
+	}
+	set := 0
+	if existsFlag {
+		set++
+	}
+	if deletedFlag {
+		set++
+	}
+	if nonemptyFlag {
+		set++
+	}
+	if set > 1 {
+		return nil, fmt.Errorf("--exists, --deleted, and --nonempty are mutually exclusive")
 	}
 	state := condition.FileExists
-	if len(args) == 2 {
-		state = condition.FileState(args[1])
-	}
-	switch state {
-	case condition.FileExists, condition.FileDeleted, condition.FileNonEmpty:
-	default:
-		return nil, fmt.Errorf("invalid file state %q: must be exists, deleted, or nonempty", state)
+	switch {
+	case deletedFlag:
+		state = condition.FileDeleted
+	case nonemptyFlag:
+		state = condition.FileNonEmpty
 	}
 	cond := condition.NewFile(args[0], state)
 	cond.Contains = contains
+	return cond, nil
+}
+
+func parseLogCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("log", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	contains, matches, exclude, jsonpath := "", "", "", ""
+	fromStart := false
+	tail, minMatches := 0, 1
+	fs.StringVar(&contains, "contains", "", "required line substring")
+	fs.StringVar(&matches, "matches", "", "required line regex")
+	fs.StringVar(&exclude, "exclude", "", "skip lines matching this regex before applying other matchers")
+	fs.StringVar(&jsonpath, "jsonpath", "", "JSON expression evaluated on each line")
+	fs.BoolVar(&fromStart, "from-start", false, "scan from beginning of file (default: skip existing content)")
+	fs.IntVar(&tail, "tail", 0, "scan last N lines of existing content before tailing new lines")
+	fs.IntVar(&minMatches, "min-matches", 1, "number of cumulative matching lines required")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("log requires exactly one PATH")
+	}
+	if err := validateLogOptions(contains, matches, jsonpath, exclude, tail, minMatches, fromStart); err != nil {
+		return nil, err
+	}
+	return buildLogCondition(args[0], contains, matches, jsonpath, exclude, fromStart, tail, minMatches)
+}
+
+func validateLogOptions(contains, matches, jsonpath, exclude string, tail, minMatches int, fromStart bool) error {
+	if contains == "" && matches == "" && jsonpath == "" {
+		return fmt.Errorf("log requires at least one of --contains, --matches, or --jsonpath")
+	}
+	if fromStart && tail > 0 {
+		return fmt.Errorf("--from-start and --tail are mutually exclusive")
+	}
+	if minMatches < 1 {
+		return fmt.Errorf("--min-matches must be at least 1")
+	}
+	return nil
+}
+
+func buildLogCondition(path, contains, matches, jsonpath, exclude string, fromStart bool, tail, minMatches int) (condition.Condition, error) {
+	cond := condition.NewLog(path)
+	cond.Contains = contains
+	cond.FromStart = fromStart
+	cond.Tail = tail
+	cond.MinMatches = minMatches
+	if matches != "" {
+		re, err := regexp.Compile(matches)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --matches regex: %w", err)
+		}
+		cond.Regex = re
+	}
+	if exclude != "" {
+		re, err := regexp.Compile(exclude)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --exclude regex: %w", err)
+		}
+		cond.Exclude = re
+	}
+	if jsonpath != "" {
+		e, err := expr.Compile(jsonpath)
+		if err != nil {
+			return nil, err
+		}
+		cond.JSONExpr = e
+	}
 	return cond, nil
 }
 
@@ -818,6 +916,8 @@ var conditionValueFlags = map[string]bool{
 	"--type":             true,
 	"--resolver":         true,
 	"--contains":         true,
+	"--matches":          true,
+	"--exclude":          true,
 	"--equals":           true,
 	"--min-count":        true,
 	"--absent-mode":      true,
@@ -874,12 +974,8 @@ func splitConditionSegments(args []string) ([][]string, error) {
 }
 
 func isBackend(arg string) bool {
-	switch arg {
-	case "http", "tcp", "exec", "file", "k8s", "dns", "docker":
-		return true
-	default:
-		return false
-	}
+	_, ok := backendParsers[arg]
+	return ok
 }
 
 func wantsHelp(args []string) bool {
@@ -949,7 +1045,7 @@ func readFileLimit(path string, limit int64) ([]byte, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("file must be a regular file")
 	}
-	file, err := os.Open(path)
+	file, err := os.Open(path) // #nosec G304 -- body-file is an explicit user-selected CLI input.
 	if err != nil {
 		return nil, err
 	}
@@ -1029,8 +1125,21 @@ Exec:
   --max-output-bytes N     Capture at most N bytes of output (default: 1048576)
 
 File:
-  waitfor file PATH [exists|deleted|nonempty]
-  --contains text          Required file content substring in first 10 MiB (only with exists/nonempty)
+  waitfor file [flags] PATH
+  --exists                 Wait until the file exists (default when no state flag given)
+  --deleted                Wait until the file is deleted
+  --nonempty               Wait until the file is non-empty
+  --contains text          Required file content substring in first 10 MiB (only with --exists/--nonempty)
+
+Log:
+  waitfor log [flags] PATH
+  --contains text          Required line substring
+  --matches regex          Required line regex
+  --exclude regex          Skip lines matching this regex before applying other matchers
+  --jsonpath expr          JSON expression evaluated on each line
+  --from-start             Scan from beginning of file (default: skip existing content, tail new lines)
+  --tail N                 Scan last N lines of existing content before tailing (mutually exclusive with --from-start)
+  --min-matches N          Number of cumulative matching lines required (default: 1)
 
 Kubernetes:
   waitfor k8s [flags] RESOURCE
@@ -1045,7 +1154,9 @@ Examples:
   waitfor tcp localhost:5432
   waitfor dns api.internal --type A
   waitfor docker postgres --health healthy
-  waitfor file /tmp/ready.flag exists
+  waitfor file /tmp/ready.flag --exists
+  waitfor log /var/log/app.log --contains "server ready"
+  waitfor log /var/log/app.log --matches "ERROR:.*timeout" --from-start
   waitfor exec --output-contains Running -- kubectl get pod myapp
   waitfor k8s deployment/api --condition Available
   waitfor --timeout 10m http https://api.example.com/health -- tcp localhost:5432

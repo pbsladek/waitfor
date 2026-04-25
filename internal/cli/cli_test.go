@@ -27,7 +27,7 @@ func TestExecuteFileJSON(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := Execute(t.Context(), []string{"--output", "json", "file", path, "exists"}, nil, &stdout, &stderr)
+	code := Execute(t.Context(), []string{"--output", "json", "file", path, "--exists"}, nil, &stdout, &stderr)
 	if code != ExitSatisfied {
 		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitSatisfied, stderr.String())
 	}
@@ -84,7 +84,7 @@ func TestExecuteTextWritesProgressToStderr(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := Execute(t.Context(), []string{"file", path, "exists"}, nil, &stdout, &stderr)
+	code := Execute(t.Context(), []string{"file", path, "--exists"}, nil, &stdout, &stderr)
 	if code != ExitSatisfied {
 		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitSatisfied, stdout.String(), stderr.String())
 	}
@@ -99,7 +99,7 @@ func TestExecuteTextWritesProgressToStderr(t *testing.T) {
 func TestExecuteTimeout(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing")
 	var stdout, stderr bytes.Buffer
-	code := Execute(t.Context(), []string{"--timeout", "20ms", "--interval", "5ms", "file", path, "exists"}, nil, &stdout, &stderr)
+	code := Execute(t.Context(), []string{"--timeout", "20ms", "--interval", "5ms", "file", path, "--exists"}, nil, &stdout, &stderr)
 	if code != ExitTimeout {
 		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitTimeout, stdout.String(), stderr.String())
 	}
@@ -111,7 +111,7 @@ func TestExecuteCancelled(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "missing")
 	var stdout, stderr bytes.Buffer
-	code := Execute(ctx, []string{"--timeout", "1s", "--interval", "5ms", "file", path, "exists"}, nil, &stdout, &stderr)
+	code := Execute(ctx, []string{"--timeout", "1s", "--interval", "5ms", "file", path, "--exists"}, nil, &stdout, &stderr)
 	if code != ExitCancelled {
 		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitCancelled, stdout.String(), stderr.String())
 	}
@@ -220,8 +220,8 @@ func TestExecuteModeAnyWithMultipleConditions(t *testing.T) {
 		"--timeout", "100ms",
 		"--interval", "5ms",
 		"--mode", "any",
-		"file", path, "exists",
-		"--", "file", missing, "exists",
+		"file", path, "--exists",
+		"--", "file", missing, "--exists",
 	}, nil, &stdout, &stderr)
 	if code != ExitSatisfied {
 		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitSatisfied, stdout.String(), stderr.String())
@@ -304,8 +304,8 @@ func TestSplitConditionSegments(t *testing.T) {
 		args []string
 		want int
 	}{
-		{name: "single", args: []string{"file", "README.md", "exists"}, want: 1},
-		{name: "multiple", args: []string{"file", "README.md", "exists", "--", "tcp", "127.0.0.1:1"}, want: 2},
+		{name: "single", args: []string{"file", "README.md", "--exists"}, want: 1},
+		{name: "multiple", args: []string{"file", "README.md", "--exists", "--", "tcp", "127.0.0.1:1"}, want: 2},
 		{name: "bare separator inside exec command", args: []string{"exec", "--", "/bin/echo", "--", "not-a-backend"}, want: 1},
 		{name: "exec command named backend", args: []string{"exec", "--", "http", "--version"}, want: 1},
 		{name: "condition after exec command", args: []string{"exec", "--", "/bin/true", "--", "http", "http://example.com"}, want: 2},
@@ -320,6 +320,43 @@ func TestSplitConditionSegments(t *testing.T) {
 			}
 			if len(got) != tt.want {
 				t.Fatalf("len(splitConditionSegments()) = %d, want %d: %#v", len(got), tt.want, got)
+			}
+		})
+	}
+}
+
+func TestParseFileConditionFlags(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantState condition.FileState
+		wantErr   string
+	}{
+		{name: "default exists", args: []string{"file", "/tmp/f"}, wantState: condition.FileExists},
+		{name: "explicit exists", args: []string{"file", "/tmp/f", "--exists"}, wantState: condition.FileExists},
+		{name: "deleted", args: []string{"file", "/tmp/f", "--deleted"}, wantState: condition.FileDeleted},
+		{name: "nonempty", args: []string{"file", "/tmp/f", "--nonempty"}, wantState: condition.FileNonEmpty},
+		{name: "mutual exclusion", args: []string{"file", "/tmp/f", "--exists", "--deleted"}, wantErr: "mutually exclusive"},
+		{name: "extra positional", args: []string{"file", "/tmp/f", "exists"}, wantErr: "exactly one PATH"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond, err := parseFileCondition(tt.args)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseFileCondition() error = %v", err)
+			}
+			fc, ok := cond.(*condition.FileCondition)
+			if !ok {
+				t.Fatalf("condition type = %T, want *condition.FileCondition", cond)
+			}
+			if fc.State != tt.wantState {
+				t.Fatalf("State = %q, want %q", fc.State, tt.wantState)
 			}
 		})
 	}
@@ -361,9 +398,9 @@ func TestExecuteParserEdgeCases(t *testing.T) {
 		name string
 		args []string
 	}{
-		{name: "trailing separator", args: []string{"file", "README.md", "exists", "--"}},
+		{name: "trailing separator", args: []string{"file", "README.md", "--exists", "--"}},
 		{name: "unknown backend", args: []string{"nope", "target"}},
-		{name: "global flag after backend", args: []string{"file", "README.md", "exists", "--timeout", "1s"}},
+		{name: "global flag after backend", args: []string{"file", "README.md", "--exists", "--timeout", "1s"}},
 		{name: "exec missing separator", args: []string{"exec", "/bin/echo", "ready"}},
 	}
 
@@ -380,7 +417,7 @@ func TestExecuteParserEdgeCases(t *testing.T) {
 
 func TestExecuteMalformedGlobalFlagReportsFlagError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := Execute(t.Context(), []string{"--timeout", "file", "README.md", "exists"}, nil, &stdout, &stderr)
+	code := Execute(t.Context(), []string{"--timeout", "file", "README.md", "--exists"}, nil, &stdout, &stderr)
 	if code != ExitInvalid {
 		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitInvalid, stdout.String(), stderr.String())
 	}
@@ -731,7 +768,7 @@ func TestExecuteK8sBadJSONPath(t *testing.T) {
 
 func TestExecuteGlobalInvalidOutput(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := Execute(t.Context(), []string{"--output", "xml", "file", "x", "exists"}, nil, &stdout, &stderr)
+	code := Execute(t.Context(), []string{"--output", "xml", "file", "x"}, nil, &stdout, &stderr)
 	if code != ExitInvalid {
 		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitInvalid, stderr.String())
 	}
@@ -739,7 +776,7 @@ func TestExecuteGlobalInvalidOutput(t *testing.T) {
 
 func TestExecuteGlobalInvalidMode(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := Execute(t.Context(), []string{"--mode", "bogus", "file", "x", "exists"}, nil, &stdout, &stderr)
+	code := Execute(t.Context(), []string{"--mode", "bogus", "file", "x"}, nil, &stdout, &stderr)
 	if code != ExitInvalid {
 		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitInvalid, stderr.String())
 	}

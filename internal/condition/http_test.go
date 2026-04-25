@@ -207,7 +207,7 @@ func TestHTTPInvalidJSONBodyUnsatisfied(t *testing.T) {
 }
 
 func TestHTTPErrorRedactsSensitiveURLParts(t *testing.T) {
-	rawURL := "https://user:pass@example.com/health?token=secret&ready=true"
+	rawURL := "https://user:pass@example.com/health?token=secret&ready=true" // #nosec G101 -- synthetic secret used to verify redaction.
 	cond := NewHTTP(rawURL)
 	cond.Client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return nil, &url.Error{Op: "Get", URL: rawURL, Err: errors.New("dial " + rawURL)}

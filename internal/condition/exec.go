@@ -42,7 +42,7 @@ func (c *ExecCondition) Check(ctx context.Context) Result {
 		return Fatal(fmt.Errorf("exec exit code cannot be negative"))
 	}
 
-	cmd := exec.CommandContext(ctx, c.Command[0], c.Command[1:]...)
+	cmd := exec.CommandContext(ctx, c.Command[0], c.Command[1:]...) // #nosec G204 -- exec backend exists to run the caller-supplied command.
 	prepareExecCommand(cmd)
 	cmd.Dir = c.Cwd
 	if len(c.Env) > 0 {
