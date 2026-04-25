@@ -228,6 +228,66 @@ func TestExecuteModeAnyWithMultipleConditions(t *testing.T) {
 	}
 }
 
+func TestExecuteGuardConditionFatal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fatal.log")
+	if err := os.WriteFile(path, []byte("FATAL startup failed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{
+		"--timeout", "200ms",
+		"--interval", "5ms",
+		"file", filepath.Join(t.TempDir(), "missing"), "--exists",
+		"--", "guard", "log", path, "--matches", "FATAL", "--from-start",
+	}, nil, &stdout, &stderr)
+	if code != ExitFatal {
+		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitFatal, stdout.String(), stderr.String())
+	}
+}
+
+func TestExecuteStableSuccesses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ready")
+	if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{
+		"--successes", "2",
+		"--interval", "1ms",
+		"file", path, "--exists",
+	}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitSatisfied, stdout.String(), stderr.String())
+	}
+}
+
+func TestExecuteStableSuccessesJSONClearsLastError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ready")
+	if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{
+		"--output", "json",
+		"--successes", "2",
+		"--interval", "1ms",
+		"file", path, "--exists",
+	}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitSatisfied, stdout.String(), stderr.String())
+	}
+	var report output.Report
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("invalid json: %v: %s", err, stdout.String())
+	}
+	if got := report.Conditions[0].LastError; got != "" {
+		t.Fatalf("last_error = %q, want empty after final success", got)
+	}
+}
+
 func TestExecuteExecRequiresFlagsBeforeSeparator(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := Execute(t.Context(), []string{
@@ -310,6 +370,11 @@ func TestSplitConditionSegments(t *testing.T) {
 		{name: "exec command named backend", args: []string{"exec", "--", "http", "--version"}, want: 1},
 		{name: "condition after exec command", args: []string{"exec", "--", "/bin/true", "--", "http", "http://example.com"}, want: 2},
 		{name: "literal separator flag value before backend token", args: []string{"file", "README.md", "--contains", "--", "http"}, want: 1},
+		{name: "literal trailing separator flag value", args: []string{"file", "README.md", "--contains", "--"}, want: 1},
+		{name: "guard condition", args: []string{"file", "README.md", "--exists", "--", "guard", "log", "app.log", "--contains", "panic"}, want: 2},
+		{name: "literal guard in exec command", args: []string{"exec", "--", "/bin/echo", "--", "guard"}, want: 1},
+		{name: "dns literal separator value before guard", args: []string{"dns", "example.com", "--contains", "--", "--", "guard", "log", "app.log", "--contains", "panic"}, want: 2},
+		{name: "dns equals literal separator value before guard", args: []string{"dns", "example.com", "--equals", "--", "--", "guard", "log", "app.log", "--contains", "panic"}, want: 2},
 	}
 
 	for _, tt := range tests {
@@ -439,6 +504,8 @@ func TestParseGlobalErrors(t *testing.T) {
 		{"zero timeout", []string{"--timeout", "0s", "file", "x"}, "timeout must be positive"},
 		{"zero interval", []string{"--interval", "0s", "file", "x"}, "interval must be positive"},
 		{"negative attempt-timeout", []string{"--attempt-timeout=-1ns", "file", "x"}, "attempt-timeout cannot be negative"},
+		{"zero successes", []string{"--successes", "0", "file", "x"}, "successes must be at least 1"},
+		{"negative stable-for", []string{"--stable-for=-1ns", "file", "x"}, "stable-for cannot be negative"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -512,6 +579,8 @@ func TestParseKubernetesConditionSuccess(t *testing.T) {
 		{"default namespace", []string{"k8s", "pod/myapp"}, "default"},
 		{"explicit namespace", []string{"k8s", "pod/myapp", "--namespace", "prod"}, "prod"},
 		{"with condition flag", []string{"k8s", "deployment/api", "--condition", "Available"}, "default"},
+		{"with for rollout", []string{"k8s", "deployment/api", "--for", "rollout"}, "default"},
+		{"with selector", []string{"k8s", "pod", "--selector", "app=api", "--for", "ready", "--all"}, "default"},
 		{"with kubeconfig flag", []string{"k8s", "pod/myapp", "--kubeconfig", "/tmp/kube"}, "default"},
 	}
 	for _, tt := range tests {
@@ -546,6 +615,15 @@ func TestParseKubernetesConditionErrors(t *testing.T) {
 		{"missing resource", []string{"k8s"}, "exactly one RESOURCE"},
 		{"too many args", []string{"k8s", "pod/a", "extra"}, "exactly one RESOURCE"},
 		{"mutual exclusion", []string{"k8s", "pod/a", "--condition", "Ready", "--jsonpath", ".x"}, "mutually exclusive"},
+		{"for mutual exclusion", []string{"k8s", "pod/a", "--for", "ready", "--condition", "Ready"}, "mutually exclusive"},
+		{"bad for", []string{"k8s", "pod/a", "--for", "missing"}, "invalid kubernetes --for"},
+		{"selector without for", []string{"k8s", "pod", "--selector", "app=api"}, "--selector requires --for"},
+		{"selector with name", []string{"k8s", "pod/a", "--selector", "app=api", "--for", "ready"}, "resource kind without /name"},
+		{"invalid selector", []string{"k8s", "pod", "--selector", "app in (", "--for", "ready"}, "invalid kubernetes selector"},
+		{"all without selector", []string{"k8s", "pod/a", "--for", "ready", "--all"}, "--all requires --selector"},
+		{"ready wrong kind", []string{"k8s", "deployment/a", "--for", "ready"}, "not supported"},
+		{"complete wrong kind", []string{"k8s", "pod/a", "--for", "complete"}, "not supported"},
+		{"rollout wrong kind", []string{"k8s", "job/a", "--for", "rollout"}, "not supported"},
 		{"bad jsonpath", []string{"k8s", "pod/a", "--jsonpath", "  "}, "required"},
 		{"unknown flag", []string{"k8s", "pod/a", "--no-such-flag"}, ""},
 	}

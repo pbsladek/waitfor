@@ -8,6 +8,35 @@ structured JSON result.
 Human-readable progress is written to stderr. JSON output is written to stdout
 without progress lines so it is safe to consume from scripts.
 
+## Docker
+
+Published image:
+
+```bash
+docker pull pwbsladek/waitfor:latest
+docker run --rm pwbsladek/waitfor:latest --help
+```
+
+Tagged releases are published as `pwbsladek/waitfor:<tag>`. The image is
+built from Docker Hardened Images: `dhi.io/golang:1.26-dev` for compilation and
+`dhi.io/static:20250419` for the distroless runtime.
+
+Local builds require access to DHI:
+
+```bash
+docker login dhi.io
+make docker-build
+make docker-run ARGS="http https://api.example.com/health --status 200"
+```
+
+Publishing a multi-arch image:
+
+```bash
+docker login
+docker login dhi.io
+make docker-push DOCKER_TAG=tagname
+```
+
 ## Examples
 
 ```bash
@@ -23,6 +52,9 @@ waitfor log /var/log/app.log --contains "server ready"
 waitfor log /var/log/app.log --matches "ERROR:.*timeout" --from-start
 waitfor exec --output-contains Running -- kubectl get pod myapp
 waitfor k8s deployment/myapp --condition Available --namespace prod
+waitfor k8s deployment/myapp --for rollout --namespace prod
+waitfor k8s pod --selector app=myapp --for ready --all --namespace prod
+waitfor http https://api.example.com/health -- guard log /var/log/app.log --matches 'FATAL|panic'
 ```
 
 Multiple conditions are chained with `--` before the next backend:
@@ -51,6 +83,8 @@ Global flags:
 --interval duration    Poll interval (default: 2s)
 --attempt-timeout duration
                        Per-attempt deadline (default: global remaining time)
+--successes int        Consecutive successful checks required (default: 1)
+--stable-for duration  Required continuous success duration (default: disabled)
 --output string        Output format: text|json (default: text)
 --mode string          Condition mode: all|any (default: all)
 --verbose              Show each attempt
@@ -66,7 +100,7 @@ docker CONTAINER [--status running] [--health healthy]
 exec [--exit-code N] [--output-contains text] [--jsonpath expr] [--cwd path] [--env K=V] [--max-output-bytes N] -- COMMAND [ARGS...]
 file PATH [--exists|--deleted|--nonempty] [--contains text]
 log PATH (--contains text | --matches regex | --jsonpath expr) [--from-start]
-k8s RESOURCE [--condition Ready] [--namespace default] [--jsonpath expr] [--kubeconfig path]
+k8s RESOURCE [--condition Ready] [--for ready|rollout|complete] [--selector labels] [--all] [--namespace default] [--jsonpath expr] [--kubeconfig path]
 ```
 
 `exec` flags must appear before the command separator. `--exit-code` must be
@@ -83,6 +117,14 @@ treated as that flag's value. Use a second separator to start another condition:
 waitfor file ./ready --contains -- -- http https://api.example.com/health
 ```
 
+Prefix a condition with `guard` to fail fast if that condition becomes true
+while the main readiness conditions are still pending:
+
+```bash
+waitfor http https://api.example.com/health \
+  -- guard log /var/log/app.log --matches 'FATAL|panic'
+```
+
 DNS uses Go's standard resolver by default. `--resolver system` is portable and
 supports `A`, `AAAA`, `CNAME`, `TXT`, and `ANY`, including absence checks where
 "not found" is enough. Use `--resolver wire --server ADDRESS` for lower-level
@@ -95,6 +137,12 @@ Docker polling shells out to the Docker CLI and inspects container state. A
 missing Docker binary is fatal; missing containers, daemon connection failures,
 or containers in the wrong state remain retryable until the timeout and are
 reported with the last observed inspect detail.
+
+Kubernetes typed waits cover common rollout gates without custom JSON
+expressions: `--for rollout` for deployments, statefulsets, and daemonsets;
+`--for ready` for pods; and `--for complete` for jobs. `--selector` switches
+from `kind/name` to kind-level list mode, with `--all` requiring every selected
+object to satisfy the typed wait.
 
 ## JSON Expressions
 

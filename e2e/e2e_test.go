@@ -499,6 +499,18 @@ func TestLogMatchedLineInJSONDetail(t *testing.T) {
 	}
 }
 
+func TestGuardLogFatal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("INFO boot\nFATAL crash\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitFatal,
+		"--timeout", "500ms",
+		"--interval", "10ms",
+		"file", filepath.Join(t.TempDir(), "missing"), "--exists",
+		"--", "guard", "log", path, "--contains", "FATAL", "--from-start")
+}
+
 // ── Exec ────────────────────────────────────────────────────────────────────
 
 func TestExecSuccess(t *testing.T) {
@@ -592,6 +604,20 @@ func TestGlobalAttemptTimeout(t *testing.T) {
 	mustCode(t, cli.ExitTimeout,
 		"--timeout", "250ms", "--interval", "10ms", "--attempt-timeout", "50ms",
 		"http", slow.URL)
+}
+
+func TestGlobalSuccesses(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	mustCode(t, cli.ExitSatisfied, "--successes", "3", "--interval", "1ms", "http", server.URL)
+	if attempts < 3 {
+		t.Fatalf("attempts = %d, want at least 3", attempts)
+	}
 }
 
 func TestModeAll(t *testing.T) {

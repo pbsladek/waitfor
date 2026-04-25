@@ -1,6 +1,9 @@
 package condition
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // Result is returned by each Check call.
 type Result struct {
@@ -23,6 +26,13 @@ type Descriptor struct {
 	Name    string
 }
 
+type Role string
+
+const (
+	RoleReady Role = "ready"
+	RoleGuard Role = "guard"
+)
+
 func (d Descriptor) DisplayName() string {
 	if d.Name != "" {
 		return d.Name
@@ -42,6 +52,46 @@ func (d Descriptor) DisplayName() string {
 type Condition interface {
 	Descriptor() Descriptor
 	Check(ctx context.Context) Result
+}
+
+type RoleProvider interface {
+	ConditionRole() Role
+}
+
+type GuardCondition struct {
+	Inner Condition
+}
+
+func NewGuard(inner Condition) *GuardCondition {
+	return &GuardCondition{Inner: inner}
+}
+
+func (c *GuardCondition) ConditionRole() Role {
+	return RoleGuard
+}
+
+func (c *GuardCondition) Descriptor() Descriptor {
+	if c.Inner == nil {
+		return Descriptor{Backend: "guard", Target: "", Name: "guard <nil>"}
+	}
+	desc := c.Inner.Descriptor()
+	desc.Name = "guard " + desc.DisplayName()
+	return desc
+}
+
+func (c *GuardCondition) Check(ctx context.Context) Result {
+	if c.Inner == nil {
+		return Fatal(fmt.Errorf("guard condition is required"))
+	}
+	result := c.Inner.Check(ctx)
+	if result.Status == CheckSatisfied {
+		detail := "guard condition satisfied"
+		if result.Detail != "" {
+			detail += ": " + result.Detail
+		}
+		return FatalDetail(detail, fmt.Errorf("guard condition satisfied"))
+	}
+	return result
 }
 
 func Satisfied(detail string) Result {

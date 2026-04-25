@@ -131,6 +131,56 @@ func TestRunFatal(t *testing.T) {
 	}
 }
 
+func TestRunGuardDoesNotBlockModeAllSuccess(t *testing.T) {
+	out, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{
+			&fakeCondition{name: "ready", satisfyAfter: 1},
+			condition.NewGuard(&fakeCondition{name: "guard"}),
+		},
+		Timeout:  500 * time.Millisecond,
+		Interval: time.Millisecond,
+		Mode:     ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusSatisfied {
+		t.Fatalf("Status = %s, want %s, outcome = %+v", out.Status, StatusSatisfied, out)
+	}
+	if !out.Conditions[1].Guard {
+		t.Fatal("guard condition was not marked as guard")
+	}
+}
+
+func TestRunGuardSatisfiedBecomesFatal(t *testing.T) {
+	out, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{
+			&fakeCondition{name: "ready"},
+			condition.NewGuard(&fakeCondition{name: "bad-log", satisfyAfter: 1}),
+		},
+		Timeout:  500 * time.Millisecond,
+		Interval: time.Millisecond,
+		Mode:     ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusFatal {
+		t.Fatalf("Status = %s, want %s, outcome = %+v", out.Status, StatusFatal, out)
+	}
+}
+
+func TestRunRequiresNonGuardCondition(t *testing.T) {
+	_, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{condition.NewGuard(&fakeCondition{name: "guard"})},
+		Timeout:    time.Second,
+		Interval:   time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
 func TestRunCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -224,6 +274,46 @@ func TestRunPerAttemptTimeout(t *testing.T) {
 	}
 	if attempts := cond.attempts.Load(); attempts < 2 {
 		t.Fatalf("attempts = %d, want multiple attempts before global timeout", attempts)
+	}
+}
+
+func TestRunRequiresConsecutiveSuccesses(t *testing.T) {
+	cond := &fakeCondition{name: "ready", satisfyAfter: 1}
+	out, err := Run(t.Context(), Config{
+		Conditions:        []condition.Condition{cond},
+		Timeout:           500 * time.Millisecond,
+		Interval:          time.Millisecond,
+		RequiredSuccesses: 3,
+		Mode:              ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusSatisfied {
+		t.Fatalf("Status = %s, want %s", out.Status, StatusSatisfied)
+	}
+	if out.Conditions[0].Attempts < 3 {
+		t.Fatalf("attempts = %d, want at least 3", out.Conditions[0].Attempts)
+	}
+}
+
+func TestRunRequiresStableDuration(t *testing.T) {
+	cond := &fakeCondition{name: "ready", satisfyAfter: 1}
+	out, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{cond},
+		Timeout:    500 * time.Millisecond,
+		Interval:   5 * time.Millisecond,
+		StableFor:  20 * time.Millisecond,
+		Mode:       ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusSatisfied {
+		t.Fatalf("Status = %s, want %s", out.Status, StatusSatisfied)
+	}
+	if out.Elapsed < 20*time.Millisecond {
+		t.Fatalf("elapsed = %s, want at least 20ms", out.Elapsed)
 	}
 }
 

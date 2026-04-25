@@ -1,0 +1,11 @@
+.git
+.github
+.claude
+bin
+dist
+coverage.html
+coverage.out
+coverage.txt
+*.test
+*.tmp
+Dockerfile

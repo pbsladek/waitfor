@@ -18,8 +18,8 @@ import (
 	"github.com/pbsladek/wait-for/internal/runner"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/labels"
 )
-
 
 const (
 	ExitSatisfied = 0
@@ -97,6 +97,8 @@ type globalOptions struct {
 	timeout           time.Duration
 	interval          time.Duration
 	perAttemptTimeout time.Duration
+	requiredSuccesses int
+	stableFor         time.Duration
 	format            output.Format
 	mode              runner.Mode
 	verbose           bool
@@ -123,6 +125,8 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		Timeout:           opts.timeout,
 		Interval:          opts.interval,
 		PerAttemptTimeout: opts.perAttemptTimeout,
+		RequiredSuccesses: opts.requiredSuccesses,
+		StableFor:         opts.stableFor,
 		Mode:              opts.mode,
 		OnAttempt: func(event runner.AttemptEvent) {
 			printer.Attempt(output.Attempt{
@@ -177,15 +181,22 @@ func applyFormatAndMode(opts globalOptions, format, mode string) (globalOptions,
 	if opts.perAttemptTimeout < 0 {
 		return opts, fmt.Errorf("attempt-timeout cannot be negative")
 	}
+	if opts.requiredSuccesses < 1 {
+		return opts, fmt.Errorf("successes must be at least 1")
+	}
+	if opts.stableFor < 0 {
+		return opts, fmt.Errorf("stable-for cannot be negative")
+	}
 	return opts, nil
 }
 
 func parseGlobal(args []string) (globalOptions, []string, error) {
 	opts := globalOptions{
-		timeout:  5 * time.Minute,
-		interval: 2 * time.Second,
-		format:   output.FormatText,
-		mode:     runner.ModeAll,
+		timeout:           5 * time.Minute,
+		interval:          2 * time.Second,
+		requiredSuccesses: 1,
+		format:            output.FormatText,
+		mode:              runner.ModeAll,
 	}
 
 	fs := pflag.NewFlagSet("waitfor", pflag.ContinueOnError)
@@ -199,6 +210,8 @@ func parseGlobal(args []string) (globalOptions, []string, error) {
 	fs.DurationVar(&opts.timeout, "timeout", opts.timeout, "global deadline")
 	fs.DurationVar(&opts.interval, "interval", opts.interval, "poll interval")
 	fs.DurationVar(&opts.perAttemptTimeout, "attempt-timeout", 0, "per-attempt deadline; 0 disables per-attempt limit (global timeout still applies)")
+	fs.IntVar(&opts.requiredSuccesses, "successes", opts.requiredSuccesses, "consecutive successful checks required before a condition is satisfied")
+	fs.DurationVar(&opts.stableFor, "stable-for", 0, "duration a condition must remain continuously successful before it is satisfied")
 	fs.StringVar(&format, "output", string(opts.format), "output format: text|json")
 	fs.StringVar(&mode, "mode", "all", "condition mode: all|any")
 	fs.BoolVar(&opts.verbose, "verbose", false, "show every attempt")
@@ -249,6 +262,16 @@ var backendParsers = map[string]backendParser{
 func parseCondition(segment []string) (condition.Condition, error) {
 	if len(segment) == 0 {
 		return nil, fmt.Errorf("empty condition")
+	}
+	if segment[0] == "guard" {
+		if len(segment) == 1 {
+			return nil, fmt.Errorf("guard requires a backend condition")
+		}
+		inner, err := parseCondition(segment[1:])
+		if err != nil {
+			return nil, err
+		}
+		return condition.NewGuard(inner), nil
 	}
 	parser, ok := backendParsers[segment[0]]
 	if !ok {
@@ -777,11 +800,17 @@ func parseKubernetesCondition(segment []string) (condition.Condition, error) {
 	namespace := "default"
 	conditionName := ""
 	jsonpath := ""
+	waitFor := ""
+	selector := ""
 	kubeconfig := ""
+	all := false
 	fs.StringVar(&namespace, "namespace", namespace, "namespace")
 	fs.StringVar(&conditionName, "condition", conditionName, "condition type")
 	fs.StringVar(&jsonpath, "jsonpath", jsonpath, "JSON expression")
+	fs.StringVar(&waitFor, "for", waitFor, "typed wait: ready|rollout|complete")
+	fs.StringVar(&selector, "selector", selector, "label selector for kind-level waits")
 	fs.StringVar(&kubeconfig, "kubeconfig", kubeconfig, "kubeconfig path")
+	fs.BoolVar(&all, "all", all, "require all selected resources to satisfy --for")
 	if err := fs.Parse(segment[1:]); err != nil {
 		return nil, err
 	}
@@ -789,23 +818,141 @@ func parseKubernetesCondition(segment []string) (condition.Condition, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("k8s requires exactly one RESOURCE (e.g. pod/myapp, deployment/api)")
 	}
-	if conditionName != "" && jsonpath != "" {
-		return nil, fmt.Errorf("--condition and --jsonpath are mutually exclusive")
+	if err := validateKubernetesOptions(args[0], conditionName, jsonpath, waitFor, selector, all); err != nil {
+		return nil, err
 	}
-	var jsonExpr *expr.Expression
-	if jsonpath != "" {
-		var err error
-		jsonExpr, err = expr.Compile(jsonpath)
-		if err != nil {
-			return nil, err
-		}
+	jsonExpr, err := compileKubernetesJSONExpr(jsonpath)
+	if err != nil {
+		return nil, err
 	}
 	cond := condition.NewKubernetes(args[0])
 	cond.Namespace = namespace
 	cond.Condition = conditionName
+	cond.WaitFor = waitFor
+	cond.Selector = selector
+	cond.All = all
 	cond.JSONExpr = jsonExpr
 	cond.Kubeconfig = kubeconfig
 	return cond, nil
+}
+
+func validateKubernetesOptions(resource, conditionName, jsonpath, waitFor, selector string, all bool) error {
+	if err := validateKubernetesMatcherOptions(conditionName, jsonpath, waitFor); err != nil {
+		return err
+	}
+	if err := validateKubernetesSelectorOptions(resource, selector, waitFor, all); err != nil {
+		return err
+	}
+	return validateKubernetesWaitKind(resource, selector, waitFor)
+}
+
+func validateKubernetesMatcherOptions(conditionName, jsonpath, waitFor string) error {
+	if conditionName != "" && jsonpath != "" {
+		return fmt.Errorf("--condition and --jsonpath are mutually exclusive")
+	}
+	if waitFor != "" && (conditionName != "" || jsonpath != "") {
+		return fmt.Errorf("--for is mutually exclusive with --condition and --jsonpath")
+	}
+	if waitFor != "" && !validKubernetesWaitFor(waitFor) {
+		return fmt.Errorf("invalid kubernetes --for value %q", waitFor)
+	}
+	return nil
+}
+
+func validateKubernetesSelectorOptions(resource, selector, waitFor string, all bool) error {
+	switch {
+	case selector != "" && waitFor == "":
+		return fmt.Errorf("--selector requires --for")
+	case all && selector == "":
+		return fmt.Errorf("--all requires --selector")
+	case selector != "" && strings.Contains(resource, "/"):
+		return fmt.Errorf("--selector requires a resource kind without /name syntax")
+	default:
+		return validateKubernetesSelector(selector)
+	}
+}
+
+func validateKubernetesSelector(selector string) error {
+	if selector == "" {
+		return nil
+	}
+	if _, err := labels.Parse(selector); err != nil {
+		return fmt.Errorf("invalid kubernetes selector: %w", err)
+	}
+	return nil
+}
+
+func validateKubernetesWaitKind(resource, selector, waitFor string) error {
+	if waitFor == "" {
+		return nil
+	}
+	kind := kubernetesResourceKind(resource, selector)
+	if kubernetesWaitSupportsKind(waitFor, kind) {
+		return nil
+	}
+	return fmt.Errorf("--for %s is not supported for kubernetes resource kind %q", waitFor, kind)
+}
+
+func kubernetesResourceKind(resource, selector string) string {
+	if selector != "" {
+		return strings.ToLower(resource)
+	}
+	kind, _, _ := strings.Cut(resource, "/")
+	return strings.ToLower(kind)
+}
+
+func kubernetesWaitSupportsKind(waitFor, kind string) bool {
+	switch waitFor {
+	case "ready":
+		return kubernetesKindIs(kind, "pod")
+	case "complete":
+		return kubernetesKindIs(kind, "job")
+	case "rollout":
+		return kubernetesKindIs(kind, "deployment") || kubernetesKindIs(kind, "statefulset") || kubernetesKindIs(kind, "daemonset")
+	default:
+		return false
+	}
+}
+
+func kubernetesKindIs(kind, canonical string) bool {
+	return normalizeKubernetesKind(kind) == canonical
+}
+
+func normalizeKubernetesKind(kind string) string {
+	switch strings.ToLower(kind) {
+	case "pod", "pods", "po":
+		return "pod"
+	case "deployment", "deployments", "deploy":
+		return "deployment"
+	case "statefulset", "statefulsets", "sts":
+		return "statefulset"
+	case "daemonset", "daemonsets", "ds":
+		return "daemonset"
+	case "job", "jobs":
+		return "job"
+	default:
+		return strings.ToLower(kind)
+	}
+}
+
+func compileKubernetesJSONExpr(jsonpath string) (*expr.Expression, error) {
+	if jsonpath != "" {
+		jsonExpr, err := expr.Compile(jsonpath)
+		if err != nil {
+			return nil, err
+		}
+		return jsonExpr, nil
+	}
+	return nil, nil
+}
+
+func validKubernetesWaitFor(waitFor string) bool {
+	switch waitFor {
+	case "ready", "rollout", "complete":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateEnvVars(env []string) error {
@@ -884,7 +1031,7 @@ func parseExecCondition(segment []string) (condition.Condition, error) {
 }
 
 func isSeparatorBefore(args []string, i int, current []string) bool {
-	if args[i] != "--" || i+1 >= len(args) || !isBackend(args[i+1]) {
+	if args[i] != "--" || i+1 >= len(args) || !isConditionStart(args, i+1) {
 		return false
 	}
 	if isValueForPreviousFlag(args, i) {
@@ -928,6 +1075,8 @@ var conditionValueFlags = map[string]bool{
 	"--health":           true,
 	"--namespace":        true,
 	"--condition":        true,
+	"--for":              true,
+	"--selector":         true,
 	"--kubeconfig":       true,
 	"--exit-code":        true,
 	"--output-contains":  true,
@@ -950,7 +1099,7 @@ func splitConditionSegments(args []string) ([][]string, error) {
 	if args[0] == "--" {
 		return nil, fmt.Errorf("empty condition before --")
 	}
-	if args[len(args)-1] == "--" {
+	if args[len(args)-1] == "--" && !isValueForPreviousFlag(args, len(args)-1) {
 		return nil, fmt.Errorf("empty trailing condition")
 	}
 	var segments [][]string
@@ -971,6 +1120,13 @@ func splitConditionSegments(args []string) ([][]string, error) {
 	}
 	segments = append(segments, current)
 	return segments, nil
+}
+
+func isConditionStart(args []string, i int) bool {
+	if isBackend(args[i]) {
+		return true
+	}
+	return args[i] == "guard" && i+1 < len(args) && isBackend(args[i+1])
 }
 
 func isBackend(arg string) bool {
@@ -998,6 +1154,12 @@ func reportFromOutcome(out runner.Outcome) output.Report {
 	if out.PerAttemptTimeout > 0 {
 		report.PerAttemptTimeoutSeconds = output.Seconds(out.PerAttemptTimeout)
 	}
+	if out.RequiredSuccesses > 1 {
+		report.RequiredSuccesses = out.RequiredSuccesses
+	}
+	if out.StableFor > 0 {
+		report.StableForSeconds = output.Seconds(out.StableFor)
+	}
 	for _, rec := range out.Conditions {
 		report.Conditions = append(report.Conditions, output.ConditionReport{
 			Backend:        rec.Backend,
@@ -1009,6 +1171,7 @@ func reportFromOutcome(out runner.Outcome) output.Report {
 			Detail:         rec.Detail,
 			LastError:      rec.LastError,
 			Fatal:          rec.Fatal,
+			Guard:          rec.Guard,
 		})
 	}
 	return report
@@ -1073,6 +1236,8 @@ Global flags:
   --interval duration      Poll interval (default: 2s)
   --attempt-timeout duration
                            Per-attempt deadline; 0 disables (default: 0)
+  --successes N            Consecutive successful checks required (default: 1)
+  --stable-for duration    Required continuous success duration (default: 0)
   --output text|json       Output format (default: text); JSON goes to stdout
   --mode all|any           Condition mode (default: all)
   --verbose                Show each poll attempt
@@ -1143,9 +1308,13 @@ Log:
 
 Kubernetes:
   waitfor k8s [flags] RESOURCE
-  RESOURCE format: kind/name  (e.g. pod/myapp, deployment/api, job/migrate)
+  RESOURCE format: kind/name, or kind with --selector
   --condition type         Condition type to check (default: Ready)
   --jsonpath expr          JSON expression on the resource (mutually exclusive with --condition)
+  --for ready|rollout|complete
+                           Typed wait for pods, workloads, or jobs
+  --selector labels        Label selector for kind-level waits
+  --all                    Require every selected resource to satisfy --for
   --namespace ns           Namespace (default: default)
   --kubeconfig path        Path to kubeconfig file
 
@@ -1159,6 +1328,9 @@ Examples:
   waitfor log /var/log/app.log --matches "ERROR:.*timeout" --from-start
   waitfor exec --output-contains Running -- kubectl get pod myapp
   waitfor k8s deployment/api --condition Available
+  waitfor k8s deployment/api --for rollout
+  waitfor k8s pod --selector app=api --for ready --all
+  waitfor http https://api.example.com/health -- guard log /var/log/app.log --matches "FATAL|panic"
   waitfor --timeout 10m http https://api.example.com/health -- tcp localhost:5432
 
 Exit codes:

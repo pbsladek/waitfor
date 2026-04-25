@@ -41,6 +41,8 @@ type Report struct {
 	TimeoutSeconds           float64           `json:"timeout_seconds"`
 	IntervalSeconds          float64           `json:"interval_seconds"`
 	PerAttemptTimeoutSeconds float64           `json:"per_attempt_timeout_seconds,omitempty"`
+	RequiredSuccesses        int               `json:"required_successes,omitempty"`
+	StableForSeconds         float64           `json:"stable_for_seconds,omitempty"`
 	Conditions               []ConditionReport `json:"conditions"`
 }
 
@@ -54,6 +56,7 @@ type ConditionReport struct {
 	Detail         string  `json:"detail,omitempty"`
 	LastError      string  `json:"last_error,omitempty"`
 	Fatal          bool    `json:"fatal,omitempty"`
+	Guard          bool    `json:"guard,omitempty"`
 }
 
 func NewPrinter(w io.Writer, format Format, verbose bool) *Printer {

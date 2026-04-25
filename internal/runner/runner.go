@@ -3,6 +3,8 @@ package runner
 import (
 	"context"
 	"errors"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/pbsladek/wait-for/internal/condition"
@@ -30,6 +32,8 @@ type Config struct {
 	Timeout           time.Duration
 	Interval          time.Duration
 	PerAttemptTimeout time.Duration
+	RequiredSuccesses int
+	StableFor         time.Duration
 	Mode              Mode
 	OnAttempt         func(AttemptEvent)
 }
@@ -53,6 +57,7 @@ type ConditionResult struct {
 	Detail    string
 	LastError string
 	Fatal     bool
+	Guard     bool
 }
 
 type Outcome struct {
@@ -62,6 +67,8 @@ type Outcome struct {
 	Timeout           time.Duration
 	Interval          time.Duration
 	PerAttemptTimeout time.Duration
+	RequiredSuccesses int
+	StableFor         time.Duration
 	Conditions        []ConditionResult
 }
 
@@ -94,7 +101,37 @@ func validateRunConfig(cfg Config) error {
 	if cfg.PerAttemptTimeout < 0 {
 		return errors.New("per-attempt timeout cannot be negative")
 	}
+	if cfg.RequiredSuccesses < 0 {
+		return errors.New("successes cannot be negative")
+	}
+	if cfg.StableFor < 0 {
+		return errors.New("stable-for cannot be negative")
+	}
+	if !hasReadyCondition(cfg.Conditions) {
+		return errors.New("at least one non-guard condition is required")
+	}
 	return nil
+}
+
+func conditionRole(cond condition.Condition) condition.Role {
+	if provider, ok := cond.(condition.RoleProvider); ok {
+		return provider.ConditionRole()
+	}
+	return condition.RoleReady
+}
+
+func hasReadyCondition(conditions []condition.Condition) bool {
+	return readyConditionCount(conditions) > 0
+}
+
+func readyConditionCount(conditions []condition.Condition) int {
+	count := 0
+	for _, cond := range conditions {
+		if conditionRole(cond) == condition.RoleReady {
+			count++
+		}
+	}
+	return count
 }
 
 func finalStatus(ctx context.Context, records []ConditionResult, mode Mode) Status {
@@ -116,6 +153,9 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 	if err := validateRunConfig(cfg); err != nil {
 		return Outcome{}, err
 	}
+	if cfg.RequiredSuccesses == 0 {
+		cfg.RequiredSuccesses = 1
+	}
 	if cfg.PerAttemptTimeout > cfg.Timeout {
 		cfg.PerAttemptTimeout = cfg.Timeout
 	}
@@ -125,11 +165,14 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 	defer cancel()
 
 	records := make([]ConditionResult, len(cfg.Conditions))
+	var readyRemaining atomic.Int64
+	readyRemaining.Store(int64(readyConditionCount(cfg.Conditions)))
 	for i, cond := range cfg.Conditions {
 		desc := cond.Descriptor()
 		records[i].Backend = desc.Backend
 		records[i].Target = desc.Target
 		records[i].Name = desc.DisplayName()
+		records[i].Guard = conditionRole(cond) == condition.RoleGuard
 	}
 
 	g, runCtx := errgroup.WithContext(ctx)
@@ -137,7 +180,7 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 		i := i
 		cond := cond
 		g.Go(func() error {
-			runCondition(runCtx, cond, cfg, start, &records[i], cancel)
+			runCondition(runCtx, cond, cfg, start, &records[i], cancel, &readyRemaining)
 			return nil
 		})
 	}
@@ -149,6 +192,8 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 		Timeout:           cfg.Timeout,
 		Interval:          cfg.Interval,
 		PerAttemptTimeout: cfg.PerAttemptTimeout,
+		RequiredSuccesses: cfg.RequiredSuccesses,
+		StableFor:         cfg.StableFor,
 		Conditions:        append([]ConditionResult(nil), records...),
 		Status:            finalStatus(ctx, records, cfg.Mode),
 	}
@@ -170,6 +215,8 @@ func updateRecord(record *ConditionResult, result condition.Result, conditionSta
 	record.Detail = result.Detail
 	if result.Err != nil {
 		record.LastError = result.Err.Error()
+	} else {
+		record.LastError = ""
 	}
 	if result.Status == condition.CheckFatal {
 		record.Fatal = true
@@ -177,6 +224,53 @@ func updateRecord(record *ConditionResult, result condition.Result, conditionSta
 	if result.Status == condition.CheckSatisfied {
 		record.Satisfied = true
 	}
+}
+
+type stabilityProgress struct {
+	consecutive int
+	stableSince time.Time
+}
+
+func (p *stabilityProgress) reset() {
+	p.consecutive = 0
+	p.stableSince = time.Time{}
+}
+
+func applyStabilityThreshold(result condition.Result, cfg Config, progress *stabilityProgress, now time.Time) condition.Result {
+	if result.Status != condition.CheckSatisfied {
+		progress.reset()
+		return result
+	}
+	progress.consecutive++
+	if progress.stableSince.IsZero() {
+		progress.stableSince = now
+	}
+	if stabilitySatisfied(cfg, progress, now) {
+		return result
+	}
+	return condition.Unsatisfied(stabilityDetail(cfg, progress, now), errors.New("stability threshold not met"))
+}
+
+func stabilitySatisfied(cfg Config, progress *stabilityProgress, now time.Time) bool {
+	if progress.consecutive < cfg.RequiredSuccesses {
+		return false
+	}
+	return cfg.StableFor == 0 || now.Sub(progress.stableSince) >= cfg.StableFor
+}
+
+func stabilityDetail(cfg Config, progress *stabilityProgress, now time.Time) string {
+	if progress.consecutive < cfg.RequiredSuccesses {
+		return "satisfied " + pluralCount(progress.consecutive, "success") + " of " + pluralCount(cfg.RequiredSuccesses, "success")
+	}
+	elapsed := now.Sub(progress.stableSince)
+	return "stable for " + elapsed.Truncate(time.Millisecond).String() + " of " + cfg.StableFor.String()
+}
+
+func pluralCount(n int, word string) string {
+	if n == 1 {
+		return "1 " + word
+	}
+	return strconv.Itoa(n) + " " + word + "es"
 }
 
 // buildAttemptEvent constructs the callback payload for one check attempt.
@@ -219,8 +313,10 @@ func runCondition(
 	start time.Time,
 	record *ConditionResult,
 	cancel context.CancelFunc,
+	readyRemaining *atomic.Int64,
 ) {
 	conditionStart := time.Now()
+	progress := stabilityProgress{}
 	timer := time.NewTimer(cfg.Interval)
 	if !timer.Stop() {
 		<-timer.C
@@ -239,20 +335,18 @@ func runCondition(
 		attemptCtx, attemptCancel := makeAttemptContext(ctx, cfg.PerAttemptTimeout)
 		result := cond.Check(attemptCtx)
 		attemptCancel()
+		if record.Guard {
+			progress.reset()
+		} else {
+			result = applyStabilityThreshold(result, cfg, &progress, time.Now())
+		}
 
 		updateRecord(record, result, conditionStart, start)
+		done := resultEndsCondition(result, cfg, record, cancel, readyRemaining)
 		if cfg.OnAttempt != nil {
 			cfg.OnAttempt(buildAttemptEvent(record, attempt, result, start))
 		}
-
-		switch result.Status {
-		case condition.CheckFatal:
-			cancel()
-			return
-		case condition.CheckSatisfied:
-			if cfg.Mode == ModeAny {
-				cancel()
-			}
+		if done {
 			return
 		}
 
@@ -262,17 +356,46 @@ func runCondition(
 	}
 }
 
+func resultEndsCondition(
+	result condition.Result,
+	cfg Config,
+	record *ConditionResult,
+	cancel context.CancelFunc,
+	readyRemaining *atomic.Int64,
+) bool {
+	switch result.Status {
+	case condition.CheckFatal:
+		cancel()
+		return true
+	case condition.CheckSatisfied:
+		cancelSatisfiedRun(cfg, record, cancel, readyRemaining)
+		return true
+	default:
+		return false
+	}
+}
+
+func cancelSatisfiedRun(cfg Config, record *ConditionResult, cancel context.CancelFunc, readyRemaining *atomic.Int64) {
+	if cfg.Mode == ModeAny {
+		cancel()
+		return
+	}
+	if !record.Guard && readyRemaining.Add(-1) == 0 {
+		cancel()
+	}
+}
+
 func outcomeSatisfied(records []ConditionResult, mode Mode) bool {
 	if mode == ModeAny {
 		for _, rec := range records {
-			if rec.Satisfied {
+			if !rec.Guard && rec.Satisfied {
 				return true
 			}
 		}
 		return false
 	}
 	for _, rec := range records {
-		if !rec.Satisfied {
+		if !rec.Guard && !rec.Satisfied {
 			return false
 		}
 	}
