@@ -398,13 +398,13 @@ waitfor exec \
 
 ---
 
-## 20. Verbose mode with jq to stream attempts as newline-delimited JSON
+## 20. Parse final JSON output with jq
 
-In JSON mode every poll updates the same JSON document. Pair `--verbose` with
-a short interval to monitor attempt-by-attempt in a pipeline:
+In JSON mode `waitfor` writes one final JSON document to stdout. Human progress
+stays off stdout, so the result can be piped directly to `jq`:
 
 ```bash
-waitfor --output json --verbose --interval 1s \
+waitfor --output json --interval 1s \
   http https://api.example.com/health --status 200 2>/dev/null | \
   jq 'if .status == "satisfied" then "✓ ready after \(.elapsed_seconds)s" else empty end'
 ```

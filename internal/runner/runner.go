@@ -215,6 +215,8 @@ func updateRecord(record *ConditionResult, result condition.Result, conditionSta
 	record.Detail = result.Detail
 	if result.Err != nil {
 		record.LastError = result.Err.Error()
+	} else {
+		record.LastError = ""
 	}
 	if result.Status == condition.CheckFatal {
 		record.Fatal = true
@@ -340,11 +342,11 @@ func runCondition(
 		}
 
 		updateRecord(record, result, conditionStart, start)
+		done := resultEndsCondition(result, cfg, record, cancel, readyRemaining)
 		if cfg.OnAttempt != nil {
 			cfg.OnAttempt(buildAttemptEvent(record, attempt, result, start))
 		}
-
-		if resultEndsCondition(result, cfg, record, cancel, readyRemaining) {
+		if done {
 			return
 		}
 

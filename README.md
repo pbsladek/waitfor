@@ -8,6 +8,35 @@ structured JSON result.
 Human-readable progress is written to stderr. JSON output is written to stdout
 without progress lines so it is safe to consume from scripts.
 
+## Docker
+
+Published image:
+
+```bash
+docker pull pwbsladek/waitfor:latest
+docker run --rm pwbsladek/waitfor:latest --help
+```
+
+Tagged releases are published as `pwbsladek/waitfor:<tag>`. The image is
+built from Docker Hardened Images: `dhi.io/golang:1.26-dev` for compilation and
+`dhi.io/static:20250419` for the distroless runtime.
+
+Local builds require access to DHI:
+
+```bash
+docker login dhi.io
+make docker-build
+make docker-run ARGS="http https://api.example.com/health --status 200"
+```
+
+Publishing a multi-arch image:
+
+```bash
+docker login
+docker login dhi.io
+make docker-push DOCKER_TAG=tagname
+```
+
 ## Examples
 
 ```bash

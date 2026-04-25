@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/pbsladek/wait-for/internal/expr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -96,6 +97,9 @@ func validateK8sResource(resource string, selector string) error {
 func (c *KubernetesCondition) checkSelected(ctx context.Context, getter KubernetesGetter) Result {
 	items, err := getter.List(ctx, c.Resource, c.Namespace, c.Selector)
 	if err != nil {
+		if apierrors.IsBadRequest(err) {
+			return Fatal(err)
+		}
 		return Unsatisfied("", err)
 	}
 	if len(items) == 0 {
@@ -166,26 +170,39 @@ func checkK8sWaitFor(obj map[string]any, waitFor string) Result {
 }
 
 func checkK8sSelected(items []map[string]any, waitFor string, all bool) Result {
-	var last Result
+	firstSatisfied, lastUnsatisfied, fatal := scanK8sSelected(items, waitFor)
+	if fatal != nil {
+		return *fatal
+	}
+	if !all && firstSatisfied.Status == CheckSatisfied {
+		return Satisfied(fmt.Sprintf("1 of %d resources satisfied: %s", len(items), firstSatisfied.Detail))
+	}
+	if all && lastUnsatisfied.Status == "" {
+		return Satisfied(fmt.Sprintf("%d resources satisfied", len(items)))
+	}
+	if lastUnsatisfied.Detail == "" {
+		lastUnsatisfied.Detail = "no selected resources satisfied"
+	}
+	return Unsatisfied(lastUnsatisfied.Detail, lastUnsatisfied.Err)
+}
+
+func scanK8sSelected(items []map[string]any, waitFor string) (Result, Result, *Result) {
+	var firstSatisfied Result
+	var lastUnsatisfied Result
 	for _, item := range items {
 		result := checkK8sWaitFor(item, waitFor)
 		if result.Status == CheckFatal {
-			return result
+			return Result{}, Result{}, &result
 		}
-		if result.Status == CheckSatisfied && !all {
-			return Satisfied(fmt.Sprintf("1 of %d resources satisfied: %s", len(items), result.Detail))
+		if result.Status == CheckSatisfied {
+			if firstSatisfied.Status == "" {
+				firstSatisfied = result
+			}
+			continue
 		}
-		if result.Status != CheckSatisfied {
-			last = result
-		}
+		lastUnsatisfied = result
 	}
-	if all && last.Status == "" {
-		return Satisfied(fmt.Sprintf("%d resources satisfied", len(items)))
-	}
-	if last.Detail == "" {
-		last.Detail = "no selected resources satisfied"
-	}
-	return Unsatisfied(last.Detail, last.Err)
+	return firstSatisfied, lastUnsatisfied, nil
 }
 
 func checkK8sReady(obj map[string]any) Result {
@@ -257,8 +274,12 @@ func checkDeploymentRollout(obj map[string]any) Result {
 	}
 	updated := k8sInt64(obj, "status", "updatedReplicas")
 	available := k8sInt64(obj, "status", "availableReplicas")
+	total := k8sInt64(obj, "status", "replicas")
 	if updated < desired {
 		return k8sRolloutUnsatisfied("updated replicas", updated, desired)
+	}
+	if total > updated {
+		return k8sRolloutUnsatisfied("total replicas after old replicas terminate", total, updated)
 	}
 	if available < desired {
 		return k8sRolloutUnsatisfied("available replicas", available, desired)

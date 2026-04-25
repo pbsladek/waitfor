@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/pbsladek/wait-for/internal/expr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -102,7 +103,7 @@ func TestKubernetesConditionDefaultConditionReady(t *testing.T) {
 }
 
 func TestKubernetesConditionDeploymentRollout(t *testing.T) {
-	client := fake.NewSimpleDynamicClient(runtime.NewScheme(), rolloutDeployObject(3, 3, 3, 2, 2))
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme(), rolloutDeployObject(3, 3, 3, 3, 2, 2))
 	cond := NewKubernetes("deployment/myapp")
 	cond.Getter = NewDynamicKubernetesGetterWithClient(client)
 	cond.WaitFor = "rollout"
@@ -114,7 +115,7 @@ func TestKubernetesConditionDeploymentRollout(t *testing.T) {
 }
 
 func TestKubernetesConditionDeploymentRolloutWaitsForObservedGeneration(t *testing.T) {
-	client := fake.NewSimpleDynamicClient(runtime.NewScheme(), rolloutDeployObject(3, 3, 3, 3, 2))
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme(), rolloutDeployObject(3, 3, 3, 3, 3, 2))
 	cond := NewKubernetes("deployment/myapp")
 	cond.Getter = NewDynamicKubernetesGetterWithClient(client)
 	cond.WaitFor = "rollout"
@@ -125,6 +126,21 @@ func TestKubernetesConditionDeploymentRolloutWaitsForObservedGeneration(t *testi
 	}
 	if result.Detail != "observed generation 2, expected 3" {
 		t.Fatalf("detail = %q, want observed generation detail", result.Detail)
+	}
+}
+
+func TestKubernetesConditionDeploymentRolloutWaitsForOldReplicas(t *testing.T) {
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme(), rolloutDeployObject(3, 4, 3, 3, 2, 2))
+	cond := NewKubernetes("deployment/myapp")
+	cond.Getter = NewDynamicKubernetesGetterWithClient(client)
+	cond.WaitFor = "rollout"
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckUnsatisfied {
+		t.Fatalf("status = %s, want unsatisfied", result.Status)
+	}
+	if result.Detail != "total replicas after old replicas terminate 4, expected 3" {
+		t.Fatalf("detail = %q, want old replica detail", result.Detail)
 	}
 }
 
@@ -225,6 +241,31 @@ func TestKubernetesConditionSelectorAnySatisfied(t *testing.T) {
 	}
 }
 
+func TestKubernetesConditionSelectorFatalPrecedesAnySatisfied(t *testing.T) {
+	failed := podObject("False")
+	failed.Object["status"].(map[string]any)["phase"] = "Failed"
+	tests := []struct {
+		name  string
+		items []map[string]any
+	}{
+		{"failed first", []map[string]any{failed.Object, podObject("True").Object}},
+		{"failed last", []map[string]any{podObject("True").Object, failed.Object}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := NewKubernetes("pod")
+			cond.Getter = &listGetter{items: tt.items}
+			cond.Selector = "app=api"
+			cond.WaitFor = "ready"
+
+			result := cond.Check(t.Context())
+			if result.Status != CheckFatal {
+				t.Fatalf("status = %s, want fatal", result.Status)
+			}
+		})
+	}
+}
+
 func TestKubernetesConditionSelectorAllWaitsForEveryResource(t *testing.T) {
 	cond := NewKubernetes("pod")
 	cond.Getter = &listGetter{items: []map[string]any{
@@ -250,6 +291,18 @@ func TestKubernetesConditionSelectorNoMatches(t *testing.T) {
 	result := cond.Check(t.Context())
 	if result.Status != CheckUnsatisfied {
 		t.Fatalf("status = %s, want unsatisfied", result.Status)
+	}
+}
+
+func TestKubernetesConditionSelectorBadRequestFatal(t *testing.T) {
+	cond := NewKubernetes("pod")
+	cond.Getter = &listGetter{err: apierrors.NewBadRequest("invalid label selector")}
+	cond.Selector = "app in ("
+	cond.WaitFor = "ready"
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("status = %s, want fatal", result.Status)
 	}
 }
 
@@ -521,11 +574,12 @@ func deployObject() *unstructured.Unstructured {
 	return obj
 }
 
-func rolloutDeployObject(replicas, updated, available, generation, observed int64) *unstructured.Unstructured {
+func rolloutDeployObject(replicas, total, updated, available, generation, observed int64) *unstructured.Unstructured {
 	obj := deployObject()
 	obj.Object["metadata"].(map[string]any)["generation"] = generation
 	obj.Object["spec"] = map[string]any{"replicas": replicas}
 	obj.Object["status"] = map[string]any{
+		"replicas":           total,
 		"updatedReplicas":    updated,
 		"availableReplicas":  available,
 		"observedGeneration": observed,

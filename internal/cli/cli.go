@@ -18,6 +18,7 @@ import (
 	"github.com/pbsladek/wait-for/internal/runner"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 const (
@@ -839,7 +840,10 @@ func validateKubernetesOptions(resource, conditionName, jsonpath, waitFor, selec
 	if err := validateKubernetesMatcherOptions(conditionName, jsonpath, waitFor); err != nil {
 		return err
 	}
-	return validateKubernetesSelectorOptions(resource, selector, waitFor, all)
+	if err := validateKubernetesSelectorOptions(resource, selector, waitFor, all); err != nil {
+		return err
+	}
+	return validateKubernetesWaitKind(resource, selector, waitFor)
 }
 
 func validateKubernetesMatcherOptions(conditionName, jsonpath, waitFor string) error {
@@ -864,7 +868,70 @@ func validateKubernetesSelectorOptions(resource, selector, waitFor string, all b
 	case selector != "" && strings.Contains(resource, "/"):
 		return fmt.Errorf("--selector requires a resource kind without /name syntax")
 	default:
+		return validateKubernetesSelector(selector)
+	}
+}
+
+func validateKubernetesSelector(selector string) error {
+	if selector == "" {
 		return nil
+	}
+	if _, err := labels.Parse(selector); err != nil {
+		return fmt.Errorf("invalid kubernetes selector: %w", err)
+	}
+	return nil
+}
+
+func validateKubernetesWaitKind(resource, selector, waitFor string) error {
+	if waitFor == "" {
+		return nil
+	}
+	kind := kubernetesResourceKind(resource, selector)
+	if kubernetesWaitSupportsKind(waitFor, kind) {
+		return nil
+	}
+	return fmt.Errorf("--for %s is not supported for kubernetes resource kind %q", waitFor, kind)
+}
+
+func kubernetesResourceKind(resource, selector string) string {
+	if selector != "" {
+		return strings.ToLower(resource)
+	}
+	kind, _, _ := strings.Cut(resource, "/")
+	return strings.ToLower(kind)
+}
+
+func kubernetesWaitSupportsKind(waitFor, kind string) bool {
+	switch waitFor {
+	case "ready":
+		return kubernetesKindIs(kind, "pod")
+	case "complete":
+		return kubernetesKindIs(kind, "job")
+	case "rollout":
+		return kubernetesKindIs(kind, "deployment") || kubernetesKindIs(kind, "statefulset") || kubernetesKindIs(kind, "daemonset")
+	default:
+		return false
+	}
+}
+
+func kubernetesKindIs(kind, canonical string) bool {
+	return normalizeKubernetesKind(kind) == canonical
+}
+
+func normalizeKubernetesKind(kind string) string {
+	switch strings.ToLower(kind) {
+	case "pod", "pods", "po":
+		return "pod"
+	case "deployment", "deployments", "deploy":
+		return "deployment"
+	case "statefulset", "statefulsets", "sts":
+		return "statefulset"
+	case "daemonset", "daemonsets", "ds":
+		return "daemonset"
+	case "job", "jobs":
+		return "job"
+	default:
+		return strings.ToLower(kind)
 	}
 }
 
@@ -964,7 +1031,7 @@ func parseExecCondition(segment []string) (condition.Condition, error) {
 }
 
 func isSeparatorBefore(args []string, i int, current []string) bool {
-	if args[i] != "--" || i+1 >= len(args) || !isBackend(args[i+1]) {
+	if args[i] != "--" || i+1 >= len(args) || !isConditionStart(args, i+1) {
 		return false
 	}
 	if isValueForPreviousFlag(args, i) {
@@ -1032,7 +1099,7 @@ func splitConditionSegments(args []string) ([][]string, error) {
 	if args[0] == "--" {
 		return nil, fmt.Errorf("empty condition before --")
 	}
-	if args[len(args)-1] == "--" {
+	if args[len(args)-1] == "--" && !isValueForPreviousFlag(args, len(args)-1) {
 		return nil, fmt.Errorf("empty trailing condition")
 	}
 	var segments [][]string
@@ -1055,10 +1122,14 @@ func splitConditionSegments(args []string) ([][]string, error) {
 	return segments, nil
 }
 
-func isBackend(arg string) bool {
-	if arg == "guard" {
+func isConditionStart(args []string, i int) bool {
+	if isBackend(args[i]) {
 		return true
 	}
+	return args[i] == "guard" && i+1 < len(args) && isBackend(args[i+1])
+}
+
+func isBackend(arg string) bool {
 	_, ok := backendParsers[arg]
 	return ok
 }

@@ -263,6 +263,31 @@ func TestExecuteStableSuccesses(t *testing.T) {
 	}
 }
 
+func TestExecuteStableSuccessesJSONClearsLastError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ready")
+	if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{
+		"--output", "json",
+		"--successes", "2",
+		"--interval", "1ms",
+		"file", path, "--exists",
+	}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitSatisfied, stdout.String(), stderr.String())
+	}
+	var report output.Report
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("invalid json: %v: %s", err, stdout.String())
+	}
+	if got := report.Conditions[0].LastError; got != "" {
+		t.Fatalf("last_error = %q, want empty after final success", got)
+	}
+}
+
 func TestExecuteExecRequiresFlagsBeforeSeparator(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := Execute(t.Context(), []string{
@@ -345,7 +370,11 @@ func TestSplitConditionSegments(t *testing.T) {
 		{name: "exec command named backend", args: []string{"exec", "--", "http", "--version"}, want: 1},
 		{name: "condition after exec command", args: []string{"exec", "--", "/bin/true", "--", "http", "http://example.com"}, want: 2},
 		{name: "literal separator flag value before backend token", args: []string{"file", "README.md", "--contains", "--", "http"}, want: 1},
+		{name: "literal trailing separator flag value", args: []string{"file", "README.md", "--contains", "--"}, want: 1},
 		{name: "guard condition", args: []string{"file", "README.md", "--exists", "--", "guard", "log", "app.log", "--contains", "panic"}, want: 2},
+		{name: "literal guard in exec command", args: []string{"exec", "--", "/bin/echo", "--", "guard"}, want: 1},
+		{name: "dns literal separator value before guard", args: []string{"dns", "example.com", "--contains", "--", "--", "guard", "log", "app.log", "--contains", "panic"}, want: 2},
+		{name: "dns equals literal separator value before guard", args: []string{"dns", "example.com", "--equals", "--", "--", "guard", "log", "app.log", "--contains", "panic"}, want: 2},
 	}
 
 	for _, tt := range tests {
@@ -590,7 +619,11 @@ func TestParseKubernetesConditionErrors(t *testing.T) {
 		{"bad for", []string{"k8s", "pod/a", "--for", "missing"}, "invalid kubernetes --for"},
 		{"selector without for", []string{"k8s", "pod", "--selector", "app=api"}, "--selector requires --for"},
 		{"selector with name", []string{"k8s", "pod/a", "--selector", "app=api", "--for", "ready"}, "resource kind without /name"},
+		{"invalid selector", []string{"k8s", "pod", "--selector", "app in (", "--for", "ready"}, "invalid kubernetes selector"},
 		{"all without selector", []string{"k8s", "pod/a", "--for", "ready", "--all"}, "--all requires --selector"},
+		{"ready wrong kind", []string{"k8s", "deployment/a", "--for", "ready"}, "not supported"},
+		{"complete wrong kind", []string{"k8s", "pod/a", "--for", "complete"}, "not supported"},
+		{"rollout wrong kind", []string{"k8s", "job/a", "--for", "rollout"}, "not supported"},
 		{"bad jsonpath", []string{"k8s", "pod/a", "--jsonpath", "  "}, "required"},
 		{"unknown flag", []string{"k8s", "pod/a", "--no-such-flag"}, ""},
 	}

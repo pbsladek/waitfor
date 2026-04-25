@@ -43,10 +43,11 @@ exec-condition := exec [exec-flags] -- command [args ...]
 ```
 
 `exec` uses `--` to separate its own flags from the command being run. After
-that separator every token belongs to the command, including any backend names.
-This means an exec command that passes a literal `-- http`, `-- tcp`, `-- dns`,
-`-- docker`, `-- exec`, `-- file`, `-- log`, or `-- k8s` token pair cannot be
-followed unambiguously by a second waitfor condition.
+that separator, tokens belong to the command until a later `-- BACKEND` or
+`-- guard BACKEND` condition separator is encountered. This means an exec
+command that passes a literal `-- http`, `-- tcp`, `-- dns`, `-- docker`,
+`-- exec`, `-- file`, `-- log`, `-- k8s`, or `-- guard BACKEND` token sequence
+cannot be followed unambiguously by a second waitfor condition.
 
 A `--` that appears immediately after a value-taking backend flag (such as
 `--contains`) is treated as that flag's value, not as a condition separator:
