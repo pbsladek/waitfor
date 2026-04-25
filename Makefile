@@ -4,8 +4,9 @@ DOCKER_IMAGE ?= pwbsladek/waitfor
 DOCKER_TAG ?= local
 DHI_GO_IMAGE ?= dhi.io/golang:1.26-dev
 DHI_RUNTIME_IMAGE ?= dhi.io/static:20250419
+VERSION ?=
 
-.PHONY: build build-linux build-arm docker-build docker-push docker-run test test-e2e test-integration test-integration-docker test-integration-k8s lint security coverage bench release clean
+.PHONY: build build-linux build-arm docker-build docker-push docker-run test test-e2e test-integration test-integration-docker test-integration-k8s lint security coverage bench tag push-tag release-tag release clean
 
 build:
 	go build -o bin/$(BINARY) $(PKG)
@@ -55,6 +56,19 @@ coverage:
 
 bench:
 	go test ./internal/cli ./internal/output ./internal/runner ./internal/condition -run '^$$' -bench . -benchmem -count=10
+
+tag:
+	@test -n "$(VERSION)" || (echo "VERSION is required, for example: make tag VERSION=v0.1.0" && exit 1)
+	@case "$(VERSION)" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "VERSION must look like v0.1.0"; exit 1;; esac
+	@git diff --quiet || (echo "working tree has uncommitted changes; commit before tagging" && exit 1)
+	@git diff --cached --quiet || (echo "index has staged changes; commit before tagging" && exit 1)
+	git tag -a "$(VERSION)" -m "Release $(VERSION)"
+
+push-tag:
+	@test -n "$(VERSION)" || (echo "VERSION is required, for example: make push-tag VERSION=v0.1.0" && exit 1)
+	git push origin "$(VERSION)"
+
+release-tag: tag push-tag
 
 release:
 	goreleaser release --clean
