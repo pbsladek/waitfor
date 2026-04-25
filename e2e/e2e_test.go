@@ -377,7 +377,7 @@ func TestLogTailsNewLines(t *testing.T) {
 	// Append matching content after a short delay.
 	go func() {
 		time.Sleep(30 * time.Millisecond)
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- test appends to path created by t.TempDir.
 		if err != nil {
 			return
 		}
@@ -442,7 +442,7 @@ func TestLogMinMatchesAcrossPolls(t *testing.T) {
 	// Append two more matches after a short delay.
 	go func() {
 		time.Sleep(30 * time.Millisecond)
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- test appends to path created by t.TempDir.
 		if err != nil {
 			return
 		}

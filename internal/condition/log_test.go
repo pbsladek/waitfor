@@ -76,7 +76,7 @@ func TestLogNewContentAfterInit(t *testing.T) {
 		t.Fatal("first poll should not be satisfied (existing content skipped)")
 	}
 
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- test appends to path created by t.TempDir.
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +270,7 @@ func TestLogMinMatchesAccumulatesAcrossPolls(t *testing.T) {
 	}
 
 	// Append two more matching lines.
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- test appends to path created by t.TempDir.
 	if err != nil {
 		t.Fatal(err)
 	}
