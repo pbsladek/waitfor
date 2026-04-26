@@ -333,6 +333,71 @@ func TestRunNormalizesPerAttemptTimeoutToGlobalTimeout(t *testing.T) {
 	}
 }
 
+func TestRunRecordsBackoffConfig(t *testing.T) {
+	out, err := Run(t.Context(), Config{
+		Conditions:  []condition.Condition{&fakeCondition{name: "ready", satisfyAfter: 1}},
+		Timeout:     25 * time.Millisecond,
+		Interval:    time.Millisecond,
+		MaxInterval: 5 * time.Millisecond,
+		Backoff:     BackoffExponential,
+		Jitter:      0.25,
+		Mode:        ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Backoff != BackoffExponential || out.MaxInterval != 5*time.Millisecond || out.Jitter != 0.25 {
+		t.Fatalf("backoff config = %s/%s/%v", out.Backoff, out.MaxInterval, out.Jitter)
+	}
+}
+
+func TestPollScheduleExponentialIntervals(t *testing.T) {
+	schedule := newPollSchedule(Config{
+		Interval:    10 * time.Millisecond,
+		MaxInterval: 25 * time.Millisecond,
+		Backoff:     BackoffExponential,
+	})
+	got := []time.Duration{
+		schedule.next(false),
+		schedule.next(false),
+		schedule.next(false),
+		schedule.next(true),
+	}
+	want := []time.Duration{
+		10 * time.Millisecond,
+		20 * time.Millisecond,
+		25 * time.Millisecond,
+		10 * time.Millisecond,
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("interval[%d] = %s, want %s", i, got[i], want[i])
+		}
+	}
+}
+
+func TestPollScheduleJitterRange(t *testing.T) {
+	schedule := newPollSchedule(Config{
+		Interval:    100 * time.Millisecond,
+		MaxInterval: 100 * time.Millisecond,
+		Backoff:     BackoffConstant,
+		Jitter:      0.5,
+	})
+	got := schedule.next(false)
+	if got < 50*time.Millisecond || got > 150*time.Millisecond {
+		t.Fatalf("jittered interval = %s, want within 50ms..150ms", got)
+	}
+}
+
+func TestDurationHelpers(t *testing.T) {
+	if got := minDuration(2*time.Second, time.Second); got != time.Second {
+		t.Fatalf("minDuration = %s, want 1s", got)
+	}
+	if got := maxDuration(time.Nanosecond, time.Millisecond); got != time.Millisecond {
+		t.Fatalf("maxDuration = %s, want 1ms", got)
+	}
+}
+
 func TestOutcomeStatusMethods(t *testing.T) {
 	tests := []struct {
 		status    Status
@@ -386,5 +451,37 @@ func TestRunRejectsNegativePerAttemptTimeout(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestRunRejectsInvalidBackoffConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{
+			name: "max interval below interval",
+			cfg:  Config{MaxInterval: time.Nanosecond},
+		},
+		{
+			name: "invalid backoff",
+			cfg:  Config{MaxInterval: time.Millisecond, Backoff: Backoff("linear")},
+		},
+		{
+			name: "negative jitter",
+			cfg:  Config{MaxInterval: time.Millisecond, Jitter: -0.1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.cfg
+			cfg.Conditions = []condition.Condition{&fakeCondition{name: "ready", satisfyAfter: 1}}
+			cfg.Timeout = time.Second
+			cfg.Interval = time.Millisecond
+			_, err := Run(t.Context(), cfg)
+			if err == nil {
+				t.Fatal("Run() expected error, got nil")
+			}
+		})
 	}
 }

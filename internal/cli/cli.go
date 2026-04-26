@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +74,16 @@ func newCommand(stdin io.Reader, stdout io.Writer, stderr io.Writer) *cobra.Comm
 		SilenceUsage:       true,
 		SilenceErrors:      true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if isDoctorCommand(args) {
+				code, err := runDoctor(args[1:], stdout, stderr)
+				if err != nil {
+					return exitError{code: code, err: err}
+				}
+				if code != ExitSatisfied {
+					return exitError{code: code}
+				}
+				return nil
+			}
 			if wantsHelp(args) {
 				_, _ = io.WriteString(stdout, helpText())
 				return nil
@@ -96,6 +107,9 @@ func newCommand(stdin io.Reader, stdout io.Writer, stderr io.Writer) *cobra.Comm
 type globalOptions struct {
 	timeout           time.Duration
 	interval          time.Duration
+	maxInterval       time.Duration
+	backoff           runner.Backoff
+	jitter            float64
 	perAttemptTimeout time.Duration
 	requiredSuccesses int
 	stableFor         time.Duration
@@ -124,6 +138,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		Conditions:        conditions,
 		Timeout:           opts.timeout,
 		Interval:          opts.interval,
+		MaxInterval:       opts.maxInterval,
+		Backoff:           opts.backoff,
+		Jitter:            opts.jitter,
 		PerAttemptTimeout: opts.perAttemptTimeout,
 		RequiredSuccesses: opts.requiredSuccesses,
 		StableFor:         opts.stableFor,
@@ -172,28 +189,52 @@ func applyFormatAndMode(opts globalOptions, format, mode string) (globalOptions,
 	default:
 		return opts, fmt.Errorf("invalid mode %q", mode)
 	}
-	if opts.timeout <= 0 {
-		return opts, fmt.Errorf("timeout must be positive")
-	}
-	if opts.interval <= 0 {
-		return opts, fmt.Errorf("interval must be positive")
-	}
-	if opts.perAttemptTimeout < 0 {
-		return opts, fmt.Errorf("attempt-timeout cannot be negative")
-	}
-	if opts.requiredSuccesses < 1 {
-		return opts, fmt.Errorf("successes must be at least 1")
-	}
-	if opts.stableFor < 0 {
-		return opts, fmt.Errorf("stable-for cannot be negative")
+	if err := validateGeneralOptions(opts); err != nil {
+		return opts, err
 	}
 	return opts, nil
+}
+
+func validateGeneralOptions(opts globalOptions) error {
+	if opts.timeout <= 0 {
+		return fmt.Errorf("timeout must be positive")
+	}
+	if opts.interval <= 0 {
+		return fmt.Errorf("interval must be positive")
+	}
+	if err := validateBackoffOptions(opts); err != nil {
+		return err
+	}
+	if opts.perAttemptTimeout < 0 {
+		return fmt.Errorf("attempt-timeout cannot be negative")
+	}
+	if opts.requiredSuccesses < 1 {
+		return fmt.Errorf("successes must be at least 1")
+	}
+	if opts.stableFor < 0 {
+		return fmt.Errorf("stable-for cannot be negative")
+	}
+	return nil
+}
+
+func validateBackoffOptions(opts globalOptions) error {
+	if opts.maxInterval < opts.interval {
+		return fmt.Errorf("max-interval must be greater than or equal to interval")
+	}
+	if opts.backoff != runner.BackoffConstant && opts.backoff != runner.BackoffExponential {
+		return fmt.Errorf("invalid backoff %q", opts.backoff)
+	}
+	if opts.jitter < 0 || opts.jitter > 1 {
+		return fmt.Errorf("jitter must be between 0 and 100%%")
+	}
+	return nil
 }
 
 func parseGlobal(args []string) (globalOptions, []string, error) {
 	opts := globalOptions{
 		timeout:           5 * time.Minute,
 		interval:          2 * time.Second,
+		backoff:           runner.BackoffConstant,
 		requiredSuccesses: 1,
 		format:            output.FormatText,
 		mode:              runner.ModeAll,
@@ -207,8 +248,13 @@ func parseGlobal(args []string) (globalOptions, []string, error) {
 	fs.SetInterspersed(false)
 	var format string
 	var mode string
+	var backoff string
+	var jitter string
 	fs.DurationVar(&opts.timeout, "timeout", opts.timeout, "global deadline")
 	fs.DurationVar(&opts.interval, "interval", opts.interval, "poll interval")
+	fs.DurationVar(&opts.maxInterval, "max-interval", 0, "maximum poll interval for exponential backoff; defaults to --interval")
+	fs.StringVar(&backoff, "backoff", string(opts.backoff), "poll backoff strategy: constant|exponential")
+	fs.StringVar(&jitter, "jitter", "0%", "poll interval jitter, as a percentage such as 20% or a fraction such as 0.2")
 	fs.DurationVar(&opts.perAttemptTimeout, "attempt-timeout", 0, "per-attempt deadline; 0 disables per-attempt limit (global timeout still applies)")
 	fs.IntVar(&opts.requiredSuccesses, "successes", opts.requiredSuccesses, "consecutive successful checks required before a condition is satisfied")
 	fs.DurationVar(&opts.stableFor, "stable-for", 0, "duration a condition must remain continuously successful before it is satisfied")
@@ -223,11 +269,38 @@ func parseGlobal(args []string) (globalOptions, []string, error) {
 	if len(rest) == 0 {
 		return opts, nil, fmt.Errorf("missing condition backend")
 	}
+	opts.backoff = runner.Backoff(strings.ToLower(backoff))
+	if opts.maxInterval == 0 {
+		opts.maxInterval = opts.interval
+	}
+	opts.jitter, err = parseJitter(jitter)
+	if err != nil {
+		return opts, nil, err
+	}
 	opts, err = applyFormatAndMode(opts, format, mode)
 	if err != nil {
 		return opts, nil, err
 	}
 	return opts, rest, nil
+}
+
+func parseJitter(raw string) (float64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, fmt.Errorf("jitter is required")
+	}
+	if strings.HasSuffix(raw, "%") {
+		value, err := strconv.ParseFloat(strings.TrimSuffix(raw, "%"), 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid jitter %q", raw)
+		}
+		return value / 100, nil
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid jitter %q", raw)
+	}
+	return value, nil
 }
 
 func parseConditions(args []string) ([]condition.Condition, error) {
@@ -273,11 +346,78 @@ func parseCondition(segment []string) (condition.Condition, error) {
 		}
 		return condition.NewGuard(inner), nil
 	}
+	segment, name, err := parseConditionName(segment)
+	if err != nil {
+		return nil, err
+	}
 	parser, ok := backendParsers[segment[0]]
 	if !ok {
 		return nil, fmt.Errorf("unknown backend %q", segment[0])
 	}
-	return parser(segment)
+	cond, err := parser(segment)
+	if err != nil {
+		return nil, err
+	}
+	if name != "" {
+		cond = condition.WithName(cond, name)
+	}
+	return cond, nil
+}
+
+func parseConditionName(segment []string) ([]string, string, error) {
+	cleaned := []string{segment[0]}
+	name := ""
+	limit := conditionFlagLimit(segment)
+	for i := 1; i < len(segment); i++ {
+		if i >= limit {
+			cleaned = append(cleaned, segment[i:]...)
+			break
+		}
+		arg := segment[i]
+		if arg == "--name" {
+			if i+1 >= limit {
+				return nil, "", fmt.Errorf("--name requires a value")
+			}
+			var err error
+			name, err = setConditionName(name, segment[i+1])
+			if err != nil {
+				return nil, "", err
+			}
+			i++
+			continue
+		}
+		if value, ok := strings.CutPrefix(arg, "--name="); ok {
+			var err error
+			name, err = setConditionName(name, value)
+			if err != nil {
+				return nil, "", err
+			}
+			continue
+		}
+		cleaned = append(cleaned, arg)
+	}
+	return cleaned, name, nil
+}
+
+func conditionFlagLimit(segment []string) int {
+	if len(segment) == 0 || segment[0] != "exec" {
+		return len(segment)
+	}
+	if separator := indexOf(segment[1:], "--"); separator >= 0 {
+		return separator + 1
+	}
+	return len(segment)
+}
+
+func setConditionName(current, next string) (string, error) {
+	next = strings.TrimSpace(next)
+	if next == "" {
+		return "", fmt.Errorf("--name cannot be empty")
+	}
+	if current != "" {
+		return "", fmt.Errorf("--name can be set only once per condition")
+	}
+	return next, nil
 }
 
 func validateHTTPURL(rawURL string) error {
@@ -1083,6 +1223,7 @@ var conditionValueFlags = map[string]bool{
 	"--cwd":              true,
 	"--env":              true,
 	"--max-output-bytes": true,
+	"--name":             true,
 }
 
 func isExecCommandSeparator(current []string) bool {
@@ -1150,6 +1291,15 @@ func reportFromOutcome(out runner.Outcome) output.Report {
 		TimeoutSeconds:  output.Seconds(out.Timeout),
 		IntervalSeconds: output.Seconds(out.Interval),
 		Conditions:      make([]output.ConditionReport, 0, len(out.Conditions)),
+	}
+	if out.MaxInterval != out.Interval {
+		report.MaxIntervalSeconds = output.Seconds(out.MaxInterval)
+	}
+	if out.Backoff != "" && out.Backoff != runner.BackoffConstant {
+		report.Backoff = string(out.Backoff)
+	}
+	if out.Jitter > 0 {
+		report.Jitter = out.Jitter
 	}
 	if out.PerAttemptTimeout > 0 {
 		report.PerAttemptTimeoutSeconds = output.Seconds(out.PerAttemptTimeout)
@@ -1234,6 +1384,10 @@ Usage:
 Global flags:
   --timeout duration       Global deadline (default: 5m)
   --interval duration      Poll interval (default: 2s)
+  --backoff constant|exponential
+                           Poll backoff strategy (default: constant)
+  --max-interval duration  Maximum interval for exponential backoff (default: --interval)
+  --jitter percent         Poll jitter, for example 20% or 0.2 (default: 0%)
   --attempt-timeout duration
                            Per-attempt deadline; 0 disables (default: 0)
   --successes N            Consecutive successful checks required (default: 1)
@@ -1241,6 +1395,13 @@ Global flags:
   --output text|json       Output format (default: text); JSON goes to stdout
   --mode all|any           Condition mode (default: all)
   --verbose                Show each poll attempt
+
+Condition flag:
+  --name label             Human-readable condition label for text and JSON output
+
+Doctor:
+  waitfor doctor [--output text|json] [--require check]
+  --require check          Require temp|shell|docker|k8s|dns-wire (repeatable or comma-separated)
 
 HTTP:
   waitfor http [flags] URL

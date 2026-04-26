@@ -367,6 +367,59 @@ func TestBinaryJSONOutputStreams(t *testing.T) {
 	}
 }
 
+func TestBinaryConditionNamesAndBackoff(t *testing.T) {
+	requireBlackbox(t)
+
+	path := filepath.Join(t.TempDir(), "ready")
+	if err := os.WriteFile(path, []byte("ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := runWaitfor(t,
+		"--output", "json",
+		"--interval", "10ms",
+		"--backoff", "exponential",
+		"--max-interval", "40ms",
+		"--jitter", "0%",
+		"file", path, "--exists", "--name", "ready-file")
+	requireExitCode(t, result, 0)
+
+	var payload struct {
+		Backoff    string `json:"backoff"`
+		Conditions []struct {
+			Name string `json:"name"`
+		} `json:"conditions"`
+	}
+	if err := json.Unmarshal([]byte(result.stdout), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, result.stdout)
+	}
+	if payload.Backoff != "exponential" || len(payload.Conditions) != 1 || payload.Conditions[0].Name != "ready-file" {
+		t.Fatalf("payload = %+v, want named exponential condition", payload)
+	}
+}
+
+func TestBinaryDoctorJSON(t *testing.T) {
+	requireBlackbox(t)
+
+	result := runWaitfor(t, "doctor", "--output", "json")
+	requireExitCode(t, result, 0)
+	if result.stderr != "" {
+		t.Fatalf("stderr = %q, want empty doctor JSON stderr", result.stderr)
+	}
+	var payload struct {
+		Status string `json:"status"`
+		Checks []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal([]byte(result.stdout), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, result.stdout)
+	}
+	if payload.Status == "" || len(payload.Checks) == 0 {
+		t.Fatalf("payload = %+v, want doctor checks", payload)
+	}
+}
+
 func TestShellInvokedBinaryQuoting(t *testing.T) {
 	requireBlackbox(t)
 	if runtime.GOOS == "windows" {

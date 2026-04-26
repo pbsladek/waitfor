@@ -40,6 +40,9 @@ type Report struct {
 	ElapsedSeconds           float64           `json:"elapsed_seconds"`
 	TimeoutSeconds           float64           `json:"timeout_seconds"`
 	IntervalSeconds          float64           `json:"interval_seconds"`
+	MaxIntervalSeconds       float64           `json:"max_interval_seconds,omitempty"`
+	Backoff                  string            `json:"backoff,omitempty"`
+	Jitter                   float64           `json:"jitter,omitempty"`
 	PerAttemptTimeoutSeconds float64           `json:"per_attempt_timeout_seconds,omitempty"`
 	RequiredSuccesses        int               `json:"required_successes,omitempty"`
 	StableForSeconds         float64           `json:"stable_for_seconds,omitempty"`

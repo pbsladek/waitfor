@@ -83,6 +83,8 @@ waitfor exec --output-contains Running -- kubectl get pod myapp
 waitfor k8s deployment/myapp --condition Available --namespace prod
 waitfor k8s deployment/myapp --for rollout --namespace prod
 waitfor k8s pod --selector app=myapp --for ready --all --namespace prod
+waitfor doctor --output json
+waitfor --backoff exponential --max-interval 5s --jitter 20% http https://api.example.com/health --name api
 waitfor http https://api.example.com/health -- guard log /var/log/app.log --matches 'FATAL|panic'
 ```
 
@@ -110,6 +112,10 @@ Global flags:
 ```text
 --timeout duration     Global deadline (default: 5m)
 --interval duration    Poll interval (default: 2s)
+--backoff string       Poll backoff: constant|exponential (default: constant)
+--max-interval duration
+                       Maximum poll interval for exponential backoff (default: --interval)
+--jitter string        Poll interval jitter, for example 20% or 0.2 (default: 0%)
 --attempt-timeout duration
                        Per-attempt deadline (default: global remaining time)
 --successes int        Consecutive successful checks required (default: 1)
@@ -130,7 +136,11 @@ exec [--exit-code N] [--output-contains text] [--jsonpath expr] [--cwd path] [--
 file PATH [--exists|--deleted|--nonempty] [--contains text]
 log PATH (--contains text | --matches regex | --jsonpath expr) [--from-start]
 k8s RESOURCE [--condition Ready] [--for ready|rollout|complete] [--selector labels] [--all] [--namespace default] [--jsonpath expr] [--kubeconfig path]
+doctor [--output text|json] [--require temp|shell|docker|k8s|dns-wire]
 ```
+
+Every condition accepts `--name LABEL` for human-readable text progress and JSON
+summaries. For guards, the label is prefixed with `guard` in output.
 
 `exec` flags must appear before the command separator. `--exit-code` must be
 non-negative and defaults to `0`. Everything after `--` belongs to the command:
@@ -172,6 +182,11 @@ expressions: `--for rollout` for deployments, statefulsets, and daemonsets;
 `--for ready` for pods; and `--for complete` for jobs. `--selector` switches
 from `kind/name` to kind-level list mode, with `--all` requiring every selected
 object to satisfy the typed wait.
+
+`waitfor doctor` reports local support for optional integrations and scripting
+environment assumptions. Docker and Kubernetes are warnings by default because
+those backends are optional; add `--require docker,k8s` when a pipeline must fail
+if either integration is unavailable.
 
 ## JSON Expressions
 

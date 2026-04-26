@@ -43,6 +43,90 @@ func TestExecuteFileJSON(t *testing.T) {
 	}
 }
 
+func TestExecuteConditionNameJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ready")
+	if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"--output", "json", "file", path, "--exists", "--name", "ready-file"}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitSatisfied, stderr.String())
+	}
+	var report output.Report
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("invalid json: %v: %s", err, stdout.String())
+	}
+	if got := report.Conditions[0].Name; got != "ready-file" {
+		t.Fatalf("condition name = %q, want ready-file", got)
+	}
+}
+
+func TestExecuteBackoffOptionsJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ready")
+	if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{
+		"--output", "json",
+		"--interval", "10ms",
+		"--backoff", "exponential",
+		"--max-interval", "50ms",
+		"--jitter", "20%",
+		"file", path, "--exists",
+	}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitSatisfied, stderr.String())
+	}
+	var report output.Report
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("invalid json: %v: %s", err, stdout.String())
+	}
+	if report.Backoff != "exponential" || report.MaxIntervalSeconds != 0.05 || report.Jitter != 0.2 {
+		t.Fatalf("backoff report = %q/%v/%v", report.Backoff, report.MaxIntervalSeconds, report.Jitter)
+	}
+}
+
+func TestExecuteDoctorJSON(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"doctor", "--output", "json"}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitSatisfied, stderr.String())
+	}
+	var report doctorReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("invalid json: %v: %s", err, stdout.String())
+	}
+	if report.Status == "" || len(report.Checks) == 0 {
+		t.Fatalf("doctor report incomplete: %+v", report)
+	}
+}
+
+func TestExecuteDoctorHelp(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"doctor", "--help"}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitSatisfied, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "waitfor doctor") {
+		t.Fatalf("stdout = %q, want doctor help", stdout.String())
+	}
+}
+
+func TestRunDoctorText(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"doctor"}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitSatisfied, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "waitfor doctor") || !strings.Contains(stdout.String(), "temp") {
+		t.Fatalf("stdout = %q, want text doctor report", stdout.String())
+	}
+}
+
 func TestReportFromOutcomeIncludesCurrentBackendDetails(t *testing.T) {
 	report := reportFromOutcome(runner.Outcome{
 		Status:   runner.StatusTimeout,
@@ -506,6 +590,10 @@ func TestParseGlobalErrors(t *testing.T) {
 		{"negative attempt-timeout", []string{"--attempt-timeout=-1ns", "file", "x"}, "attempt-timeout cannot be negative"},
 		{"zero successes", []string{"--successes", "0", "file", "x"}, "successes must be at least 1"},
 		{"negative stable-for", []string{"--stable-for=-1ns", "file", "x"}, "stable-for cannot be negative"},
+		{"bad backoff", []string{"--backoff", "linear", "file", "x"}, "invalid backoff"},
+		{"max interval below interval", []string{"--interval", "10ms", "--max-interval", "1ms", "file", "x"}, "max-interval"},
+		{"negative jitter", []string{"--jitter", "-1%", "file", "x"}, "jitter"},
+		{"bad jitter", []string{"--jitter", "sometimes", "file", "x"}, "invalid jitter"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -517,6 +605,127 @@ func TestParseGlobalErrors(t *testing.T) {
 				t.Fatalf("parseGlobal() err = %q, want to contain %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestParseJitterFraction(t *testing.T) {
+	got, err := parseJitter("0.25")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 0.25 {
+		t.Fatalf("jitter = %v, want 0.25", got)
+	}
+}
+
+func TestParseDoctorOptions(t *testing.T) {
+	opts, err := parseDoctorOptions([]string{"--output", "json", "--require", "docker,k8s", "--require", "dns-wire"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.format != output.FormatJSON {
+		t.Fatalf("format = %q, want json", opts.format)
+	}
+	for _, name := range []string{"temp", "docker", "k8s", "dns-wire"} {
+		if !opts.required[name] {
+			t.Fatalf("required[%s] = false, want true", name)
+		}
+	}
+}
+
+func TestParseDoctorOptionsErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "bad output", args: []string{"--output", "xml"}},
+		{name: "bad require", args: []string{"--require", "printer"}},
+		{name: "positional", args: []string{"extra"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseDoctorOptions(tt.args)
+			if err == nil {
+				t.Fatal("parseDoctorOptions() expected error, got nil")
+			}
+		})
+	}
+}
+
+func TestDoctorStatusCombination(t *testing.T) {
+	if got := combineDoctorStatus(doctorOK, doctorCheck{Status: doctorWarn}); got != doctorWarn {
+		t.Fatalf("optional warning status = %s, want warn", got)
+	}
+	if got := combineDoctorStatus(doctorOK, doctorCheck{Status: doctorWarn, Required: true}); got != doctorFail {
+		t.Fatalf("required warning status = %s, want fail", got)
+	}
+}
+
+func TestDoctorTextHelpers(t *testing.T) {
+	report := doctorReport{
+		Status:  doctorWarn,
+		Version: "test",
+		Commit:  "abc123",
+		GOOS:    "testos",
+		GOARCH:  "testarch",
+		Checks: []doctorCheck{
+			{Name: "temp", Status: doctorOK, Detail: "writable"},
+			{Name: "docker", Status: doctorWarn},
+		},
+	}
+	var buf bytes.Buffer
+	if err := writeDoctorReport(&buf, output.FormatText, report); err != nil {
+		t.Fatal(err)
+	}
+	got := buf.String()
+	for _, want := range []string{"waitfor doctor: warn", "commit: abc123", "[ok] temp: writable", "[warn] docker"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("doctor text %q missing %q", got, want)
+		}
+	}
+}
+
+func TestRunDoctorCommandError(t *testing.T) {
+	_, err := runDoctorCommand("definitely-no-such-waitfor-doctor-command")
+	if err == nil {
+		t.Fatal("runDoctorCommand() expected error, got nil")
+	}
+}
+
+func TestParseConditionName(t *testing.T) {
+	cond, err := parseCondition([]string{"file", "/tmp/ready", "--exists", "--name", "ready-file"})
+	if err != nil {
+		t.Fatalf("parseCondition() error = %v", err)
+	}
+	if got := cond.Descriptor().DisplayName(); got != "ready-file" {
+		t.Fatalf("display = %q, want ready-file", got)
+	}
+}
+
+func TestParseConditionNameErrors(t *testing.T) {
+	tests := [][]string{
+		{"file", "/tmp/ready", "--name"},
+		{"file", "/tmp/ready", "--name", ""},
+		{"file", "/tmp/ready", "--name", "a", "--name", "b"},
+	}
+	for _, segment := range tests {
+		if _, err := parseCondition(segment); err == nil {
+			t.Fatalf("parseCondition(%v) expected error, got nil", segment)
+		}
+	}
+}
+
+func TestParseConditionNameDoesNotConsumeExecCommandFlag(t *testing.T) {
+	cond, err := parseCondition([]string{"exec", "--", "/bin/echo", "--name", "literal"})
+	if err != nil {
+		t.Fatalf("parseCondition() error = %v", err)
+	}
+	execCond, ok := cond.(*condition.ExecCondition)
+	if !ok {
+		t.Fatalf("condition type = %T, want exec condition", cond)
+	}
+	if got := strings.Join(execCond.Command, " "); got != "/bin/echo --name literal" {
+		t.Fatalf("command = %q, want literal --name command", got)
 	}
 }
 

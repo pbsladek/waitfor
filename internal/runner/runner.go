@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -27,10 +28,20 @@ const (
 	StatusFatal     Status = "fatal"
 )
 
+type Backoff string
+
+const (
+	BackoffConstant    Backoff = "constant"
+	BackoffExponential Backoff = "exponential"
+)
+
 type Config struct {
 	Conditions        []condition.Condition
 	Timeout           time.Duration
 	Interval          time.Duration
+	MaxInterval       time.Duration
+	Backoff           Backoff
+	Jitter            float64
 	PerAttemptTimeout time.Duration
 	RequiredSuccesses int
 	StableFor         time.Duration
@@ -66,6 +77,9 @@ type Outcome struct {
 	Elapsed           time.Duration
 	Timeout           time.Duration
 	Interval          time.Duration
+	MaxInterval       time.Duration
+	Backoff           Backoff
+	Jitter            float64
 	PerAttemptTimeout time.Duration
 	RequiredSuccesses int
 	StableFor         time.Duration
@@ -92,25 +106,71 @@ func validateRunConfig(cfg Config) error {
 	if len(cfg.Conditions) == 0 {
 		return errors.New("at least one condition is required")
 	}
+	if err := validateTimingConfig(cfg); err != nil {
+		return err
+	}
+	if err := validateBackoffConfig(cfg); err != nil {
+		return err
+	}
+	if err := validateStabilityConfig(cfg); err != nil {
+		return err
+	}
+	if !hasReadyCondition(cfg.Conditions) {
+		return errors.New("at least one non-guard condition is required")
+	}
+	return nil
+}
+
+func validateTimingConfig(cfg Config) error {
 	if cfg.Timeout <= 0 {
 		return errors.New("timeout must be positive")
 	}
 	if cfg.Interval <= 0 {
 		return errors.New("interval must be positive")
 	}
+	if cfg.MaxInterval < cfg.Interval {
+		return errors.New("max interval must be greater than or equal to interval")
+	}
 	if cfg.PerAttemptTimeout < 0 {
 		return errors.New("per-attempt timeout cannot be negative")
 	}
+	return nil
+}
+
+func validateBackoffConfig(cfg Config) error {
+	if cfg.Backoff != BackoffConstant && cfg.Backoff != BackoffExponential {
+		return errors.New("backoff must be constant or exponential")
+	}
+	if cfg.Jitter < 0 || cfg.Jitter > 1 {
+		return errors.New("jitter must be between 0 and 1")
+	}
+	return nil
+}
+
+func validateStabilityConfig(cfg Config) error {
 	if cfg.RequiredSuccesses < 0 {
 		return errors.New("successes cannot be negative")
 	}
 	if cfg.StableFor < 0 {
 		return errors.New("stable-for cannot be negative")
 	}
-	if !hasReadyCondition(cfg.Conditions) {
-		return errors.New("at least one non-guard condition is required")
-	}
 	return nil
+}
+
+func normalizeRunConfig(cfg Config) Config {
+	if cfg.Backoff == "" {
+		cfg.Backoff = BackoffConstant
+	}
+	if cfg.MaxInterval == 0 {
+		cfg.MaxInterval = cfg.Interval
+	}
+	if cfg.RequiredSuccesses == 0 {
+		cfg.RequiredSuccesses = 1
+	}
+	if cfg.PerAttemptTimeout > cfg.Timeout {
+		cfg.PerAttemptTimeout = cfg.Timeout
+	}
+	return cfg
 }
 
 func conditionRole(cond condition.Condition) condition.Role {
@@ -150,14 +210,9 @@ func finalStatus(ctx context.Context, records []ConditionResult, mode Mode) Stat
 }
 
 func Run(ctx context.Context, cfg Config) (Outcome, error) {
+	cfg = normalizeRunConfig(cfg)
 	if err := validateRunConfig(cfg); err != nil {
 		return Outcome{}, err
-	}
-	if cfg.RequiredSuccesses == 0 {
-		cfg.RequiredSuccesses = 1
-	}
-	if cfg.PerAttemptTimeout > cfg.Timeout {
-		cfg.PerAttemptTimeout = cfg.Timeout
 	}
 
 	start := time.Now()
@@ -191,6 +246,9 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 		Elapsed:           time.Since(start),
 		Timeout:           cfg.Timeout,
 		Interval:          cfg.Interval,
+		MaxInterval:       cfg.MaxInterval,
+		Backoff:           cfg.Backoff,
+		Jitter:            cfg.Jitter,
 		PerAttemptTimeout: cfg.PerAttemptTimeout,
 		RequiredSuccesses: cfg.RequiredSuccesses,
 		StableFor:         cfg.StableFor,
@@ -306,6 +364,68 @@ func waitInterval(ctx context.Context, timer *time.Timer, interval time.Duration
 	}
 }
 
+type pollSchedule struct {
+	base    time.Duration
+	max     time.Duration
+	backoff Backoff
+	jitter  float64
+	current time.Duration
+	rng     *rand.Rand
+}
+
+func newPollSchedule(cfg Config) *pollSchedule {
+	return &pollSchedule{
+		base:    cfg.Interval,
+		max:     cfg.MaxInterval,
+		backoff: cfg.Backoff,
+		jitter:  cfg.Jitter,
+		current: cfg.Interval,
+		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+}
+
+func (s *pollSchedule) next(previousSatisfied bool) time.Duration {
+	if previousSatisfied {
+		s.current = s.base
+		return s.withJitter(s.base)
+	}
+	interval := s.current
+	if s.backoff == BackoffExponential {
+		s.current = nextExponentialInterval(s.current, s.max)
+	}
+	return s.withJitter(interval)
+}
+
+func nextExponentialInterval(current, max time.Duration) time.Duration {
+	if current >= max/2 {
+		return max
+	}
+	return minDuration(current*2, max)
+}
+
+func (s *pollSchedule) withJitter(interval time.Duration) time.Duration {
+	if s.jitter == 0 {
+		return interval
+	}
+	factor := 1 - s.jitter + s.rng.Float64()*2*s.jitter
+	jittered := time.Duration(float64(interval) * factor)
+	return maxDuration(jittered, time.Nanosecond)
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func runCondition(
 	ctx context.Context,
 	cond condition.Condition,
@@ -317,6 +437,7 @@ func runCondition(
 ) {
 	conditionStart := time.Now()
 	progress := stabilityProgress{}
+	schedule := newPollSchedule(cfg)
 	timer := time.NewTimer(cfg.Interval)
 	if !timer.Stop() {
 		<-timer.C
@@ -333,8 +454,9 @@ func runCondition(
 		attempt := record.Attempts
 
 		attemptCtx, attemptCancel := makeAttemptContext(ctx, cfg.PerAttemptTimeout)
-		result := cond.Check(attemptCtx)
+		rawResult := cond.Check(attemptCtx)
 		attemptCancel()
+		result := rawResult
 		if record.Guard {
 			progress.reset()
 		} else {
@@ -350,7 +472,8 @@ func runCondition(
 			return
 		}
 
-		if !waitInterval(ctx, timer, cfg.Interval) {
+		interval := schedule.next(rawResult.Status == condition.CheckSatisfied)
+		if !waitInterval(ctx, timer, interval) {
 			return
 		}
 	}

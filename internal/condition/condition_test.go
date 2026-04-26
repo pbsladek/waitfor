@@ -84,6 +84,45 @@ func TestNilGuardCondition(t *testing.T) {
 	}
 }
 
+func TestNamedConditionOverridesDisplayName(t *testing.T) {
+	named := WithName(staticCondition{
+		desc:   Descriptor{Backend: "http", Target: "https://example.test"},
+		result: Satisfied("ready"),
+	}, "api")
+	if got := named.Descriptor().DisplayName(); got != "api" {
+		t.Fatalf("display = %q, want api", got)
+	}
+	result := named.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("status = %s, want satisfied", result.Status)
+	}
+}
+
+func TestNamedGuardPreservesGuardRole(t *testing.T) {
+	named := WithName(NewGuard(staticCondition{
+		desc:   Descriptor{Backend: "log", Target: "app.log"},
+		result: Unsatisfied("clear", nil),
+	}), "panic log")
+	provider, ok := named.(RoleProvider)
+	if !ok {
+		t.Fatal("named guard should provide a condition role")
+	}
+	if provider.ConditionRole() != RoleGuard {
+		t.Fatalf("role = %s, want guard", provider.ConditionRole())
+	}
+}
+
+func TestNilNamedCondition(t *testing.T) {
+	named := WithName(nil, "missing")
+	if got := named.Descriptor().DisplayName(); got != "missing" {
+		t.Fatalf("display = %q, want missing", got)
+	}
+	result := named.Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("status = %s, want fatal", result.Status)
+	}
+}
+
 type staticCondition struct {
 	desc   Descriptor
 	result Result

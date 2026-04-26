@@ -62,6 +62,35 @@ type GuardCondition struct {
 	Inner Condition
 }
 
+type NamedCondition struct {
+	Inner Condition
+	Name  string
+}
+
+func WithName(inner Condition, name string) Condition {
+	return &NamedCondition{Inner: inner, Name: name}
+}
+
+func (c *NamedCondition) ConditionRole() Role {
+	return conditionRole(c.Inner)
+}
+
+func (c *NamedCondition) Descriptor() Descriptor {
+	if c.Inner == nil {
+		return Descriptor{Name: c.Name}
+	}
+	desc := c.Inner.Descriptor()
+	desc.Name = c.Name
+	return desc
+}
+
+func (c *NamedCondition) Check(ctx context.Context) Result {
+	if c.Inner == nil {
+		return Fatal(fmt.Errorf("named condition is required"))
+	}
+	return c.Inner.Check(ctx)
+}
+
 func NewGuard(inner Condition) *GuardCondition {
 	return &GuardCondition{Inner: inner}
 }
@@ -92,6 +121,13 @@ func (c *GuardCondition) Check(ctx context.Context) Result {
 		return FatalDetail(detail, fmt.Errorf("guard condition satisfied"))
 	}
 	return result
+}
+
+func conditionRole(cond Condition) Role {
+	if provider, ok := cond.(RoleProvider); ok {
+		return provider.ConditionRole()
+	}
+	return RoleReady
 }
 
 func Satisfied(detail string) Result {
