@@ -45,12 +45,20 @@ Create a GitHub Release by pushing a version tag:
 make release-tag VERSION=v0.1.0
 ```
 
-The `Release` workflow runs for `v*` tags. It checks out the exact tag, runs the
-Go test suite and black-box binary integration tests, then runs GoReleaser to
-publish release notes, archives, and checksums to GitHub.
+The `Release` workflow runs automatically when a `v*` tag is pushed. It checks
+out the exact tag, runs the Go test suite and black-box binary integration
+tests, then runs GoReleaser to publish release notes, archives, and checksums to
+GitHub.
 
-If a tag already exists without a GitHub Release, run the `Release` workflow
-manually from GitHub Actions and enter that tag, for example `v0.1.0`.
+The tag must point at a commit that already contains the release workflow.
+`make release-tag` checks this before creating the tag.
+
+If a tag was pushed before this workflow existed, GitHub cannot replay that tag
+creation event. Create the release from the command line instead of using the UI:
+
+```bash
+make release-existing VERSION=v0.1.0
+```
 
 For a local artifact-only dry run:
 
