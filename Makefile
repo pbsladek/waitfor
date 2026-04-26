@@ -7,7 +7,7 @@ DHI_GO_IMAGE ?= dhi.io/golang:1.26-dev
 DHI_RUNTIME_IMAGE ?= dhi.io/static:20250419
 VERSION ?=
 
-.PHONY: build build-linux build-arm build-darwin build-windows build-all docker-build docker-push docker-run test test-e2e test-integration test-integration-docker test-integration-k8s lint security coverage bench tag push-tag release-tag release release-snapshot clean
+.PHONY: build build-linux build-arm build-darwin build-windows build-all docker-build docker-push docker-run test test-e2e test-integration test-integration-docker test-integration-k8s lint security coverage bench tag push-tag release-tag release release-existing release-snapshot clean
 
 build:
 	go build -o bin/$(BINARY) $(PKG)
@@ -71,6 +71,7 @@ bench:
 tag:
 	@test -n "$(VERSION)" || (echo "VERSION is required, for example: make tag VERSION=v0.1.0" && exit 1)
 	@case "$(VERSION)" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "VERSION must look like v0.1.0"; exit 1;; esac
+	@git cat-file -e HEAD:.github/workflows/release.yml || (echo "release workflow is not committed at HEAD; commit .github/workflows/release.yml before tagging" && exit 1)
 	@git diff --quiet || (echo "working tree has uncommitted changes; commit before tagging" && exit 1)
 	@git diff --cached --quiet || (echo "index has staged changes; commit before tagging" && exit 1)
 	git tag -a "$(VERSION)" -m "Release $(VERSION)"
@@ -84,6 +85,11 @@ release-tag: tag push-tag
 
 release:
 	goreleaser release --clean
+
+release-existing:
+	@test -n "$(VERSION)" || (echo "VERSION is required, for example: make release-existing VERSION=v0.1.0" && exit 1)
+	@case "$(VERSION)" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "VERSION must look like v0.1.0"; exit 1;; esac
+	gh workflow run release.yml --ref main -f tag="$(VERSION)"
 
 release-snapshot:
 	goreleaser release --snapshot --clean
