@@ -8,28 +8,36 @@ init containers, and agent workflows.
 
 ```
 cmd/waitfor/        entrypoint — signal handling, delegates to internal/cli
-internal/cli/       argument parsing, backend wiring, exit codes
-internal/condition/ one file per backend: http, tcp, dns, docker, file, exec, k8s
-internal/runner/    polling loop — timeout, interval, all/any, parallelism
+internal/cli/       argument parsing, doctor command, backend wiring, exit codes
+internal/condition/ one file per backend: http, tcp, dns, docker, file, log, exec, k8s
+internal/runner/    polling loop — timeout, interval, backoff/jitter, all/any, parallelism
 internal/output/    text/JSON formatters (progress → stderr, JSON → stdout)
-internal/expr/      minimal JSONPath evaluator used by http, exec, and k8s
+internal/expr/      minimal JSONPath evaluator used by http, exec, log, and k8s
 e2e/                end-to-end tests that call cli.Execute() directly
+integration/        black-box tests that compile and shell-execute the real binary
 ```
 
 ## Build and verify
 
 ```bash
-make build    # go build -o bin/waitfor ./cmd/waitfor
-make test     # go test ./...
-make lint     # golangci-lint run
-make coverage # go test -coverpkg=./... then open coverage.html
+make build       # go build -o bin/waitfor ./cmd/waitfor
+make test        # go test ./...
+make lint        # golangci-lint run ./...
+make security    # golangci-lint run --enable=gosec ./...
+make coverage    # go test -coverpkg=./... then open coverage.html
 ```
 
 Always run before finishing any change:
 
 ```bash
-go build ./... && go test ./... && golangci-lint run
+go build ./... && go test ./... && golangci-lint run ./...
 gocyclo -over 9 $(find . -name '*.go' -not -name '*_test.go')
+```
+
+For changes that affect the shell-invoked binary, also run:
+
+```bash
+make test-integration
 ```
 
 ## Core interface
@@ -42,6 +50,9 @@ type Condition interface {
     Check(ctx context.Context) Result
 }
 ```
+
+`Descriptor().Name` may be overridden by `--name` via `condition.WithName`;
+backends should still set stable `Backend` and `Target` values.
 
 `Check` returns one of three terminal values — use the helpers, never construct
 `Result` directly:
@@ -98,9 +109,12 @@ Established extraction patterns to follow:
 | `expr`           | `compareFloat64/Bool/String` | `compareValues`               |
 | `expr`           | `traverseField/Indexes`      | `lookupJSONPath`              |
 | `runner`         | `validateRunConfig`          | `Run`                         |
+| `runner`         | `validateTimingConfig`       | `validateRunConfig`           |
+| `runner`         | `validateBackoffConfig`      | `validateRunConfig`           |
 | `runner`         | `finalStatus`                | `Run`                         |
 | `runner`         | `waitInterval`               | `runCondition`                |
 | `runner`         | `buildAttemptEvent`          | `runCondition`                |
+| `runner`         | `pollSchedule.next`          | `runCondition`                |
 | `condition/http` | `checkResponseBody`          | `HTTPCondition.Check`         |
 | `condition/http` | `buildInsecureTransport`     | `HTTPCondition.client`        |
 | `condition/exec` | `classifyRunError`           | `ExecCondition.Check`         |
@@ -112,8 +126,12 @@ Established extraction patterns to follow:
 | `cli`            | `parseBodyContent`           | `parseHTTPCondition`          |
 | `cli`            | `parseHTTPHeaders`           | `parseHTTPCondition`          |
 | `cli`            | `applyFormatAndMode`         | `parseGlobal`                 |
+| `cli`            | `validateGeneralOptions`     | `applyFormatAndMode`          |
+| `cli`            | `validateBackoffOptions`     | `validateGeneralOptions`      |
+| `cli`            | `parseConditionName`         | `parseCondition`              |
 | `cli`            | `validateDNSAbsentOptions`   | `validateDNSWireOptions`      |
 | `cli`            | `validateDNSTransportOptions` | `validateDNSWireOptions`      |
+| `cli/doctor`     | `parseDoctorOptions`         | `runDoctor`                   |
 
 ## Adding a backend
 
@@ -123,8 +141,10 @@ Established extraction patterns to follow:
 3. Add `internal/condition/<name>_test.go` — table-driven unit tests, no Cobra.
 4. Add e2e cases in `e2e/e2e_test.go` — at least: satisfied, timeout, invalid
    args → `ExitInvalid`, fatal path → `ExitFatal`.
-5. Return promptly when `ctx` is cancelled; never block after `ctx.Done()`.
-6. Use `condition.Fatal` only for errors that cannot resolve on retry (missing
+5. Add black-box coverage in `integration/blackbox_test.go` when behavior must
+   be validated through the real shell-invoked binary.
+6. Return promptly when `ctx` is cancelled; never block after `ctx.Done()`.
+7. Use `condition.Fatal` only for errors that cannot resolve on retry (missing
    binary, bad credentials, invalid config). Network errors are `Unsatisfied`.
 
 ### Checklist for a new backend
@@ -134,6 +154,8 @@ Established extraction patterns to follow:
 - [ ] Error paths: `Fatal` for permanent, `Unsatisfied` for transient
 - [ ] No global state; all config lives on the struct
 - [ ] Unit tests do not require a running external service (use fakes/stubs)
+- [ ] Black-box tests cover CLI behavior that depends on process execution,
+      shell quoting, streams, or real polling
 - [ ] `gocyclo` score ≤ 9 for every new function
 - [ ] Coverage of the new file ≥ 85 % from unit tests alone
 
@@ -144,9 +166,13 @@ Established extraction patterns to follow:
   directly.
 - **The runner is backend-agnostic.** Parallelism, timeout, all/any mode, and
   the polling loop all live in `internal/runner`. Backends know nothing about
-  retries.
+  retries, backoff, jitter, `--successes`, or `--stable-for`.
 - **JSON output goes to stdout; human progress goes to stderr.** Never swap
   these. The printer selects the channel automatically based on `--output json`.
+- **Condition labels are wrappers, not backend fields.** `--name` is implemented
+  by `condition.WithName`; do not add label fields to individual backends.
+- **Doctor is a CLI command, not a backend.** `waitfor doctor` reports local
+  environment support and should not enter the runner.
 - **Kubernetes uses a `KubernetesGetter` interface.** Production code uses the
   dynamic client; tests inject a `fake.NewSimpleDynamicClient`. Do not call the
   real API in unit tests.
@@ -158,6 +184,8 @@ Established extraction patterns to follow:
 - **Docker uses the Docker CLI boundary.** Missing Docker is fatal because
   retries cannot fix it. Missing containers, inspect failures, and state or
   health mismatches are retryable unless the configuration itself is invalid.
+- **Log polling keeps state in the condition.** It handles tailing, rotation,
+  exclusion, regex/string matching, JSON expressions, and minimum match counts.
 - **`expr` stays minimal.** The JSONPath evaluator covers the subset needed by
   `--jsonpath`. Do not add operators or syntax without a concrete use case.
 - **No new dependencies** unless the stdlib and existing deps genuinely cannot
@@ -196,10 +224,26 @@ _, err := parseKubernetesCondition([]string{"k8s", "pod/a", "--jsonpath", " "})
 
 ### Integration tests
 Black-box tests in `integration/blackbox_test.go` compile and execute the real
-binary when `WAITFOR_BLACKBOX=1` is set. Kubernetes cases additionally require
-`WAITFOR_BLACKBOX_K8S=1` and a real cluster context. Keep Kubernetes tests
-skipped by default so `go test ./...` does not require Docker, kind, or a
-cluster.
+binary when `WAITFOR_BLACKBOX=1` is set. Docker cases additionally require
+`WAITFOR_BLACKBOX_DOCKER=1`; Kubernetes cases require `WAITFOR_BLACKBOX_K8S=1`
+and a real cluster context. Keep Docker and Kubernetes tests skipped by default
+so `go test ./...` does not require Docker, kind, or a cluster.
+
+### Release and Docker automation
+Version tags are created with:
+
+```bash
+make release-tag VERSION=v0.1.0
+```
+
+The tag must point at a commit containing `.github/workflows/release.yml`; the
+Makefile checks this before tagging. Existing tags can be released without the
+GitHub UI via `make release-existing VERSION=v0.1.0`.
+
+Docker publish builds are intentionally split by platform. The workflow builds
+`linux/amd64` on `ubuntu-latest` and `linux/arm64` on `ubuntu-24.04-arm`, pushes
+per-platform digests, then creates a multi-arch manifest. Preserve this shape so
+arm64 builds do not fall back to QEMU.
 
 ## Common mistakes to avoid
 
@@ -210,6 +254,8 @@ cluster.
 - Blocking in `Check` after `ctx.Done()` fires — the runner will not cancel a
   goroutine that ignores context; it will hang until the global timeout.
 - Writing to stdout from a backend — all output is the runner's responsibility.
+- Using `math/rand` for jitter — `gosec` flags it; use `crypto/rand` or a
+  deterministic test seam.
 - Adding a `sync.Mutex` to a condition struct when the runner guarantees each
   `Check` call is serialised per-condition (use `sync.Once` for lazy init only).
 - Breaking the `Condition` interface to pass extra information — put it in the
