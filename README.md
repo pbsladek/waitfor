@@ -37,6 +37,27 @@ docker login dhi.io
 make docker-push DOCKER_TAG=tagname
 ```
 
+## Releases
+
+Create a GitHub Release by pushing a version tag:
+
+```bash
+make release-tag VERSION=v0.1.0
+```
+
+The `Release` workflow runs for `v*` tags. It checks out the exact tag, runs the
+Go test suite and black-box binary integration tests, then runs GoReleaser to
+publish release notes, archives, and checksums to GitHub.
+
+If a tag already exists without a GitHub Release, run the `Release` workflow
+manually from GitHub Actions and enter that tag, for example `v0.1.0`.
+
+For a local artifact-only dry run:
+
+```bash
+make release-snapshot
+```
+
 ## Examples
 
 ```bash

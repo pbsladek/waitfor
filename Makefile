@@ -7,7 +7,7 @@ DHI_GO_IMAGE ?= dhi.io/golang:1.26-dev
 DHI_RUNTIME_IMAGE ?= dhi.io/static:20250419
 VERSION ?=
 
-.PHONY: build build-linux build-arm build-darwin build-windows build-all docker-build docker-push docker-run test test-e2e test-integration test-integration-docker test-integration-k8s lint security coverage bench tag push-tag release-tag release clean
+.PHONY: build build-linux build-arm build-darwin build-windows build-all docker-build docker-push docker-run test test-e2e test-integration test-integration-docker test-integration-k8s lint security coverage bench tag push-tag release-tag release release-snapshot clean
 
 build:
 	go build -o bin/$(BINARY) $(PKG)
@@ -80,9 +80,13 @@ push-tag:
 	git push origin "$(VERSION)"
 
 release-tag: tag push-tag
+	@echo "Pushed $(VERSION); GitHub Actions will create the GitHub release, notes, archives, and checksums."
 
 release:
 	goreleaser release --clean
+
+release-snapshot:
+	goreleaser release --snapshot --clean
 
 clean:
 	rm -rf bin dist coverage.out coverage.txt coverage.html
