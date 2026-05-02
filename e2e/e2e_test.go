@@ -322,6 +322,14 @@ func TestFileMutuallyExclusiveStateFlags(t *testing.T) {
 	}
 }
 
+func TestFileDeletedCannotContain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f")
+	_, stderr := mustCode(t, cli.ExitInvalid, "file", path, "--deleted", "--contains", "ready")
+	if !strings.Contains(stderr, "--deleted cannot be combined") {
+		t.Fatalf("stderr %q does not mention --deleted conflict", stderr)
+	}
+}
+
 // ── Log ─────────────────────────────────────────────────────────────────────
 
 func TestLogContainsSatisfied(t *testing.T) {

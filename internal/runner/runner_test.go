@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -170,6 +171,69 @@ func TestRunGuardSatisfiedBecomesFatal(t *testing.T) {
 	}
 }
 
+func TestRunReadySuccessWinsOverLaterGuardAlreadyInFlight(t *testing.T) {
+	out, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{
+			delayedSatisfiedCondition{name: "ready"},
+			condition.NewGuard(delayedSatisfiedCondition{name: "late-guard", delay: 20 * time.Millisecond, ignoreContext: true}),
+		},
+		Timeout:  500 * time.Millisecond,
+		Interval: time.Millisecond,
+		Mode:     ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusSatisfied {
+		t.Fatalf("Status = %s, want %s, outcome = %+v", out.Status, StatusSatisfied, out)
+	}
+	for _, rec := range out.Conditions {
+		if rec.Guard && rec.Fatal {
+			t.Fatalf("late guard recorded fatal after readiness completed: %+v", rec)
+		}
+	}
+}
+
+func TestRunIgnoresSatisfiedResultAfterTimeout(t *testing.T) {
+	out, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{
+			delayedSatisfiedCondition{name: "late-ready", delay: 20 * time.Millisecond, ignoreContext: true},
+		},
+		Timeout:  5 * time.Millisecond,
+		Interval: time.Millisecond,
+		Mode:     ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusTimeout {
+		t.Fatalf("Status = %s, want %s, outcome = %+v", out.Status, StatusTimeout, out)
+	}
+	if out.Conditions[0].Satisfied {
+		t.Fatalf("late satisfied result was recorded: %+v", out.Conditions[0])
+	}
+}
+
+func TestRunIgnoresFatalResultAfterTimeout(t *testing.T) {
+	out, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{
+			delayedFatalCondition{name: "late-fatal", delay: 20 * time.Millisecond},
+		},
+		Timeout:  5 * time.Millisecond,
+		Interval: time.Millisecond,
+		Mode:     ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusTimeout {
+		t.Fatalf("Status = %s, want %s, outcome = %+v", out.Status, StatusTimeout, out)
+	}
+	if out.Conditions[0].Fatal {
+		t.Fatalf("late fatal result was recorded: %+v", out.Conditions[0])
+	}
+}
+
 func TestRunRequiresNonGuardCondition(t *testing.T) {
 	_, err := Run(t.Context(), Config{
 		Conditions: []condition.Condition{condition.NewGuard(&fakeCondition{name: "guard"})},
@@ -222,13 +286,19 @@ func TestRunRecordedFatalTakesPrecedenceOverSatisfaction(t *testing.T) {
 	}
 }
 
-func TestFinalStatusFatalTakesPrecedenceOverModeAnySatisfaction(t *testing.T) {
-	status := finalStatus(t.Context(), []ConditionResult{
+func TestFinalStatusUsesFirstTerminalStatus(t *testing.T) {
+	records := []ConditionResult{
 		{Name: "ready", Satisfied: true},
 		{Name: "fatal", Fatal: true},
-	}, ModeAny)
-	if status != StatusFatal {
-		t.Fatalf("Status = %s, want %s", status, StatusFatal)
+	}
+	if status := finalStatus(t.Context(), records, ModeAny, terminalSatisfied); status != StatusSatisfied {
+		t.Fatalf("terminal satisfied Status = %s, want %s", status, StatusSatisfied)
+	}
+	if status := finalStatus(t.Context(), records, ModeAny, terminalFatal); status != StatusFatal {
+		t.Fatalf("terminal fatal Status = %s, want %s", status, StatusFatal)
+	}
+	if status := finalStatus(t.Context(), records, ModeAny, terminalNone); status != StatusFatal {
+		t.Fatalf("no terminal Status = %s, want %s", status, StatusFatal)
 	}
 }
 
@@ -240,6 +310,45 @@ func (fatalSatisfiedCondition) Descriptor() condition.Descriptor {
 
 func (fatalSatisfiedCondition) Check(ctx context.Context) condition.Result {
 	return condition.FatalDetail("ready but invalid", errors.New("bad config"))
+}
+
+type delayedSatisfiedCondition struct {
+	name          string
+	delay         time.Duration
+	ignoreContext bool
+}
+
+func (c delayedSatisfiedCondition) Descriptor() condition.Descriptor {
+	return condition.Descriptor{Name: c.name}
+}
+
+func (c delayedSatisfiedCondition) Check(ctx context.Context) condition.Result {
+	if c.delay > 0 {
+		if c.ignoreContext {
+			time.Sleep(c.delay)
+		} else {
+			select {
+			case <-time.After(c.delay):
+			case <-ctx.Done():
+				return condition.Unsatisfied("", ctx.Err())
+			}
+		}
+	}
+	return condition.Satisfied("ready")
+}
+
+type delayedFatalCondition struct {
+	name  string
+	delay time.Duration
+}
+
+func (c delayedFatalCondition) Descriptor() condition.Descriptor {
+	return condition.Descriptor{Name: c.name}
+}
+
+func (c delayedFatalCondition) Check(ctx context.Context) condition.Result {
+	time.Sleep(c.delay)
+	return condition.Fatal(errors.New("bad config"))
 }
 
 type contextWaitingCondition struct {
@@ -442,6 +551,279 @@ func TestRunOnAttemptReceivesEachAttempt(t *testing.T) {
 	}
 }
 
+func TestRunWaitsForOnAttemptBeforeReturning(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	done := make(chan struct{})
+	var out Outcome
+	var err error
+
+	go func() {
+		defer close(done)
+		out, err = Run(t.Context(), Config{
+			Conditions: []condition.Condition{&fakeCondition{name: "ready", satisfyAfter: 1}},
+			Timeout:    500 * time.Millisecond,
+			Interval:   time.Millisecond,
+			Mode:       ModeAll,
+			OnAttempt: func(event AttemptEvent) {
+				close(started)
+				<-release
+			},
+		})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(100 * time.Millisecond):
+		close(release)
+		t.Fatal("OnAttempt was not called")
+	}
+	select {
+	case <-done:
+		close(release)
+		t.Fatal("Run returned before OnAttempt completed")
+	default:
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Run did not return after OnAttempt completed")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusSatisfied {
+		t.Fatalf("Status = %s, want %s", out.Status, StatusSatisfied)
+	}
+}
+
+func TestRunSerializesOnAttemptCallback(t *testing.T) {
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	conditions := make([]condition.Condition, 20)
+	for i := range conditions {
+		conditions[i] = &fakeCondition{name: "ready", satisfyAfter: 1}
+	}
+
+	out, err := Run(t.Context(), Config{
+		Conditions: conditions,
+		Timeout:    500 * time.Millisecond,
+		Interval:   time.Millisecond,
+		Mode:       ModeAll,
+		OnAttempt: func(event AttemptEvent) {
+			activeNow := active.Add(1)
+			for {
+				max := maxActive.Load()
+				if activeNow <= max || maxActive.CompareAndSwap(max, activeNow) {
+					break
+				}
+			}
+			time.Sleep(time.Millisecond)
+			active.Add(-1)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusSatisfied {
+		t.Fatalf("Status = %s, want %s", out.Status, StatusSatisfied)
+	}
+	if max := maxActive.Load(); max > 1 {
+		t.Fatalf("max concurrent OnAttempt callbacks = %d, want <= 1", max)
+	}
+}
+
+type concurrentCheckCondition struct {
+	active atomic.Int32
+	max    atomic.Int32
+}
+
+func (c *concurrentCheckCondition) Descriptor() condition.Descriptor {
+	return condition.Descriptor{Name: "shared"}
+}
+
+func (c *concurrentCheckCondition) Check(ctx context.Context) condition.Result {
+	active := c.active.Add(1)
+	for {
+		max := c.max.Load()
+		if active <= max || c.max.CompareAndSwap(max, active) {
+			break
+		}
+	}
+	defer c.active.Add(-1)
+	select {
+	case <-time.After(2 * time.Millisecond):
+	case <-ctx.Done():
+		return condition.Unsatisfied("", ctx.Err())
+	}
+	return condition.Unsatisfied("not ready", errors.New("not ready"))
+}
+
+func TestRunSerializesReusedConditionInstance(t *testing.T) {
+	shared := &concurrentCheckCondition{}
+	out, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{shared, condition.NewGuard(shared)},
+		Timeout:    25 * time.Millisecond,
+		Interval:   time.Millisecond,
+		Mode:       ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusTimeout {
+		t.Fatalf("Status = %s, want %s", out.Status, StatusTimeout)
+	}
+	if max := shared.max.Load(); max > 1 {
+		t.Fatalf("max concurrent Check calls = %d, want <= 1", max)
+	}
+}
+
+type passthroughWrapper struct {
+	inner condition.Condition
+}
+
+func (w *passthroughWrapper) Descriptor() condition.Descriptor {
+	return w.inner.Descriptor()
+}
+
+func (w *passthroughWrapper) Check(ctx context.Context) condition.Result {
+	return w.inner.Check(ctx)
+}
+
+func (w *passthroughWrapper) UnwrapCondition() condition.Condition {
+	return w.inner
+}
+
+func TestRunSerializesConditionsThroughCustomWrapper(t *testing.T) {
+	shared := &concurrentCheckCondition{}
+	out, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{
+			&passthroughWrapper{inner: shared},
+			&passthroughWrapper{inner: shared},
+		},
+		Timeout:  25 * time.Millisecond,
+		Interval: time.Millisecond,
+		Mode:     ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusTimeout {
+		t.Fatalf("Status = %s, want %s", out.Status, StatusTimeout)
+	}
+	if max := shared.max.Load(); max > 1 {
+		t.Fatalf("max concurrent Check calls = %d, want <= 1", max)
+	}
+}
+
+func TestRunDetectsGuardRoleThroughCustomWrapper(t *testing.T) {
+	out, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{
+			&fakeCondition{name: "ready", satisfyAfter: 1},
+			&passthroughWrapper{inner: condition.NewGuard(&fakeCondition{name: "guard"})},
+		},
+		Timeout:  50 * time.Millisecond,
+		Interval: time.Millisecond,
+		Mode:     ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusSatisfied {
+		t.Fatalf("Status = %s, want %s, outcome = %+v", out.Status, StatusSatisfied, out)
+	}
+	if !out.Conditions[1].Guard {
+		t.Fatalf("wrapped guard was not marked as guard: %+v", out.Conditions[1])
+	}
+}
+
+type blockingCountingCondition struct {
+	checks atomic.Int64
+}
+
+func (c *blockingCountingCondition) Descriptor() condition.Descriptor {
+	return condition.Descriptor{Name: "blocking"}
+}
+
+func (c *blockingCountingCondition) Check(ctx context.Context) condition.Result {
+	c.checks.Add(1)
+	<-ctx.Done()
+	return condition.Unsatisfied("", ctx.Err())
+}
+
+func TestRunDoesNotCountGateCanceledWaitAsAttempt(t *testing.T) {
+	shared := &blockingCountingCondition{}
+	out, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{shared, condition.NewGuard(shared)},
+		Timeout:    20 * time.Millisecond,
+		Interval:   time.Millisecond,
+		Mode:       ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusTimeout {
+		t.Fatalf("Status = %s, want %s", out.Status, StatusTimeout)
+	}
+	attempts := out.Conditions[0].Attempts + out.Conditions[1].Attempts
+	if checks := shared.checks.Load(); checks != 1 {
+		t.Fatalf("backend checks = %d, want one backend check before timeout", checks)
+	}
+	if attempts != 0 {
+		t.Fatalf("recorded attempts = %d, want late timeout result ignored", attempts)
+	}
+}
+
+func TestRunPerAttemptTimeoutStartsAfterSharedGate(t *testing.T) {
+	shared := &contextWaitingCondition{name: "shared"}
+	out, err := Run(t.Context(), Config{
+		Conditions: []condition.Condition{
+			&passthroughWrapper{inner: shared},
+			&passthroughWrapper{inner: shared},
+		},
+		Timeout:           25 * time.Millisecond,
+		Interval:          time.Millisecond,
+		PerAttemptTimeout: 2 * time.Millisecond,
+		Mode:              ModeAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusTimeout {
+		t.Fatalf("Status = %s, want %s", out.Status, StatusTimeout)
+	}
+	for _, rec := range out.Conditions {
+		if rec.Attempts == 0 {
+			t.Fatalf("%s attempts = 0, want gate wait not to stop polling; outcome = %+v", rec.Name, out)
+		}
+	}
+}
+
+func TestRunRejectsNilConditions(t *testing.T) {
+	var typedNil *fakeCondition
+	tests := []struct {
+		name string
+		cond condition.Condition
+	}{
+		{name: "nil", cond: nil},
+		{name: "typed nil", cond: typedNil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Run(t.Context(), Config{
+				Conditions: []condition.Condition{tt.cond},
+				Timeout:    time.Second,
+				Interval:   time.Millisecond,
+				Mode:       ModeAll,
+			})
+			if err == nil {
+				t.Fatal("Run() expected nil condition error, got nil")
+			}
+		})
+	}
+}
+
 func TestRunRejectsNegativePerAttemptTimeout(t *testing.T) {
 	_, err := Run(t.Context(), Config{
 		Conditions:        []condition.Condition{&fakeCondition{name: "ready", satisfyAfter: 1}},
@@ -468,8 +850,20 @@ func TestRunRejectsInvalidBackoffConfig(t *testing.T) {
 			cfg:  Config{MaxInterval: time.Millisecond, Backoff: Backoff("linear")},
 		},
 		{
+			name: "invalid mode",
+			cfg:  Config{MaxInterval: time.Millisecond, Mode: Mode("first")},
+		},
+		{
 			name: "negative jitter",
 			cfg:  Config{MaxInterval: time.Millisecond, Jitter: -0.1},
+		},
+		{
+			name: "nan jitter",
+			cfg:  Config{MaxInterval: time.Millisecond, Jitter: math.NaN()},
+		},
+		{
+			name: "infinite jitter",
+			cfg:  Config{MaxInterval: time.Millisecond, Jitter: math.Inf(1)},
 		},
 	}
 	for _, tt := range tests {

@@ -597,22 +597,64 @@ func dnsRCodeString(code uint16) string {
 	return fmt.Sprintf("RCODE%d", code)
 }
 
+func ValidateDNSName(name string) error {
+	return validateDNSName(name)
+}
+
 func validateDNSName(name string) error {
-	name = strings.TrimSpace(name)
 	if name == "" {
 		return fmt.Errorf("dns host is required")
+	}
+	if strings.TrimSpace(name) != name || containsSpaceOrControl(name) {
+		return fmt.Errorf("dns host contains invalid characters")
 	}
 	trimmed := strings.TrimSuffix(name, ".")
 	if len(trimmed) > 253 {
 		return fmt.Errorf("dns host exceeds 253 octets")
 	}
-	for _, label := range strings.Split(trimmed, ".") {
+	if trimmed == "" {
+		return nil
+	}
+	return validateDNSLabels(strings.Split(trimmed, "."))
+}
+
+func validateDNSLabels(labels []string) error {
+	for _, label := range labels {
 		if label == "" {
 			return fmt.Errorf("dns host contains an empty label")
 		}
 		if len(label) > 63 {
 			return fmt.Errorf("dns label exceeds 63 octets")
 		}
+		if !validDNSLabel(label) {
+			return fmt.Errorf("dns label contains invalid characters")
+		}
 	}
 	return nil
+}
+
+func validDNSLabel(label string) bool {
+	for i := 0; i < len(label); i++ {
+		if !validDNSLabelChar(label[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func validDNSLabelChar(ch byte) bool {
+	if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' {
+		return true
+	}
+	return ch == '-' || ch == '_'
+}
+
+func containsSpaceOrControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch <= 0x20 || ch == 0x7f {
+			return true
+		}
+	}
+	return false
 }

@@ -92,14 +92,37 @@ func parseJSONComparison(expr string) (jsonComparison, error) {
 		if op == "=" {
 			op = "=="
 		}
-		return jsonComparison{path: normalizeJSONPath(path), op: op, want: want}, nil
+		normalized := normalizeJSONPath(path)
+		if err := validateJSONPath(normalized); err != nil {
+			return jsonComparison{}, err
+		}
+		return jsonComparison{path: normalized, op: op, want: want}, nil
 	}
 
-	return jsonComparison{path: normalizeJSONPath(expr)}, nil
+	normalized := normalizeJSONPath(expr)
+	if err := validateJSONPath(normalized); err != nil {
+		return jsonComparison{}, err
+	}
+	return jsonComparison{path: normalized}, nil
 }
 
 func normalizeJSONPath(path string) string {
 	return strings.Trim(strings.TrimSpace(path), "{}")
+}
+
+func validateJSONPath(path string) error {
+	if !strings.HasPrefix(path, ".") {
+		return fmt.Errorf("jsonpath must start with '.' or '{.'")
+	}
+	remaining := strings.TrimPrefix(path, ".")
+	for remaining != "" {
+		part, rest, _ := strings.Cut(remaining, ".")
+		if _, _, err := splitJSONPathPart(part); err != nil {
+			return err
+		}
+		remaining = rest
+	}
+	return nil
 }
 
 // findOperator scans s left-to-right and returns the index and value of the

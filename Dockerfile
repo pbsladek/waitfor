@@ -30,7 +30,7 @@ ARG DATE=unknown
 
 LABEL org.opencontainers.image.title="waitfor" \
       org.opencontainers.image.description="Semantic condition poller for scripts, CI, Kubernetes init containers, and agent workflows" \
-      org.opencontainers.image.source="https://github.com/pbsladek/waitfor" \
+      org.opencontainers.image.source="https://github.com/pbsladek/wait-for" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.created="${DATE}" \

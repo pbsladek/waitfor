@@ -256,7 +256,8 @@ arm64 builds do not fall back to QEMU.
 - Writing to stdout from a backend — all output is the runner's responsibility.
 - Using `math/rand` for jitter — `gosec` flags it; use `crypto/rand` or a
   deterministic test seam.
-- Adding a `sync.Mutex` to a condition struct when the runner guarantees each
-  `Check` call is serialised per-condition (use `sync.Once` for lazy init only).
+- Adding a `sync.Mutex` to a condition struct when the runner serializes `Check`
+  calls for the same pointer condition instance, including wrappers that expose
+  `UnwrapCondition` (use `sync.Once` for lazy init only).
 - Breaking the `Condition` interface to pass extra information — put it in the
   struct fields set before `Check` is called.

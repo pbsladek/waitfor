@@ -63,6 +63,15 @@ func TestFileDeletedButStillExists(t *testing.T) {
 	}
 }
 
+func TestFileDeletedWithContainsFatal(t *testing.T) {
+	c := NewFile(filepath.Join(t.TempDir(), "missing"), FileDeleted)
+	c.Contains = "needle"
+	result := c.Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("Status = %s, want %s", result.Status, CheckFatal)
+	}
+}
+
 func TestFileContainsNotFound(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "log")
 	if err := os.WriteFile(path, []byte("nothing here"), 0o600); err != nil {
