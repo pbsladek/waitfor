@@ -10,6 +10,35 @@ import (
 	wdns "codeberg.org/miekg/dns"
 )
 
+func TestValidateDNSName(t *testing.T) {
+	tests := []struct {
+		name    string
+		host    string
+		wantErr bool
+	}{
+		{name: "plain", host: "example.test"},
+		{name: "root", host: "."},
+		{name: "service labels", host: "_sip._tcp.example.test"},
+		{name: "leading whitespace", host: " example.test", wantErr: true},
+		{name: "embedded whitespace", host: "bad name", wantErr: true},
+		{name: "control", host: "bad\tname", wantErr: true},
+		{name: "empty label", host: "bad..name", wantErr: true},
+		{name: "invalid character", host: "bad/name", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateDNSName(tt.host)
+			if tt.wantErr && err == nil {
+				t.Fatal("ValidateDNSName() expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("ValidateDNSName() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestDNSConditionARecordSatisfied(t *testing.T) {
 	cond := NewDNS("example.test")
 	cond.LookupIP = func(_ context.Context, network, host string) ([]net.IP, error) {

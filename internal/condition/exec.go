@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -48,10 +47,12 @@ func (c *ExecCondition) Check(ctx context.Context) Result {
 	if len(c.Env) > 0 {
 		cmd.Env = append(os.Environ(), c.Env...)
 	}
-	var output limitedBuffer
-	output.limit = c.MaxOutputBytes
-	cmd.Stdout = io.Writer(&output)
-	cmd.Stderr = io.Writer(&output)
+	var stdout limitedBuffer
+	stdout.limit = c.MaxOutputBytes
+	var stderr limitedBuffer
+	stderr.limit = c.MaxOutputBytes
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	exitCode, earlyResult := classifyRunError(cmd.Run(), ctx.Err())
 	if earlyResult != nil {
@@ -63,7 +64,8 @@ func (c *ExecCondition) Check(ctx context.Context) Result {
 		return Unsatisfied(detail, errors.New(detail))
 	}
 
-	return checkExecOutput(output.Bytes(), output.truncated, exitCode, c)
+	output, truncated := combinedExecOutput(&stdout, &stderr, c.MaxOutputBytes)
+	return checkExecOutput(output, stdout.Bytes(), truncated, exitCode, c)
 }
 
 // classifyRunError maps the error from cmd.Run() to either:
@@ -86,7 +88,7 @@ func classifyRunError(runErr, ctxErr error) (int, *Result) {
 }
 
 // checkExecOutput evaluates the captured output against any configured matchers.
-func checkExecOutput(out []byte, truncated bool, exitCode int, c *ExecCondition) Result {
+func checkExecOutput(out, jsonOut []byte, truncated bool, exitCode int, c *ExecCondition) Result {
 	details := []string{fmt.Sprintf("exit code %d", exitCode)}
 	if truncated {
 		details = append(details, fmt.Sprintf("output truncated to %d bytes", c.MaxOutputBytes))
@@ -98,7 +100,7 @@ func checkExecOutput(out []byte, truncated bool, exitCode int, c *ExecCondition)
 		details = append(details, "output contains required substring")
 	}
 	if c.OutputJSONExpr != nil {
-		ok, detail, err := c.OutputJSONExpr.EvaluateJSON(out)
+		ok, detail, err := c.OutputJSONExpr.EvaluateJSON(jsonOut)
 		if err != nil {
 			return Unsatisfied("jsonpath evaluation failed", err)
 		}
@@ -108,6 +110,14 @@ func checkExecOutput(out []byte, truncated bool, exitCode int, c *ExecCondition)
 		details = append(details, detail)
 	}
 	return Satisfied(strings.Join(details, ", "))
+}
+
+func combinedExecOutput(stdout, stderr *limitedBuffer, limit int64) ([]byte, bool) {
+	var output limitedBuffer
+	output.limit = limit
+	_, _ = output.Write(stdout.Bytes())
+	_, _ = output.Write(stderr.Bytes())
+	return output.Bytes(), output.truncated || stdout.truncated || stderr.truncated
 }
 
 func commandTarget(command []string) string {

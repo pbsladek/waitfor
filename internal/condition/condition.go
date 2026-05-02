@@ -58,6 +58,10 @@ type RoleProvider interface {
 	ConditionRole() Role
 }
 
+type Wrapper interface {
+	UnwrapCondition() Condition
+}
+
 type GuardCondition struct {
 	Inner Condition
 }
@@ -73,6 +77,10 @@ func WithName(inner Condition, name string) Condition {
 
 func (c *NamedCondition) ConditionRole() Role {
 	return conditionRole(c.Inner)
+}
+
+func (c *NamedCondition) UnwrapCondition() Condition {
+	return c.Inner
 }
 
 func (c *NamedCondition) Descriptor() Descriptor {
@@ -97,6 +105,10 @@ func NewGuard(inner Condition) *GuardCondition {
 
 func (c *GuardCondition) ConditionRole() Role {
 	return RoleGuard
+}
+
+func (c *GuardCondition) UnwrapCondition() Condition {
+	return c.Inner
 }
 
 func (c *GuardCondition) Descriptor() Descriptor {

@@ -238,8 +238,9 @@ expression failures are retryable.
 
 On Unix, commands run in a separate process group so cancellation propagates
 to shell descendants. `--exit-code` must be non-negative. `stdout` and
-`stderr` are merged into a single captured stream; `--max-output-bytes` caps
-capture (default: 1 MiB). `--env` entries must use `KEY=VALUE` form.
+`stderr` are merged for `--output-contains`; `--jsonpath` evaluates `stdout`
+only. `--max-output-bytes` caps capture (default: 1 MiB). `--env` entries must
+use `KEY=VALUE` form.
 
 ### File
 
@@ -253,25 +254,28 @@ flags (default `--exists`):
 | `--nonempty` | Path exists and has size greater than zero. |
 
 `--contains TEXT` reads the file and requires a substring match within the
-first 10 MiB. It is only meaningful with `--exists` or `--nonempty`. Content
-checks on non-regular files (directories, devices) are fatal. Missing paths,
-empty files, and substring mismatches are retryable.
+first 10 MiB. It is valid only with `--exists` or `--nonempty`; combining it
+with `--deleted` is invalid. Content checks on non-regular files (directories,
+devices) are fatal. Missing paths, empty files, and substring mismatches are
+retryable.
 
 ### Log
 
 Tails a file and returns satisfied when enough matching lines have appeared.
 
-**Offset tracking.** On the first check, the byte offset is initialised:
-`--from-start` sets it to zero; `--tail N` scans up to 1 MiB from the end to
-find the start of the last N lines; the default sets it to the current file
-size (tail-only, skips all existing content). Subsequent checks read up to
-10 MiB of new content from the saved offset and advance it to the end of what
-was read.
+**Offset tracking.** On the first check with an existing file, the byte offset
+is initialised: `--from-start` sets it to zero; `--tail N` scans up to 1 MiB
+from the end to find the start of the last N lines; the default sets it to the
+current file size (tail-only, skips all existing content). If the file is
+missing when waiting starts, the first file created at that path is scanned from
+the beginning. Subsequent checks read up to 10 MiB of new content from the saved
+offset and advance it to the end of what was read.
 
 **Rotation detection.** Each check calls `os.Stat` and compares the result
 with the previously seen `os.FileInfo` using `os.SameFile`. If the inode has
-changed, the offset and cumulative match count are reset to zero and the new
-file is scanned from the beginning.
+changed, or if the file size shrinks below the saved offset, the offset and
+cumulative match count are reset to zero and the new content is scanned from
+the beginning.
 
 **Line matching (AND semantics).** For each new line:
 
@@ -340,6 +344,10 @@ type Condition interface {
     Check(ctx context.Context) Result
 }
 
+type Wrapper interface {
+    UnwrapCondition() Condition
+}
+
 type Result struct {
     Status CheckStatus  // CheckSatisfied | CheckUnsatisfied | CheckFatal
     Detail string       // human-readable summary; included in JSON output
@@ -350,8 +358,10 @@ type Result struct {
 `Check` must be safe to call repeatedly from a single goroutine and must return
 promptly when `ctx` is cancelled. Retryable failures return `CheckUnsatisfied`;
 unrecoverable failures return `CheckFatal`. Stateful backends (e.g. `log`) may
-store mutable fields directly on the struct because the runner calls `Check`
-from exactly one goroutine per condition instance.
+store mutable fields directly on the struct because the runner serializes
+`Check` calls for the same pointer condition instance. Wrappers such as guards
+and names implement `Wrapper`, so two wrappers around the same inner pointer are
+serialized against that shared inner condition.
 
 ## Runner
 
@@ -366,16 +376,24 @@ type Config struct {
     RequiredSuccesses int
     StableFor         time.Duration
     Mode              Mode          // ModeAll | ModeAny
-    OnAttempt         func(AttemptEvent)
+    OnAttempt         func(AttemptEvent) // synchronous and serialized
 }
 ```
 
 Conditions are polled concurrently, one goroutine per condition. `ModeAll`
 waits for every condition to satisfy; `ModeAny` cancels remaining work after
-the first satisfaction. Fatal errors take precedence over satisfaction when
-both are recorded in the same run. A per-attempt timeout of `0` passes the
+the first satisfaction. The first terminal result wins, so a fatal guard that
+completes after all required readiness conditions have already completed does
+not turn a satisfied run into a fatal run. A per-attempt timeout of `0` passes the
 global run context directly to each check. If `PerAttemptTimeout` exceeds the
 global `Timeout`, it is normalised to the global timeout before the run starts.
+
+`OnAttempt` is called after each recorded backend `Check` call. The runner
+serializes callbacks and waits for them before returning, so progress lines
+cannot be written after the final summary. Slow callbacks can delay polling.
+The JSON `attempts` field counts recorded backend `Check` calls, not cancelled
+waits for a shared condition gate or late terminal checks ignored after the run
+has already completed.
 
 `RequiredSuccesses` and `StableFor` apply only to non-guard conditions. A
 successful backend check is treated as still pending until the configured
@@ -439,7 +457,8 @@ otherwise its last detail.
 | `1` | Timeout expired |
 | `2` | Invalid arguments or configuration |
 | `3` | Unrecoverable condition failure |
-| `130` | Cancelled by SIGINT, SIGTERM, or parent context |
+| `130` | Cancelled by SIGINT or parent context |
+| `143` | Cancelled by SIGTERM |
 
 ## Growth Rules
 

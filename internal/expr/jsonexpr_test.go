@@ -40,12 +40,8 @@ func TestEvaluateJSON(t *testing.T) {
 	}
 }
 
-func TestEvaluateJSONRejectsInvalidPath(t *testing.T) {
-	expression, err := Compile("ready == true")
-	if err != nil {
-		t.Fatalf("Compile() error = %v", err)
-	}
-	_, _, err = expression.EvaluateJSON([]byte(`{"ready":true}`))
+func TestCompileRejectsInvalidPath(t *testing.T) {
+	_, err := Compile("ready == true")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -163,6 +159,8 @@ func TestCompileErrors(t *testing.T) {
 		"  ",
 		".field == ",
 		" == value",
+		"items",
+		".items[bad]",
 	}
 	for _, expr := range tests {
 		if _, err := Compile(expr); err == nil {

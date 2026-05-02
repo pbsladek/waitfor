@@ -60,7 +60,7 @@ func (c *KubernetesCondition) Check(ctx context.Context) Result {
 	}
 	obj, err := getter.Get(ctx, c.Resource, c.Namespace)
 	if err != nil {
-		return Unsatisfied("", err)
+		return classifyK8sGetterError(err)
 	}
 	if c.WaitFor != "" {
 		return checkK8sWaitFor(obj, c.WaitFor)
@@ -97,15 +97,26 @@ func validateK8sResource(resource string, selector string) error {
 func (c *KubernetesCondition) checkSelected(ctx context.Context, getter KubernetesGetter) Result {
 	items, err := getter.List(ctx, c.Resource, c.Namespace, c.Selector)
 	if err != nil {
-		if apierrors.IsBadRequest(err) {
-			return Fatal(err)
-		}
-		return Unsatisfied("", err)
+		return classifyK8sGetterError(err)
 	}
 	if len(items) == 0 {
 		return Unsatisfied("no resources matched selector", errors.New("no resources matched selector"))
 	}
 	return checkK8sSelected(items, c.WaitFor, c.All)
+}
+
+func classifyK8sGetterError(err error) Result {
+	if permanentK8sError(err) {
+		return Fatal(err)
+	}
+	return Unsatisfied("", err)
+}
+
+func permanentK8sError(err error) bool {
+	return apierrors.IsUnauthorized(err) ||
+		apierrors.IsForbidden(err) ||
+		apierrors.IsBadRequest(err) ||
+		apierrors.IsInvalid(err)
 }
 
 func (c *KubernetesCondition) resolveGetter() (KubernetesGetter, error) {

@@ -4,8 +4,11 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"errors"
+	"math"
 	"math/big"
+	"reflect"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +39,16 @@ const (
 	BackoffExponential Backoff = "exponential"
 )
 
+type terminalStatus int32
+
+const (
+	terminalNone terminalStatus = iota
+	terminalSatisfied
+	terminalFatal
+)
+
+const maxConditionUnwrapDepth = 32
+
 type Config struct {
 	Conditions        []condition.Condition
 	Timeout           time.Duration
@@ -47,7 +60,10 @@ type Config struct {
 	RequiredSuccesses int
 	StableFor         time.Duration
 	Mode              Mode
-	OnAttempt         func(AttemptEvent)
+	// OnAttempt is called synchronously after each recorded backend check. The
+	// runner serializes callback execution so callers do not need to add locking
+	// solely to protect their output writer.
+	OnAttempt func(AttemptEvent)
 }
 
 type AttemptEvent struct {
@@ -103,9 +119,17 @@ func (o Outcome) Fatal() bool {
 	return o.Status == StatusFatal
 }
 
+func ValidateConfig(cfg Config) error {
+	cfg = normalizeRunConfig(cfg)
+	return validateRunConfig(cfg)
+}
+
 func validateRunConfig(cfg Config) error {
 	if len(cfg.Conditions) == 0 {
 		return errors.New("at least one condition is required")
+	}
+	if err := validateConditionConfig(cfg.Conditions); err != nil {
+		return err
 	}
 	if err := validateTimingConfig(cfg); err != nil {
 		return err
@@ -116,8 +140,20 @@ func validateRunConfig(cfg Config) error {
 	if err := validateStabilityConfig(cfg); err != nil {
 		return err
 	}
+	if err := validateModeConfig(cfg); err != nil {
+		return err
+	}
 	if !hasReadyCondition(cfg.Conditions) {
 		return errors.New("at least one non-guard condition is required")
+	}
+	return nil
+}
+
+func validateConditionConfig(conditions []condition.Condition) error {
+	for _, cond := range conditions {
+		if isNilCondition(cond) {
+			return errors.New("condition cannot be nil")
+		}
 	}
 	return nil
 }
@@ -142,7 +178,7 @@ func validateBackoffConfig(cfg Config) error {
 	if cfg.Backoff != BackoffConstant && cfg.Backoff != BackoffExponential {
 		return errors.New("backoff must be constant or exponential")
 	}
-	if cfg.Jitter < 0 || cfg.Jitter > 1 {
+	if math.IsNaN(cfg.Jitter) || math.IsInf(cfg.Jitter, 0) || cfg.Jitter < 0 || cfg.Jitter > 1 {
 		return errors.New("jitter must be between 0 and 1")
 	}
 	return nil
@@ -158,9 +194,21 @@ func validateStabilityConfig(cfg Config) error {
 	return nil
 }
 
+func validateModeConfig(cfg Config) error {
+	switch cfg.Mode {
+	case ModeAll, ModeAny:
+		return nil
+	default:
+		return errors.New("mode must be all or any")
+	}
+}
+
 func normalizeRunConfig(cfg Config) Config {
 	if cfg.Backoff == "" {
 		cfg.Backoff = BackoffConstant
+	}
+	if cfg.Mode == "" {
+		cfg.Mode = ModeAll
 	}
 	if cfg.MaxInterval == 0 {
 		cfg.MaxInterval = cfg.Interval
@@ -175,8 +223,19 @@ func normalizeRunConfig(cfg Config) Config {
 }
 
 func conditionRole(cond condition.Condition) condition.Role {
-	if provider, ok := cond.(condition.RoleProvider); ok {
-		return provider.ConditionRole()
+	for depth := 0; depth < maxConditionUnwrapDepth; depth++ {
+		if provider, ok := cond.(condition.RoleProvider); ok {
+			return provider.ConditionRole()
+		}
+		wrapper, ok := cond.(condition.Wrapper)
+		if !ok {
+			return condition.RoleReady
+		}
+		inner := wrapper.UnwrapCondition()
+		if isNilCondition(inner) {
+			return condition.RoleReady
+		}
+		cond = inner
 	}
 	return condition.RoleReady
 }
@@ -195,7 +254,13 @@ func readyConditionCount(conditions []condition.Condition) int {
 	return count
 }
 
-func finalStatus(ctx context.Context, records []ConditionResult, mode Mode) Status {
+func finalStatus(ctx context.Context, records []ConditionResult, mode Mode, terminal terminalStatus) Status {
+	switch terminal {
+	case terminalFatal:
+		return StatusFatal
+	case terminalSatisfied:
+		return StatusSatisfied
+	}
 	for _, rec := range records {
 		if rec.Fatal {
 			return StatusFatal
@@ -222,6 +287,7 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 
 	records := make([]ConditionResult, len(cfg.Conditions))
 	var readyRemaining atomic.Int64
+	var terminal atomic.Int32
 	readyRemaining.Store(int64(readyConditionCount(cfg.Conditions)))
 	for i, cond := range cfg.Conditions {
 		desc := cond.Descriptor()
@@ -231,12 +297,14 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 		records[i].Guard = conditionRole(cond) == condition.RoleGuard
 	}
 
+	gates := conditionGates(cfg.Conditions)
+	attempts := newAttemptRecorder(cfg.OnAttempt)
 	g, runCtx := errgroup.WithContext(ctx)
 	for i, cond := range cfg.Conditions {
 		i := i
 		cond := cond
 		g.Go(func() error {
-			runCondition(runCtx, cond, cfg, start, &records[i], cancel, &readyRemaining)
+			runCondition(runCtx, cond, gates[i], cfg, start, &records[i], cancel, &readyRemaining, &terminal, attempts)
 			return nil
 		})
 	}
@@ -254,9 +322,121 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 		RequiredSuccesses: cfg.RequiredSuccesses,
 		StableFor:         cfg.StableFor,
 		Conditions:        append([]ConditionResult(nil), records...),
-		Status:            finalStatus(ctx, records, cfg.Mode),
+		Status:            finalStatus(ctx, records, cfg.Mode, terminalStatus(terminal.Load())),
 	}
 	return out, nil
+}
+
+type conditionGate chan struct{}
+
+func conditionGates(conditions []condition.Condition) []conditionGate {
+	byPointer := map[uintptr]conditionGate{}
+	gates := make([]conditionGate, len(conditions))
+	for i, cond := range conditions {
+		key, ok := conditionPointerKey(cond)
+		if ok {
+			gate, exists := byPointer[key]
+			if !exists {
+				gate = make(conditionGate, 1)
+				byPointer[key] = gate
+			}
+			gates[i] = gate
+			continue
+		}
+		gates[i] = make(conditionGate, 1)
+	}
+	return gates
+}
+
+func conditionPointerKey(cond condition.Condition) (uintptr, bool) {
+	cond = unwrapCondition(cond)
+	if isNilCondition(cond) {
+		return 0, false
+	}
+	value := reflect.ValueOf(cond)
+	if value.Kind() != reflect.Pointer || value.IsNil() {
+		return 0, false
+	}
+	return value.Pointer(), true
+}
+
+func unwrapCondition(cond condition.Condition) condition.Condition {
+	for depth := 0; depth < maxConditionUnwrapDepth; depth++ {
+		wrapper, ok := cond.(condition.Wrapper)
+		if !ok {
+			return cond
+		}
+		inner := wrapper.UnwrapCondition()
+		if isNilCondition(inner) {
+			return cond
+		}
+		cond = inner
+	}
+	return cond
+}
+
+func isNilCondition(cond condition.Condition) bool {
+	if cond == nil {
+		return true
+	}
+	value := reflect.ValueOf(cond)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func checkCondition(ctx context.Context, cond condition.Condition, gate conditionGate, timeout time.Duration) (condition.Result, bool) {
+	release, ok := acquireConditionGate(ctx, gate)
+	if !ok {
+		return condition.Unsatisfied("", ctx.Err()), false
+	}
+	defer release()
+
+	attemptCtx, attemptCancel := makeAttemptContext(ctx, timeout)
+	result := cond.Check(attemptCtx)
+	attemptErr := attemptCtx.Err()
+	attemptCancel()
+
+	if ctx.Err() != nil {
+		return condition.Unsatisfied("", ctx.Err()), false
+	}
+	if attemptErr != nil {
+		return condition.Unsatisfied("", attemptErr), true
+	}
+	return result, true
+}
+
+func acquireConditionGate(ctx context.Context, gate conditionGate) (func(), bool) {
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, true
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
+type attemptRecorder struct {
+	on func(AttemptEvent)
+	mu sync.Mutex
+}
+
+func newAttemptRecorder(on func(AttemptEvent)) *attemptRecorder {
+	if on == nil {
+		return nil
+	}
+	return &attemptRecorder{on: on}
+}
+
+func (r *attemptRecorder) emit(event AttemptEvent) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.on(event)
 }
 
 // makeAttemptContext returns a child context with a per-attempt deadline.
@@ -436,11 +616,14 @@ func maxDuration(a, b time.Duration) time.Duration {
 func runCondition(
 	ctx context.Context,
 	cond condition.Condition,
+	gate conditionGate,
 	cfg Config,
 	start time.Time,
 	record *ConditionResult,
 	cancel context.CancelFunc,
 	readyRemaining *atomic.Int64,
+	terminal *atomic.Int32,
+	attempts *attemptRecorder,
 ) {
 	conditionStart := time.Now()
 	progress := stabilityProgress{}
@@ -457,12 +640,12 @@ func runCondition(
 		default:
 		}
 
-		record.Attempts++
-		attempt := record.Attempts
+		rawResult, checked := checkCondition(ctx, cond, gate, cfg.PerAttemptTimeout)
+		if !checked {
+			return
+		}
 
-		attemptCtx, attemptCancel := makeAttemptContext(ctx, cfg.PerAttemptTimeout)
-		rawResult := cond.Check(attemptCtx)
-		attemptCancel()
+		attempt := record.Attempts + 1
 		result := rawResult
 		if record.Guard {
 			progress.reset()
@@ -470,10 +653,11 @@ func runCondition(
 			result = applyStabilityThreshold(result, cfg, &progress, time.Now())
 		}
 
-		updateRecord(record, result, conditionStart, start)
-		done := resultEndsCondition(result, cfg, record, cancel, readyRemaining)
-		if cfg.OnAttempt != nil {
-			cfg.OnAttempt(buildAttemptEvent(record, attempt, result, start))
+		done, shouldRecord := resultEndsCondition(result, cfg, record, cancel, readyRemaining, terminal)
+		if shouldRecord {
+			record.Attempts = attempt
+			updateRecord(record, result, conditionStart, start)
+			attempts.emit(buildAttemptEvent(record, attempt, result, start))
 		}
 		if done {
 			return
@@ -492,27 +676,42 @@ func resultEndsCondition(
 	record *ConditionResult,
 	cancel context.CancelFunc,
 	readyRemaining *atomic.Int64,
-) bool {
+	terminal *atomic.Int32,
+) (bool, bool) {
 	switch result.Status {
 	case condition.CheckFatal:
-		cancel()
-		return true
+		if terminal.CompareAndSwap(int32(terminalNone), int32(terminalFatal)) {
+			cancel()
+			return true, true
+		}
+		return true, false
 	case condition.CheckSatisfied:
-		cancelSatisfiedRun(cfg, record, cancel, readyRemaining)
-		return true
+		return cancelSatisfiedRun(cfg, record, cancel, readyRemaining, terminal), true
 	default:
-		return false
+		return false, true
 	}
 }
 
-func cancelSatisfiedRun(cfg Config, record *ConditionResult, cancel context.CancelFunc, readyRemaining *atomic.Int64) {
+func cancelSatisfiedRun(
+	cfg Config,
+	record *ConditionResult,
+	cancel context.CancelFunc,
+	readyRemaining *atomic.Int64,
+	terminal *atomic.Int32,
+) bool {
 	if cfg.Mode == ModeAny {
-		cancel()
-		return
+		if terminal.CompareAndSwap(int32(terminalNone), int32(terminalSatisfied)) {
+			cancel()
+			return true
+		}
+		return true
 	}
 	if !record.Guard && readyRemaining.Add(-1) == 0 {
-		cancel()
+		if terminal.CompareAndSwap(int32(terminalNone), int32(terminalSatisfied)) {
+			cancel()
+		}
 	}
+	return true
 }
 
 func outcomeSatisfied(records []ConditionResult, mode Mode) bool {

@@ -29,9 +29,9 @@ waitfor http https://api.example.com/health --status 200 && ./run-migrations.sh
 ## 2. Require a specific JSON field in the health response
 
 ```bash
-waitfor http https://api.example.com/health \
-  --jsonpath '.status == "ok"' \
-  --timeout 2m
+waitfor --timeout 2m \
+  http https://api.example.com/health \
+  --jsonpath '.status == "ok"'
 ```
 
 ```
@@ -207,10 +207,10 @@ echo "service is up: $detail"
 Useful in CI to assert that a service started without fatal errors:
 
 ```bash
-waitfor log /var/log/app.log \
+waitfor --timeout 10s \
+  log /var/log/app.log \
   --matches "FATAL|panic" \
-  --from-start \
-  --timeout 10s
+  --from-start
 if [ $? -eq 0 ]; then
   echo "fatal error detected in log — failing build" >&2
   exit 1
@@ -242,10 +242,10 @@ Some services emit periodic heartbeats. Require three consecutive appearances
 before trusting the service is stable:
 
 ```bash
-waitfor log /var/log/app.log \
+waitfor --timeout 2m \
+  log /var/log/app.log \
   --contains "heartbeat ok" \
-  --min-matches 3 \
-  --timeout 2m
+  --min-matches 3
 ```
 
 ```
@@ -268,13 +268,12 @@ After a deployment that changes DNS, wait for the new CNAME to appear using
 the wire resolver for an exact check:
 
 ```bash
-waitfor dns api.example.com \
+waitfor --timeout 30m --interval 30s \
+  dns api.example.com \
   --resolver wire \
   --server 8.8.8.8 \
   --type CNAME \
-  --equals "lb.example.com." \
-  --timeout 30m \
-  --interval 30s
+  --equals "lb.example.com."
 ```
 
 ---
@@ -284,10 +283,10 @@ waitfor dns api.example.com \
 Combine `waitfor` with `mail` to alert on the first error:
 
 ```bash
-waitfor log /var/log/app.log \
+waitfor --timeout 24h \
+  log /var/log/app.log \
   --matches "ERROR|CRITICAL" \
-  --from-start \
-  --timeout 24h && \
+  --from-start && \
   echo "Error detected in app.log — check the server." | \
     mail -s "Alert: app error" ops@example.com
 ```
@@ -313,16 +312,16 @@ completes:
 ```yaml
 initContainers:
   - name: wait-for-migrate
-    image: ghcr.io/pbsladek/wait-for:latest
+    image: pwbsladek/waitfor:latest
     args:
+      - --timeout
+      - 10m
       - k8s
       - job/migrate
       - --condition
       - Complete
       - --namespace
       - production
-      - --timeout
-      - 10m
 ```
 
 Chain database and cache readiness in the same init container:
@@ -343,10 +342,10 @@ args:
 ## 17. Wait for a Kubernetes rollout to finish
 
 ```bash
-waitfor k8s deployment/api \
+waitfor --timeout 10m \
+  k8s deployment/api \
   --condition Available \
-  --namespace production \
-  --timeout 10m && \
+  --namespace production && \
   echo "rollout complete"
 ```
 
@@ -381,18 +380,17 @@ waitfor --timeout 3m --interval 2s \
 Wait until `kubectl rollout status` returns exit code `0`:
 
 ```bash
-waitfor exec \
-  --timeout 10m \
-  --interval 5s \
+waitfor --timeout 10m --interval 5s \
+  exec \
   -- kubectl rollout status deployment/api -n production
 ```
 
 With output inspection — wait until the migration script prints "done":
 
 ```bash
-waitfor exec \
+waitfor --timeout 5m \
+  exec \
   --output-contains "migrations complete" \
-  --timeout 5m \
   -- psql "$DATABASE_URL" -c "SELECT status FROM schema_migrations ORDER BY id DESC LIMIT 1"
 ```
 
@@ -445,7 +443,7 @@ Example failure output on stderr:
 Block until another process deletes its lock file before proceeding:
 
 ```bash
-waitfor file /var/run/deploy.lock --deleted --timeout 10m && \
+waitfor --timeout 10m file /var/run/deploy.lock --deleted && \
   touch /var/run/deploy.lock && \
   ./deploy.sh; \
   rm -f /var/run/deploy.lock
@@ -463,7 +461,7 @@ first 50 lines of output, using `--tail` to limit the scan window:
 kubectl set image deployment/api-canary api=my-image:v2 -n production
 
 # Wait for the canary pod log to be written
-waitfor file /mnt/logs/canary.log --nonempty --timeout 2m
+waitfor --timeout 2m file /mnt/logs/canary.log --nonempty
 
 # Check the first 50 lines for errors; timeout = "no errors found in window"
 if waitfor --timeout 30s log /mnt/logs/canary.log \
@@ -483,10 +481,10 @@ kubectl set image deployment/api api=my-image:v2 -n production
 ## 24. Send a Slack message when a long job completes
 
 ```bash
-waitfor k8s job/nightly-report \
+waitfor --timeout 6h \
+  k8s job/nightly-report \
   --condition Complete \
-  --namespace production \
-  --timeout 6h && \
+  --namespace production && \
   curl -s -X POST "$SLACK_WEBHOOK" \
     -H 'Content-Type: application/json' \
     -d '{"text":"✅ nightly-report job finished"}'
@@ -495,9 +493,9 @@ waitfor k8s job/nightly-report \
 Capture elapsed time from JSON and include it in the message:
 
 ```bash
-result=$(waitfor --output json \
+result=$(waitfor --output json --timeout 6h \
   k8s job/nightly-report --condition Complete \
-  --namespace production --timeout 6h)
+  --namespace production)
 
 elapsed=$(echo "$result" | jq '.elapsed_seconds | round')
 curl -s -X POST "$SLACK_WEBHOOK" \

@@ -20,7 +20,8 @@ const (
 
 // LogCondition tails a file and returns Satisfied when enough matching lines
 // appear. It tracks a byte offset so each poll reads only new content.
-// File rotation is detected via os.SameFile and resets all state.
+// File rotation is detected via os.SameFile or copytruncate shrinkage and
+// resets all state.
 type LogCondition struct {
 	Path       string
 	Contains   string
@@ -37,6 +38,12 @@ type LogCondition struct {
 	prevInfo    os.FileInfo
 	initialized bool
 	matchCount  int
+	missingInit bool
+}
+
+type logChunk struct {
+	data       []byte
+	nextOffset int64
 }
 
 func NewLog(path string) *LogCondition {
@@ -57,24 +64,31 @@ func (c *LogCondition) Check(ctx context.Context) Result {
 	info, err := os.Stat(c.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if !c.initialized {
+				c.missingInit = true
+			}
 			return Unsatisfied("file does not exist", err)
 		}
 		return Unsatisfied("", err)
 	}
 
-	data, err := c.readNewContent(info)
+	chunk, err := c.readNewContent(info)
 	if err != nil {
 		return Unsatisfied("", err)
 	}
 
-	return c.scanLines(ctx, data)
+	result, complete := c.scanLines(ctx, chunk.data)
+	if complete {
+		c.offset = chunk.nextOffset
+	}
+	return result
 }
 
-func (c *LogCondition) readNewContent(info os.FileInfo) ([]byte, error) {
+func (c *LogCondition) readNewContent(info os.FileInfo) (logChunk, error) {
 	c.resetOnRotation(info)
 	if !c.initialized {
 		if err := c.initOffset(info); err != nil {
-			return nil, err
+			return logChunk{}, err
 		}
 		c.initialized = true
 	}
@@ -82,30 +96,35 @@ func (c *LogCondition) readNewContent(info os.FileInfo) ([]byte, error) {
 
 	f, err := os.Open(c.Path) // #nosec G304 -- log polling intentionally reads the user-selected target.
 	if err != nil {
-		return nil, err
+		return logChunk{}, err
 	}
 	defer func() { _ = f.Close() }()
 
 	if _, err := f.Seek(c.offset, io.SeekStart); err != nil {
-		return nil, err
+		return logChunk{}, err
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxLogScanBytes))
 	if err != nil {
-		return nil, err
+		return logChunk{}, err
 	}
-	c.offset += int64(len(data))
-	return data, nil
+	return logChunk{data: data, nextOffset: c.offset + int64(len(data))}, nil
 }
 
 func (c *LogCondition) resetOnRotation(info os.FileInfo) {
-	if c.prevInfo != nil && !os.SameFile(c.prevInfo, info) {
+	if c.prevInfo != nil && (!os.SameFile(c.prevInfo, info) || info.Size() < c.offset) {
 		c.offset = 0
-		c.initialized = false
+		c.initialized = true
 		c.matchCount = 0
+		c.missingInit = false
 	}
 }
 
 func (c *LogCondition) initOffset(info os.FileInfo) error {
+	if c.missingInit {
+		c.offset = 0
+		c.missingInit = false
+		return nil
+	}
 	if c.FromStart {
 		c.offset = 0
 		return nil
@@ -122,23 +141,31 @@ func (c *LogCondition) initOffset(info os.FileInfo) error {
 	return nil
 }
 
-func (c *LogCondition) scanLines(ctx context.Context, data []byte) Result {
+func (c *LogCondition) scanLines(ctx context.Context, data []byte) (Result, bool) {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 0, 64*1024), int(maxLogScanBytes))
+	matches := 0
+	var lastMatch []byte
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			return Unsatisfied("", ctx.Err())
+			return Unsatisfied("", ctx.Err()), false
 		default:
 		}
 		line := scanner.Bytes()
 		if c.matchLine(line) {
-			c.matchCount++
-			if c.matchCount >= c.requiredMatches() {
-				return Satisfied(c.satisfiedDetail(line))
-			}
+			matches++
+			lastMatch = append(lastMatch[:0], line...)
 		}
 	}
-	return c.unsatisfiedResult()
+	if err := scanner.Err(); err != nil {
+		return Unsatisfied("log scan failed", err), false
+	}
+	c.matchCount += matches
+	if c.matchCount >= c.requiredMatches() && matches > 0 {
+		return Satisfied(c.satisfiedDetail(lastMatch)), true
+	}
+	return c.unsatisfiedResult(), true
 }
 
 func (c *LogCondition) requiredMatches() int {

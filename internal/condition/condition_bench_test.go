@@ -146,7 +146,7 @@ func BenchmarkLogScanLargeChunk(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		cond.matchCount = 0
-		if result := cond.scanLines(context.Background(), data); result.Status != CheckUnsatisfied {
+		if result, _ := cond.scanLines(context.Background(), data); result.Status != CheckUnsatisfied {
 			b.Fatalf("status = %s", result.Status)
 		}
 	}
