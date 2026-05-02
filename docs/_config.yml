@@ -1,0 +1,13 @@
+remote_theme: just-the-docs/just-the-docs@v0.10.0
+
+title: waitfor
+description: Semantic condition poller for scripts, CI, containers, and Kubernetes
+
+color_scheme: dark
+
+# Disable sidebar and search
+search_enabled: false
+nav_enabled: false
+
+plugins:
+  - jekyll-remote-theme

@@ -24,14 +24,54 @@ Supported waits:
 http, tcp, dns, docker, exec, file, log, k8s
 ```
 
-`waitfor doctor` checks whether optional local integrations such as Docker,
-Kubernetes, and DNS wire mode are available.
-
 ## Install
 
 Download prebuilt binaries from the
-[GitHub Releases](https://github.com/pbsladek/wait-for/releases) page, or
-install from source with Go:
+[GitHub Releases](https://github.com/pbsladek/wait-for/releases) page.
+
+Install the latest Linux x86_64 release:
+
+```bash
+curl -fsSLO https://github.com/pbsladek/wait-for/releases/latest/download/waitfor_linux_amd64.tar.gz
+tar -xzf waitfor_linux_amd64.tar.gz waitfor
+chmod +x waitfor
+sudo mv waitfor /usr/local/bin/waitfor
+```
+
+Install a specific Linux x86_64 release:
+
+```bash
+VERSION=v0.8.0
+curl -fsSLO "https://github.com/pbsladek/wait-for/releases/download/${VERSION}/waitfor_linux_amd64.tar.gz"
+tar -xzf waitfor_linux_amd64.tar.gz waitfor
+chmod +x waitfor
+sudo mv waitfor /usr/local/bin/waitfor
+```
+
+Install the latest macOS Apple Silicon release:
+
+```bash
+curl -fsSLO https://github.com/pbsladek/wait-for/releases/latest/download/waitfor_darwin_arm64.tar.gz
+tar -xzf waitfor_darwin_arm64.tar.gz waitfor
+chmod +x waitfor
+sudo mv waitfor /usr/local/bin/waitfor
+```
+
+Install a specific macOS Apple Silicon release:
+
+```bash
+VERSION=v0.8.0
+curl -fsSLO "https://github.com/pbsladek/wait-for/releases/download/${VERSION}/waitfor_darwin_arm64.tar.gz"
+tar -xzf waitfor_darwin_arm64.tar.gz waitfor
+chmod +x waitfor
+sudo mv waitfor /usr/local/bin/waitfor
+```
+
+Use `waitfor_linux_arm64.tar.gz`, `waitfor_darwin_amd64.tar.gz`,
+`waitfor_windows_amd64.zip`, or `waitfor_windows_arm64.zip` for other
+platforms.
+
+Install from source with Go:
 
 ```bash
 go install github.com/pbsladek/wait-for/cmd/waitfor@latest
@@ -58,7 +98,6 @@ Tagged images are published as `pwbsladek/waitfor:<tag>`.
 ```text
 waitfor [flags] <backend> <target> [backend-flags]
 waitfor [flags] <backend> ... -- <backend> ...
-waitfor doctor [--output text|json] [--require temp|shell|docker|k8s|dns-wire]
 ```
 
 Global flags:
@@ -91,7 +130,6 @@ exec [--exit-code N] [--output-contains text] [--jsonpath expr] [--cwd path] [--
 file PATH [--exists|--deleted|--nonempty] [--contains text]
 log PATH (--contains text | --matches regex | --jsonpath expr) [--exclude regex] [--from-start|--tail N] [--min-matches N]
 k8s RESOURCE [--condition Ready] [--for ready|rollout|complete] [--selector labels] [--all] [--namespace default] [--jsonpath expr] [--kubeconfig path]
-doctor [--output text|json] [--require temp|shell|docker|k8s|dns-wire]
 ```
 
 Every condition accepts `--name LABEL` for human-readable text progress and JSON
@@ -102,26 +140,76 @@ condition should complete the run.
 
 ## Examples
 
-Wait for common readiness signals:
+Wait for HTTP readiness:
 
 ```bash
 waitfor http https://api.example.com/health --status 200
+
 waitfor http https://api.example.com/health --status 200 --body-contains ok
+
+waitfor http https://api.example.com/ready --jsonpath '.ready == true'
+```
+
+Wait for ports and DNS:
+
+```bash
 waitfor tcp localhost:5432
+
 waitfor dns api.example.com --type A --min-count 1
+
 waitfor dns api.example.com --resolver wire --server 1.1.1.1 --type HTTPS --rcode NOERROR
+```
+
+Wait for local process state:
+
+```bash
 waitfor docker my-container --status running --health healthy
+
 waitfor file /tmp/ready.flag --exists
+
 waitfor file /tmp/lock --deleted
-waitfor log /var/log/app.log --contains "server ready"
-waitfor log /var/log/app.log --matches "ERROR:.*timeout" --from-start
-waitfor log /var/log/app.log --contains ready --tail 100 --min-matches 2
+
 waitfor exec --output-contains Running -- kubectl get pod myapp
+```
+
+Wait for log output:
+
+```bash
+waitfor log /var/log/app.log --contains "server ready"
+
+waitfor log /var/log/app.log --matches "ERROR:.*timeout" --from-start
+
+waitfor log /var/log/app.log --contains ready --tail 100 --min-matches 2
+```
+
+Wait for Kubernetes resources:
+
+```bash
 waitfor k8s deployment/myapp --condition Available --namespace prod
+
 waitfor k8s deployment/myapp --for rollout --namespace prod
+
 waitfor k8s pod --selector app=myapp --for ready --all --namespace prod
-waitfor doctor --output json
+```
+
+Use timing controls for noisy services:
+
+```bash
+waitfor --successes 3 http https://api.example.com/health --status 200
+
+waitfor --stable-for 30s http https://api.example.com/health --status 200
+
 waitfor --backoff exponential --max-interval 5s --jitter 20% http https://api.example.com/health --name api
+```
+
+Use JSON output in scripts:
+
+```bash
+waitfor --output json http https://api.example.com/health --status 200
+
+waitfor --output json --mode any \
+  http https://primary.example.com/health \
+  -- http https://fallback.example.com/health
 ```
 
 Multiple conditions are chained with `--` before the next backend:
@@ -176,11 +264,23 @@ expressions: `--for rollout` for deployments, statefulsets, and daemonsets;
 from `kind/name` to kind-level list mode, with `--all` requiring every selected
 object to satisfy the typed wait.
 
+## Environment Checks
+
 `waitfor doctor` reports local support for optional integrations and scripting
 environment assumptions. Docker and Kubernetes are warnings by default because
 those backends are optional; add `--require docker,k8s` when a pipeline must fail
 if either integration is unavailable. `--require` is repeatable and also accepts
 comma-separated values.
+
+```bash
+waitfor doctor --output json
+
+waitfor doctor --require docker,k8s --output json
+```
+
+```text
+waitfor doctor [--output text|json] [--require temp|shell|docker|k8s|dns-wire]
+```
 
 ## JSON Expressions
 
