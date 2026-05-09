@@ -73,7 +73,7 @@ waitfor [flags] <backend> ... -- <backend> ...
 Supported waits:
 
 ```text
-http, tcp, dns, docker, exec, file, log, k8s
+http, tcp, tls, s3, dns, docker, process, systemd, exec, file, log, k8s
 ```
 
 Common flags:
@@ -104,12 +104,24 @@ waitfor http https://api.example.com/ready --jsonpath '.ready == true'
 ```bash
 waitfor tcp localhost:5432
 
+waitfor tls api.example.com:443 --valid-for 30d
+
+waitfor s3 s3://bucket/path/ready.json --exists
+
+waitfor s3 s3://bucket/path/ready.json --contains '"ready":true' --endpoint-url http://localhost:9000
+
+waitfor s3 s3://bucket/path/ready.json --endpoint-url https://ceph-rgw.example.com --region default
+
 waitfor dns api.example.com --type A --min-count 1
 ```
 
 ### Files and logs
 
 ```bash
+waitfor process --name postgres --running
+
+waitfor systemd nginx.service --active
+
 waitfor file /tmp/ready.flag --exists
 
 waitfor log /var/log/app.log --contains "server ready"

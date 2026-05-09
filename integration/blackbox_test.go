@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -130,6 +131,16 @@ func requireExitCode(t *testing.T, got commandResult, want int) {
 	}
 }
 
+func writeBlackboxServerCertificatePEM(t *testing.T, server *httptest.Server) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "server-cert.pem")
+	block := &pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func TestBinaryFilePolling(t *testing.T) {
 	requireBlackbox(t)
 
@@ -163,6 +174,94 @@ func TestBinaryTimeoutExitCode(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
 	result := runWaitfor(t, "--timeout", "75ms", "--interval", "20ms", "file", missing, "--exists")
 	requireExitCode(t, result, 1)
+}
+
+func TestBinaryTLSPolling(t *testing.T) {
+	requireBlackbox(t)
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	caPath := writeBlackboxServerCertificatePEM(t, server)
+	requireExitCode(t, runWaitfor(t,
+		"tls", server.Listener.Addr().String(),
+		"--servername", "example.com",
+		"--ca-file", caPath,
+		"--valid-for", "24h"), 0)
+	requireExitCode(t, runWaitfor(t, "--timeout", "75ms", "--interval", "20ms",
+		"tls", server.Listener.Addr().String(),
+		"--servername", "example.com",
+		"--ca-file", caPath,
+		"--valid-for", "1000000h"), 1)
+}
+
+func TestBinaryS3Polling(t *testing.T) {
+	requireBlackbox(t)
+
+	var attempts atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/ready-bucket/path/ready.json" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		if attempts.Add(1) < 3 {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("x-amz-meta-version", "42")
+		_, _ = fmt.Fprint(w, `{"ready":true}`)
+	}))
+	defer server.Close()
+
+	result := runWaitfor(t, "--timeout", "2s", "--interval", "25ms",
+		"s3", "s3://ready-bucket/path/ready.json",
+		"--endpoint-url", server.URL,
+		"--metadata", "version=42",
+		"--contains", `"ready":true`)
+	requireExitCode(t, result, 0)
+	if attempts.Load() < 3 {
+		t.Fatalf("attempts = %d, want polling before success", attempts.Load())
+	}
+	requireExitCode(t, runWaitfor(t, "--timeout", "75ms", "--interval", "20ms",
+		"s3", "s3://ready-bucket/path/missing.json",
+		"--endpoint-url", server.URL,
+		"--exists"), 1)
+}
+
+func TestBinaryS3CephEndpointEnvironment(t *testing.T) {
+	requireBlackbox(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/rgw/ready-bucket/path/ready.json" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	t.Setenv("AWS_ENDPOINT_URL_S3", server.URL+"/rgw")
+	requireExitCode(t, runWaitfor(t,
+		"s3", "s3://ready-bucket/path/ready.json",
+		"--exists",
+		"--region", "default"), 0)
+}
+
+func TestBinaryProcessPIDPolling(t *testing.T) {
+	requireBlackbox(t)
+
+	requireExitCode(t, runWaitfor(t, "process", "--pid", strconv.Itoa(os.Getpid()), "--running"), 0)
+	requireExitCode(t, runWaitfor(t, "--timeout", "75ms", "--interval", "20ms",
+		"process", "--pid", strconv.Itoa(os.Getpid()), "--stopped"), 1)
+}
+
+func TestBinarySystemdInvalidArgs(t *testing.T) {
+	requireBlackbox(t)
+
+	result := runWaitfor(t, "systemd", "nginx.service", "--active", "--failed")
+	requireExitCode(t, result, 2)
 }
 
 func TestBinaryHTTPPolling(t *testing.T) {

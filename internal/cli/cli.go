@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ const (
 	ExitCancelled = 130
 
 	maxHTTPBodyFileBytes = 10 * 1024 * 1024
+	maxTLSCAFileBytes    = 10 * 1024 * 1024
 )
 
 type exitError struct {
@@ -332,14 +334,18 @@ func parseConditions(args []string) ([]condition.Condition, error) {
 type backendParser func([]string) (condition.Condition, error)
 
 var backendParsers = map[string]backendParser{
-	"http":   parseHTTPCondition,
-	"tcp":    parseTCPCondition,
-	"exec":   parseExecCondition,
-	"file":   parseFileCondition,
-	"log":    parseLogCondition,
-	"k8s":    parseKubernetesCondition,
-	"dns":    parseDNSCondition,
-	"docker": parseDockerCondition,
+	"http":    parseHTTPCondition,
+	"tcp":     parseTCPCondition,
+	"tls":     parseTLSCondition,
+	"s3":      parseS3Condition,
+	"exec":    parseExecCondition,
+	"file":    parseFileCondition,
+	"log":     parseLogCondition,
+	"k8s":     parseKubernetesCondition,
+	"dns":     parseDNSCondition,
+	"docker":  parseDockerCondition,
+	"process": parseProcessCondition,
+	"systemd": parseSystemdCondition,
 }
 
 func parseCondition(segment []string) (condition.Condition, error) {
@@ -375,6 +381,9 @@ func parseCondition(segment []string) (condition.Condition, error) {
 }
 
 func parseConditionName(segment []string) ([]string, string, error) {
+	if conditionNameReservedForBackend(segment) {
+		return segment, "", nil
+	}
 	cleaned := []string{segment[0]}
 	name := ""
 	limit := conditionFlagLimit(segment)
@@ -407,6 +416,10 @@ func parseConditionName(segment []string) ([]string, string, error) {
 		cleaned = append(cleaned, arg)
 	}
 	return cleaned, name, nil
+}
+
+func conditionNameReservedForBackend(segment []string) bool {
+	return len(segment) > 0 && segment[0] == "process"
 }
 
 func conditionFlagLimit(segment []string) int {
@@ -609,6 +622,192 @@ func parseTCPCondition(segment []string) (condition.Condition, error) {
 		return nil, fmt.Errorf("invalid tcp address %q: %w", args[0], err)
 	}
 	return condition.NewTCP(args[0]), nil
+}
+
+func parseTLSCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("tls", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	serverName := ""
+	validForRaw := ""
+	caFile := ""
+	fs.StringVar(&serverName, "servername", serverName, "TLS server name for SNI and SAN verification")
+	fs.StringVar(&validForRaw, "valid-for", validForRaw, "minimum remaining certificate validity, such as 720h or 30d")
+	fs.StringVar(&caFile, "ca-file", caFile, "PEM CA bundle to trust in addition to system roots")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("tls requires exactly one HOST:PORT address")
+	}
+	if _, _, err := net.SplitHostPort(args[0]); err != nil {
+		return nil, fmt.Errorf("invalid tls address %q: %w", args[0], err)
+	}
+	validFor, err := parseTLSValidFor(validForRaw)
+	if err != nil {
+		return nil, err
+	}
+	rootCAs, err := parseTLSRootCAs(caFile)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewTLS(args[0])
+	cond.ServerName = serverName
+	cond.ValidFor = validFor
+	cond.RootCAs = rootCAs
+	return cond, nil
+}
+
+func parseTLSValidFor(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	if strings.HasSuffix(raw, "d") {
+		days, err := strconv.ParseInt(strings.TrimSuffix(raw, "d"), 10, 64)
+		if err != nil || days < 0 {
+			return 0, fmt.Errorf("invalid --valid-for duration %q", raw)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	duration, err := time.ParseDuration(raw)
+	if err != nil || duration < 0 {
+		return 0, fmt.Errorf("invalid --valid-for duration %q", raw)
+	}
+	return duration, nil
+}
+
+func parseTLSRootCAs(path string) (*x509.CertPool, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := readFileLimit(path, maxTLSCAFileBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read ca file: %w", err)
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("ca file contains no PEM certificates")
+	}
+	return pool, nil
+}
+
+func parseS3Condition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("s3", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	endpointURL := defaultS3EndpointURL()
+	region := defaultS3Region()
+	accessKeyID := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretAccessKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	sessionToken := os.Getenv("AWS_SESSION_TOKEN")
+	contains := ""
+	virtualHostedStyle := false
+	exists := false
+	var rawMetadata []string
+	fs.BoolVar(&exists, "exists", exists, "wait until the bucket or object exists")
+	fs.StringArrayVar(&rawMetadata, "metadata", nil, "required object metadata as Key=Value; repeatable")
+	fs.StringVar(&contains, "contains", contains, "required object content substring")
+	fs.StringVar(&endpointURL, "endpoint-url", endpointURL, "S3-compatible endpoint URL; defaults to AWS_ENDPOINT_URL_S3, AWS_ENDPOINT_URL, or S3_ENDPOINT_URL")
+	fs.StringVar(&region, "region", region, "AWS region or S3-compatible signing region")
+	fs.BoolVar(&virtualHostedStyle, "virtual-hosted-style", virtualHostedStyle, "use bucket.endpoint host style with --endpoint-url")
+	fs.StringVar(&accessKeyID, "access-key-id", accessKeyID, "AWS access key id; defaults to AWS_ACCESS_KEY_ID")
+	fs.StringVar(&secretAccessKey, "secret-access-key", secretAccessKey, "AWS secret access key; defaults to AWS_SECRET_ACCESS_KEY")
+	fs.StringVar(&sessionToken, "session-token", sessionToken, "AWS session token; defaults to AWS_SESSION_TOKEN")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("s3 requires exactly one s3://bucket[/key] URL")
+	}
+	target, err := condition.ParseS3URL(args[0])
+	if err != nil {
+		return nil, err
+	}
+	metadata, err := parseS3Metadata(rawMetadata)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateS3CLIOptions(target, endpointURL, region, contains, metadata); err != nil {
+		return nil, err
+	}
+	cond := condition.NewS3(args[0])
+	cond.EndpointURL = endpointURL
+	cond.Region = region
+	cond.VirtualHostedStyle = virtualHostedStyle
+	cond.Metadata = metadata
+	cond.Contains = contains
+	cond.Credentials = condition.S3Credentials{
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: secretAccessKey,
+		SessionToken:    sessionToken,
+	}
+	return cond, nil
+}
+
+func validateS3CLIOptions(target condition.S3Target, endpointURL, region, contains string, metadata map[string]string) error {
+	if contains != "" && target.Key == "" {
+		return fmt.Errorf("--contains requires an object key")
+	}
+	if len(metadata) > 0 && target.Key == "" {
+		return fmt.Errorf("--metadata requires an object key")
+	}
+	if strings.TrimSpace(region) == "" {
+		return fmt.Errorf("--region cannot be empty")
+	}
+	return validateS3EndpointURL(endpointURL)
+}
+
+func validateS3EndpointURL(endpointURL string) error {
+	if endpointURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(endpointURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("invalid s3 endpoint URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("s3 endpoint URL must use http or https")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("s3 endpoint URL cannot include query or fragment")
+	}
+	return nil
+}
+
+func defaultS3Region() string {
+	if region := os.Getenv("AWS_REGION"); region != "" {
+		return region
+	}
+	if region := os.Getenv("AWS_DEFAULT_REGION"); region != "" {
+		return region
+	}
+	return "us-east-1"
+}
+
+func defaultS3EndpointURL() string {
+	for _, name := range []string{"AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL", "S3_ENDPOINT_URL"} {
+		if endpointURL := os.Getenv(name); endpointURL != "" {
+			return endpointURL
+		}
+	}
+	return ""
+}
+
+func parseS3Metadata(rawValues []string) (map[string]string, error) {
+	metadata := make(map[string]string, len(rawValues))
+	for _, raw := range rawValues {
+		key, value, ok := strings.Cut(raw, "=")
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if !ok || key == "" {
+			return nil, fmt.Errorf("invalid s3 metadata; must use Key=Value")
+		}
+		metadata[key] = value
+	}
+	return metadata, nil
 }
 
 type dnsParseOptions struct {
@@ -828,6 +1027,105 @@ func parseDockerCondition(segment []string) (condition.Condition, error) {
 	cond.Status = status
 	cond.Health = health
 	return cond, nil
+}
+
+func parseProcessCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("process", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	pid := 0
+	name := ""
+	running := false
+	stopped := false
+	fs.IntVar(&pid, "pid", pid, "process ID")
+	fs.StringVar(&name, "name", name, "process executable name")
+	fs.BoolVar(&running, "running", running, "wait until the process is running")
+	fs.BoolVar(&stopped, "stopped", stopped, "wait until the process is stopped")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 0 {
+		return nil, fmt.Errorf("process does not accept positional arguments; use --pid or --name")
+	}
+	state, err := parseProcessState(running, stopped)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateProcessSelector(pid, name); err != nil {
+		return nil, err
+	}
+	cond := condition.NewProcess()
+	cond.PID = pid
+	cond.Name = name
+	cond.State = state
+	return cond, nil
+}
+
+func parseProcessState(running, stopped bool) (condition.ProcessState, error) {
+	if running && stopped {
+		return "", fmt.Errorf("--running and --stopped are mutually exclusive")
+	}
+	if stopped {
+		return condition.ProcessStopped, nil
+	}
+	return condition.ProcessRunning, nil
+}
+
+func validateProcessSelector(pid int, name string) error {
+	if pid < 0 {
+		return fmt.Errorf("--pid must be positive")
+	}
+	if pid == 0 && strings.TrimSpace(name) == "" {
+		return fmt.Errorf("process requires exactly one of --pid or --name")
+	}
+	if pid > 0 && strings.TrimSpace(name) != "" {
+		return fmt.Errorf("--pid and --name are mutually exclusive")
+	}
+	return nil
+}
+
+func parseSystemdCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("systemd", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	active := false
+	inactive := false
+	failed := false
+	fs.BoolVar(&active, "active", active, "wait until the unit is active")
+	fs.BoolVar(&inactive, "inactive", inactive, "wait until the unit is inactive")
+	fs.BoolVar(&failed, "failed", failed, "wait until the unit is failed")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("systemd requires exactly one UNIT")
+	}
+	state, err := parseSystemdState(active, inactive, failed)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewSystemd(args[0])
+	cond.State = state
+	return cond, nil
+}
+
+func parseSystemdState(active, inactive, failed bool) (condition.SystemdState, error) {
+	set := 0
+	for _, value := range []bool{active, inactive, failed} {
+		if value {
+			set++
+		}
+	}
+	if set > 1 {
+		return "", fmt.Errorf("--active, --inactive, and --failed are mutually exclusive")
+	}
+	switch {
+	case inactive:
+		return condition.SystemdInactive, nil
+	case failed:
+		return condition.SystemdFailed, nil
+	default:
+		return condition.SystemdActive, nil
+	}
 }
 
 func validDockerStatus(status string) bool {
@@ -1229,40 +1527,50 @@ func isValueForPreviousFlag(args []string, i int) bool {
 }
 
 var conditionValueFlags = map[string]bool{
-	"--method":           true,
-	"--status":           true,
-	"--header":           true,
-	"--body":             true,
-	"--body-file":        true,
-	"--body-contains":    true,
-	"--body-matches":     true,
-	"--jsonpath":         true,
-	"--type":             true,
-	"--resolver":         true,
-	"--contains":         true,
-	"--matches":          true,
-	"--exclude":          true,
-	"--tail":             true,
-	"--min-matches":      true,
-	"--equals":           true,
-	"--min-count":        true,
-	"--absent-mode":      true,
-	"--server":           true,
-	"--rcode":            true,
-	"--transport":        true,
-	"--udp-size":         true,
-	"--health":           true,
-	"--namespace":        true,
-	"--condition":        true,
-	"--for":              true,
-	"--selector":         true,
-	"--kubeconfig":       true,
-	"--exit-code":        true,
-	"--output-contains":  true,
-	"--cwd":              true,
-	"--env":              true,
-	"--max-output-bytes": true,
-	"--name":             true,
+	"--method":            true,
+	"--status":            true,
+	"--header":            true,
+	"--body":              true,
+	"--body-file":         true,
+	"--body-contains":     true,
+	"--body-matches":      true,
+	"--jsonpath":          true,
+	"--type":              true,
+	"--resolver":          true,
+	"--contains":          true,
+	"--matches":           true,
+	"--exclude":           true,
+	"--tail":              true,
+	"--min-matches":       true,
+	"--equals":            true,
+	"--min-count":         true,
+	"--absent-mode":       true,
+	"--server":            true,
+	"--rcode":             true,
+	"--transport":         true,
+	"--udp-size":          true,
+	"--servername":        true,
+	"--valid-for":         true,
+	"--ca-file":           true,
+	"--metadata":          true,
+	"--endpoint-url":      true,
+	"--region":            true,
+	"--access-key-id":     true,
+	"--secret-access-key": true,
+	"--session-token":     true,
+	"--health":            true,
+	"--pid":               true,
+	"--namespace":         true,
+	"--condition":         true,
+	"--for":               true,
+	"--selector":          true,
+	"--kubeconfig":        true,
+	"--exit-code":         true,
+	"--output-contains":   true,
+	"--cwd":               true,
+	"--env":               true,
+	"--max-output-bytes":  true,
+	"--name":              true,
 }
 
 func isExecCommandSeparator(current []string) bool {
@@ -1437,6 +1745,7 @@ Global flags:
 
 Condition flag:
   --name label             Human-readable condition label for text and JSON output
+                           For process, --name selects the executable instead.
 
 Doctor:
   waitfor doctor [--output text|json] [--require check]
@@ -1457,6 +1766,27 @@ HTTP:
 
 TCP:
   waitfor tcp HOST:PORT
+
+TLS:
+  waitfor tls [flags] HOST:PORT
+  --servername name        TLS server name for SNI and SAN verification (default: HOST)
+  --valid-for duration     Minimum remaining certificate validity, such as 720h or 30d
+  --ca-file path           PEM CA bundle to trust in addition to system roots
+
+S3:
+  waitfor s3 [flags] s3://bucket[/key]
+  --exists                 Wait until the bucket or object exists (default)
+  --metadata Key=Value     Required object metadata from x-amz-meta-Key (repeatable)
+  --contains text          Required object content substring, capped at 10 MiB
+  --endpoint-url URL       S3-compatible endpoint URL, including MinIO, R2, and Ceph RGW;
+                           uses path-style requests by default
+  --virtual-hosted-style   Use bucket.endpoint host style with --endpoint-url
+  --region name            AWS region or S3-compatible signing region
+                           (default: AWS_REGION, AWS_DEFAULT_REGION, or us-east-1)
+  --access-key-id value    AWS access key id (default: AWS_ACCESS_KEY_ID)
+  --secret-access-key value
+                           AWS secret access key (default: AWS_SECRET_ACCESS_KEY)
+  --session-token value    AWS session token (default: AWS_SESSION_TOKEN)
 
 DNS:
   waitfor dns [flags] HOST
@@ -1479,6 +1809,19 @@ Docker:
   waitfor docker [flags] CONTAINER
   --status running         Container status: any|created|running|paused|restarting|removing|exited|dead
   --health healthy         Container health: healthy|unhealthy|starting|none
+
+Process:
+  waitfor process (--pid PID | --name NAME) [--running|--stopped]
+  --pid PID                Process ID to check
+  --name name              Process executable name to check
+  --running                Wait until the process is running (default)
+  --stopped                Wait until the process is stopped
+
+Systemd:
+  waitfor systemd UNIT [--active|--inactive|--failed]
+  --active                 Wait until the unit is active (default)
+  --inactive               Wait until the unit is inactive
+  --failed                 Wait until the unit is failed
 
 Exec:
   waitfor exec [flags] -- COMMAND [ARGS...]
@@ -1521,8 +1864,14 @@ Kubernetes:
 Examples:
   waitfor http https://api.example.com/health --status 200
   waitfor tcp localhost:5432
+  waitfor tls api.example.com:443 --valid-for 30d
+  waitfor s3 s3://bucket/path/ready.json --exists
+  waitfor s3 s3://bucket/path/ready.json --contains '"ready":true' --endpoint-url http://localhost:9000
+  waitfor s3 s3://bucket/path/ready.json --endpoint-url https://ceph-rgw.example.com --region default
   waitfor dns api.internal --type A
   waitfor docker postgres --health healthy
+  waitfor process --name postgres --running
+  waitfor systemd nginx.service --active
   waitfor file /tmp/ready.flag --exists
   waitfor log /var/log/app.log --contains "server ready"
   waitfor log /var/log/app.log --matches "ERROR:.*timeout" --from-start

@@ -278,7 +278,69 @@ waitfor --timeout 30m --interval 30s \
 
 ---
 
-## 15. Send an email alert when a log pattern is detected
+## 15. Check a TLS certificate before continuing
+
+Wait until a TLS endpoint presents a certificate that verifies against trusted
+roots, matches the requested server name, is currently valid, and will remain
+valid for at least 30 days:
+
+```bash
+waitfor tls api.example.com:443 --valid-for 30d
+```
+
+Use `--servername` when the TCP address and certificate name differ, and
+`--ca-file` for a private CA bundle:
+
+```bash
+waitfor tls 10.0.0.12:8443 \
+  --servername api.internal.example.com \
+  --ca-file /etc/pki/internal-ca.pem \
+  --valid-for 168h
+```
+
+---
+
+## 16. Wait for an S3 object marker
+
+Wait until an S3 object exists before continuing:
+
+```bash
+waitfor s3 s3://bucket/path/ready.json --exists
+```
+
+Require custom metadata and a marker in the object body:
+
+```bash
+waitfor s3 s3://bucket/path/ready.json \
+  --metadata version=42 \
+  --contains '"ready":true'
+```
+
+Use `--endpoint-url` for S3-compatible object storage such as MinIO, R2, or
+Ceph RGW. Endpoint overrides use path-style requests by default:
+
+```bash
+waitfor s3 s3://bucket/path/ready.json \
+  --endpoint-url http://localhost:9000 \
+  --region us-east-1
+```
+
+For Ceph RGW, use the RGW S3 endpoint and the region configured for the zone,
+often `default`:
+
+```bash
+waitfor s3 s3://bucket/path/ready.json \
+  --endpoint-url https://ceph-rgw.example.com \
+  --region default
+```
+
+Credentials come from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
+`AWS_SESSION_TOKEN`, or from the matching flags. The endpoint can also come
+from `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`, or `S3_ENDPOINT_URL`.
+
+---
+
+## 17. Send an email alert when a log pattern is detected
 
 Combine `waitfor` with `mail` to alert on the first error:
 
@@ -304,7 +366,7 @@ printf "Matched line:\n%s\n" "$detail" | \
 
 ---
 
-## 16. Kubernetes init container
+## 18. Kubernetes init container
 
 Block a pod from starting its main container until the database migration job
 completes:
@@ -339,7 +401,7 @@ args:
 
 ---
 
-## 17. Wait for a Kubernetes rollout to finish
+## 19. Wait for a Kubernetes rollout to finish
 
 ```bash
 waitfor --timeout 10m \
@@ -359,7 +421,7 @@ waitfor k8s deployment/api \
 
 ---
 
-## 18. Docker Compose startup gate
+## 20. Docker Compose startup gate
 
 Wait for every service to be healthy before running smoke tests:
 
@@ -375,7 +437,39 @@ waitfor --timeout 3m --interval 2s \
 
 ---
 
-## 19. Run a command repeatedly until it succeeds
+## 21. Wait for local process state
+
+Wait for a development database process by executable name:
+
+```bash
+waitfor process --name postgres --running
+```
+
+Wait for a known PID to exit before continuing a cleanup script:
+
+```bash
+waitfor --timeout 30s process --pid "$worker_pid" --stopped
+```
+
+---
+
+## 22. Wait for a systemd unit
+
+On Linux hosts with systemd, wait until a service reports active:
+
+```bash
+waitfor systemd nginx.service --active
+```
+
+The backend also supports inactive and failed waits:
+
+```bash
+waitfor systemd batch-job.service --failed
+```
+
+---
+
+## 23. Run a command repeatedly until it succeeds
 
 Wait until `kubectl rollout status` returns exit code `0`:
 
@@ -396,7 +490,7 @@ waitfor --timeout 5m \
 
 ---
 
-## 20. Parse final JSON output with jq
+## 24. Parse final JSON output with jq
 
 In JSON mode `waitfor` writes one final JSON document to stdout. Human progress
 stays off stdout, so the result can be piped directly to `jq`:
@@ -409,7 +503,7 @@ waitfor --output json --interval 1s \
 
 ---
 
-## 21. CI pipeline gate with structured failure reporting
+## 25. CI pipeline gate with structured failure reporting
 
 In a CI script, emit JSON on failure so the pipeline can parse which condition
 timed out:
@@ -438,7 +532,7 @@ Example failure output on stderr:
 
 ---
 
-## 22. Wait for a lock file to be released
+## 26. Wait for a lock file to be released
 
 Block until another process deletes its lock file before proceeding:
 
@@ -451,7 +545,7 @@ waitfor --timeout 10m file /var/run/deploy.lock --deleted && \
 
 ---
 
-## 23. Log-driven deployment promotion
+## 27. Log-driven deployment promotion
 
 After deploying a canary, wait until the canary log shows no errors in the
 first 50 lines of output, using `--tail` to limit the scan window:
@@ -478,7 +572,7 @@ kubectl set image deployment/api api=my-image:v2 -n production
 
 ---
 
-## 24. Send a Slack message when a long job completes
+## 28. Send a Slack message when a long job completes
 
 ```bash
 waitfor --timeout 6h \
@@ -505,7 +599,7 @@ curl -s -X POST "$SLACK_WEBHOOK" \
 
 ---
 
-## 25. Use `--attempt-timeout` for slow health endpoints
+## 29. Use `--attempt-timeout` for slow health endpoints
 
 Some services take a long time to respond during startup. Set a per-attempt
 deadline shorter than the global timeout so a hung request does not burn the
@@ -524,7 +618,7 @@ and retried after the interval. The global 5-minute deadline still applies.
 
 ---
 
-## 26. Fail fast when a guard condition appears
+## 30. Fail fast when a guard condition appears
 
 Wait for an API, but stop immediately if startup logs show a fatal error:
 
@@ -539,7 +633,7 @@ if it matches, `waitfor` exits `3` instead of waiting for the full timeout.
 
 ---
 
-## 27. Require stable readiness before continuing
+## 31. Require stable readiness before continuing
 
 Avoid starting the next step on a one-off successful probe:
 
@@ -553,7 +647,7 @@ successful for the stable duration before the run exits `0`.
 
 ---
 
-## 28. Wait for Kubernetes rollouts and selected pods
+## 32. Wait for Kubernetes rollouts and selected pods
 
 Use typed waits instead of writing JSON expressions for common Kubernetes
 states:

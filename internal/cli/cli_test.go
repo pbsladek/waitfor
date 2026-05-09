@@ -523,7 +523,17 @@ func TestConditionValueFlagsCoversBackendValueFlags(t *testing.T) {
 		"--rcode",
 		"--transport",
 		"--udp-size",
+		"--servername",
+		"--valid-for",
+		"--ca-file",
+		"--metadata",
+		"--endpoint-url",
+		"--region",
+		"--access-key-id",
+		"--secret-access-key",
+		"--session-token",
 		"--health",
+		"--pid",
 		"--namespace",
 		"--condition",
 		"--for",
@@ -540,6 +550,122 @@ func TestConditionValueFlagsCoversBackendValueFlags(t *testing.T) {
 		if !conditionValueFlags[flag] {
 			t.Fatalf("conditionValueFlags[%q] = false, want true", flag)
 		}
+	}
+}
+
+func TestParseS3ConditionFlags(t *testing.T) {
+	cond, err := parseS3Condition([]string{
+		"s3", "s3://ready-bucket/path/ready.json",
+		"--exists",
+		"--metadata", "version=42",
+		"--contains", `"ready":true`,
+		"--endpoint-url", "http://127.0.0.1:9000",
+		"--region", "auto",
+		"--virtual-hosted-style",
+		"--access-key-id", "test-access-key",
+		"--secret-access-key", "test-secret-key",
+		"--session-token", "test-session-token",
+	})
+	if err != nil {
+		t.Fatalf("parseS3Condition() error = %v", err)
+	}
+	s3Cond, ok := cond.(*condition.S3Condition)
+	if !ok {
+		t.Fatalf("condition type = %T, want *condition.S3Condition", cond)
+	}
+	if s3Cond.URL != "s3://ready-bucket/path/ready.json" || s3Cond.EndpointURL != "http://127.0.0.1:9000" {
+		t.Fatalf("s3 condition = %+v", s3Cond)
+	}
+	if !s3Cond.VirtualHostedStyle || s3Cond.Region != "auto" {
+		t.Fatalf("s3 condition style/region = %+v", s3Cond)
+	}
+	if s3Cond.Metadata["version"] != "42" || s3Cond.Contains != `"ready":true` {
+		t.Fatalf("s3 metadata/contains = %+v/%q", s3Cond.Metadata, s3Cond.Contains)
+	}
+	if s3Cond.Credentials.AccessKeyID != "test-access-key" ||
+		s3Cond.Credentials.SecretAccessKey != "test-secret-key" ||
+		s3Cond.Credentials.SessionToken != "test-session-token" {
+		t.Fatalf("s3 credentials = %+v", s3Cond.Credentials)
+	}
+}
+
+func TestParseS3ConditionErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment []string
+		wantErr string
+	}{
+		{name: "missing url", segment: []string{"s3"}, wantErr: "exactly one"},
+		{name: "bad url", segment: []string{"s3", "https://example.test/object"}, wantErr: "invalid s3 URL"},
+		{name: "contains without key", segment: []string{"s3", "s3://bucket", "--contains", "ready"}, wantErr: "object key"},
+		{name: "metadata without key", segment: []string{"s3", "s3://bucket", "--metadata", "version=1"}, wantErr: "object key"},
+		{name: "bad metadata", segment: []string{"s3", "s3://bucket/key", "--metadata", "version"}, wantErr: "Key=Value"},
+		{name: "bad endpoint", segment: []string{"s3", "s3://bucket/key", "--endpoint-url", "ftp://example.test"}, wantErr: "http or https"},
+		{name: "blank region", segment: []string{"s3", "s3://bucket/key", "--region", " "}, wantErr: "region"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseS3Condition(tt.segment)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDefaultS3EndpointURL(t *testing.T) {
+	t.Setenv("AWS_ENDPOINT_URL", "https://generic.example.test")
+	t.Setenv("S3_ENDPOINT_URL", "https://legacy.example.test")
+	if got := defaultS3EndpointURL(); got != "https://generic.example.test" {
+		t.Fatalf("defaultS3EndpointURL() = %q, want generic endpoint", got)
+	}
+
+	t.Setenv("AWS_ENDPOINT_URL_S3", "https://ceph-rgw.example.test")
+	if got := defaultS3EndpointURL(); got != "https://ceph-rgw.example.test" {
+		t.Fatalf("defaultS3EndpointURL() = %q, want S3-specific endpoint", got)
+	}
+}
+
+func TestParseTLSConditionFlags(t *testing.T) {
+	cond, err := parseTLSCondition([]string{"tls", "api.example.com:443", "--servername", "api.internal", "--valid-for", "30d"})
+	if err != nil {
+		t.Fatalf("parseTLSCondition() error = %v", err)
+	}
+	tlsCond, ok := cond.(*condition.TLSCondition)
+	if !ok {
+		t.Fatalf("condition type = %T, want *condition.TLSCondition", cond)
+	}
+	if tlsCond.Address != "api.example.com:443" || tlsCond.ServerName != "api.internal" {
+		t.Fatalf("tls condition = %+v", tlsCond)
+	}
+	if tlsCond.ValidFor != 30*24*time.Hour {
+		t.Fatalf("ValidFor = %s, want 720h", tlsCond.ValidFor)
+	}
+}
+
+func TestParseTLSConditionErrors(t *testing.T) {
+	badCA := filepath.Join(t.TempDir(), "bad-ca.pem")
+	if err := os.WriteFile(badCA, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name    string
+		segment []string
+		wantErr string
+	}{
+		{name: "missing address", segment: []string{"tls"}, wantErr: "exactly one"},
+		{name: "bad address", segment: []string{"tls", "api.example.com"}, wantErr: "invalid tls address"},
+		{name: "bad valid for", segment: []string{"tls", "api.example.com:443", "--valid-for", "soon"}, wantErr: "invalid --valid-for"},
+		{name: "negative valid for", segment: []string{"tls", "api.example.com:443", "--valid-for", "-1s"}, wantErr: "invalid --valid-for"},
+		{name: "bad ca", segment: []string{"tls", "api.example.com:443", "--ca-file", badCA}, wantErr: "no PEM certificates"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseTLSCondition(tt.segment)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -576,6 +702,86 @@ func TestParseFileConditionFlags(t *testing.T) {
 			}
 			if fc.State != tt.wantState {
 				t.Fatalf("State = %q, want %q", fc.State, tt.wantState)
+			}
+		})
+	}
+}
+
+func TestParseProcessConditionFlags(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantPID   int
+		wantName  string
+		wantState condition.ProcessState
+		wantErr   string
+	}{
+		{name: "pid running default", args: []string{"process", "--pid", "42"}, wantPID: 42, wantState: condition.ProcessRunning},
+		{name: "name running explicit", args: []string{"process", "--name", "postgres", "--running"}, wantName: "postgres", wantState: condition.ProcessRunning},
+		{name: "stopped", args: []string{"process", "--pid", "42", "--stopped"}, wantPID: 42, wantState: condition.ProcessStopped},
+		{name: "missing selector", args: []string{"process", "--running"}, wantErr: "exactly one"},
+		{name: "both selectors", args: []string{"process", "--pid", "42", "--name", "postgres"}, wantErr: "mutually exclusive"},
+		{name: "bad pid", args: []string{"process", "--pid", "-1"}, wantErr: "positive"},
+		{name: "state conflict", args: []string{"process", "--pid", "42", "--running", "--stopped"}, wantErr: "mutually exclusive"},
+		{name: "positional", args: []string{"process", "postgres", "--running"}, wantErr: "positional"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond, err := parseProcessCondition(tt.args)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseProcessCondition() error = %v", err)
+			}
+			pc, ok := cond.(*condition.ProcessCondition)
+			if !ok {
+				t.Fatalf("condition type = %T, want *condition.ProcessCondition", cond)
+			}
+			if pc.PID != tt.wantPID || pc.Name != tt.wantName || pc.State != tt.wantState {
+				t.Fatalf("process condition = %+v, want pid=%d name=%q state=%q", pc, tt.wantPID, tt.wantName, tt.wantState)
+			}
+		})
+	}
+}
+
+func TestParseSystemdConditionFlags(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantUnit  string
+		wantState condition.SystemdState
+		wantErr   string
+	}{
+		{name: "active default", args: []string{"systemd", "nginx.service"}, wantUnit: "nginx.service", wantState: condition.SystemdActive},
+		{name: "active explicit", args: []string{"systemd", "nginx.service", "--active"}, wantUnit: "nginx.service", wantState: condition.SystemdActive},
+		{name: "inactive", args: []string{"systemd", "nginx.service", "--inactive"}, wantUnit: "nginx.service", wantState: condition.SystemdInactive},
+		{name: "failed", args: []string{"systemd", "nginx.service", "--failed"}, wantUnit: "nginx.service", wantState: condition.SystemdFailed},
+		{name: "missing unit", args: []string{"systemd", "--active"}, wantErr: "exactly one UNIT"},
+		{name: "extra positional", args: []string{"systemd", "nginx.service", "extra"}, wantErr: "exactly one UNIT"},
+		{name: "state conflict", args: []string{"systemd", "nginx.service", "--active", "--failed"}, wantErr: "mutually exclusive"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond, err := parseSystemdCondition(tt.args)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseSystemdCondition() error = %v", err)
+			}
+			sc, ok := cond.(*condition.SystemdCondition)
+			if !ok {
+				t.Fatalf("condition type = %T, want *condition.SystemdCondition", cond)
+			}
+			if sc.Unit != tt.wantUnit || sc.State != tt.wantState {
+				t.Fatalf("systemd condition = %+v, want unit=%q state=%q", sc, tt.wantUnit, tt.wantState)
 			}
 		})
 	}
@@ -855,6 +1061,20 @@ func TestParseConditionNameDoesNotConsumeExecCommandFlag(t *testing.T) {
 	}
 	if got := strings.Join(execCond.Command, " "); got != "/bin/echo --name literal" {
 		t.Fatalf("command = %q, want literal --name command", got)
+	}
+}
+
+func TestParseConditionNameDoesNotConsumeProcessName(t *testing.T) {
+	cond, err := parseCondition([]string{"process", "--name", "postgres", "--running"})
+	if err != nil {
+		t.Fatalf("parseCondition() error = %v", err)
+	}
+	processCond, ok := cond.(*condition.ProcessCondition)
+	if !ok {
+		t.Fatalf("condition type = %T, want process condition", cond)
+	}
+	if processCond.Name != "postgres" {
+		t.Fatalf("process name = %q, want postgres", processCond.Name)
 	}
 }
 

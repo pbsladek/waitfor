@@ -20,8 +20,12 @@ Runs have one final status:
 | ------- | ------- | ----- |
 | `http` | `waitfor http URL --status 2xx --body-contains ok` | HTTP request with configurable method, status, headers, body matchers, and TLS options. |
 | `tcp` | `waitfor tcp HOST:PORT` | Opens and immediately closes a TCP connection. |
+| `tls` | `waitfor tls api.example.com:443 --valid-for 30d` | Verifies certificate chain, SAN match, current validity, and minimum remaining validity. |
+| `s3` | `waitfor s3 s3://bucket/path/ready.json --exists` | Checks S3-compatible bucket existence, object existence, object metadata, and object content markers. |
 | `dns` | `waitfor dns HOST --type A --min-count 1` | System resolver by default; `--resolver wire` for protocol-level checks. |
 | `docker` | `waitfor docker CONTAINER --status running --health healthy` | Shells out to `docker inspect` for container state and health. |
+| `process` | `waitfor process --name postgres --running` | Checks local process state by PID or executable name. |
+| `systemd` | `waitfor systemd nginx.service --active` | Checks Linux systemd unit active state through `systemctl show`. |
 | `exec` | `waitfor exec --output-contains ok -- COMMAND [ARGS...]` | Runs a command and checks exit code, output substring, or JSON expression. |
 | `file` | `waitfor file PATH --exists` | Checks filesystem state: exists, deleted, or non-empty; optional substring match. |
 | `log` | `waitfor log PATH --contains "ready"` | Tails a file and matches lines using substring, regex, and/or JSON expression. Tracks byte offset across polls; detects log rotation. |
@@ -45,9 +49,10 @@ exec-condition := exec [exec-flags] -- command [args ...]
 `exec` uses `--` to separate its own flags from the command being run. After
 that separator, tokens belong to the command until a later `-- BACKEND` or
 `-- guard BACKEND` condition separator is encountered. This means an exec
-command that passes a literal `-- http`, `-- tcp`, `-- dns`, `-- docker`,
-`-- exec`, `-- file`, `-- log`, `-- k8s`, or `-- guard BACKEND` token sequence
-cannot be followed unambiguously by a second waitfor condition.
+command that passes a literal `-- http`, `-- tcp`, `-- tls`, `-- s3`, `-- dns`, `-- docker`,
+`-- process`, `-- systemd`, `-- exec`, `-- file`, `-- log`, `-- k8s`, or
+`-- guard BACKEND` token sequence cannot be followed unambiguously by a second
+waitfor condition.
 
 A `--` that appears immediately after a value-taking backend flag (such as
 `--contains`) is treated as that flag's value, not as a condition separator:
@@ -91,6 +96,22 @@ http URL
      [--no-follow-redirects]
 
 tcp HOST:PORT
+
+tls HOST:PORT
+    [--servername NAME]             # default: HOST
+    [--valid-for DURATION]          # accepts Go durations and day suffixes such as 30d
+    [--ca-file PATH]                # PEM CA bundle added to system roots
+
+s3 s3://BUCKET[/KEY]
+   [--exists]                       # default; bucket if no key, object if key is present
+   [--metadata KEY=VALUE ...]       # repeatable; checks x-amz-meta-KEY
+   [--contains TEXT]                # object body substring; first 10 MiB only
+   [--endpoint-url URL]             # S3-compatible endpoint; path-style by default
+   [--virtual-hosted-style]         # use bucket.endpoint host style with --endpoint-url
+   [--region REGION]                # default: AWS_REGION, AWS_DEFAULT_REGION, or us-east-1
+   [--access-key-id VALUE]          # default: AWS_ACCESS_KEY_ID
+   [--secret-access-key VALUE]      # default: AWS_SECRET_ACCESS_KEY
+   [--session-token VALUE]          # default: AWS_SESSION_TOKEN
 
 dns HOST
     [--type TYPE]                   # A|AAAA|CNAME|TXT|ANY|MX|SRV|NS|CAA|HTTPS|SVCB (default: A)
@@ -165,6 +186,31 @@ Status matchers accept an exact code (`200`, `404`) or a class (`2xx`, `5xx`).
 `HOST:PORT` format is validated at parse time. Each check opens a TCP
 connection with the attempt context and closes it immediately on success.
 Dial failures are retryable.
+
+### S3
+
+Targets use `s3://bucket` for bucket existence or `s3://bucket/key` for object
+existence and object matchers. `--exists` is the default. `--metadata KEY=VALUE`
+checks object custom metadata through `x-amz-meta-KEY`; `--contains TEXT`
+downloads up to the first 10 MiB of the object and searches for the marker.
+
+By default, AWS S3 requests use virtual-hosted URLs of the form
+`https://bucket.s3.REGION.amazonaws.com/key`. `--endpoint-url` enables
+S3-compatible stores such as MinIO, R2, and Ceph RGW and uses path-style
+requests by default: `ENDPOINT/bucket/key`. Endpoint base paths are preserved,
+so a Ceph RGW endpoint such as `https://ceph-rgw.example.com/s3` becomes
+`https://ceph-rgw.example.com/s3/bucket/key`. Add `--virtual-hosted-style` when
+the endpoint expects the bucket in the host name.
+
+Credentials are optional so public buckets can be checked without signing. When
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (or matching flags) are present,
+requests are signed with AWS SigV4 for service `s3`; `AWS_SESSION_TOKEN` is
+included when present. `--endpoint-url` defaults from `AWS_ENDPOINT_URL_S3`,
+`AWS_ENDPOINT_URL`, or `S3_ENDPOINT_URL`, in that order. Network errors and
+non-2xx responses are retryable. Malformed targets, malformed endpoint URLs,
+object matchers without an object key, blank regions, and partial credentials
+are fatal for direct construction and argument errors or fatal condition errors
+through the CLI.
 
 ### DNS
 

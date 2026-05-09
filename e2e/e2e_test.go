@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"net/http"
@@ -80,6 +81,24 @@ func requirePOSIXShell(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires /bin/sh")
 	}
+}
+
+func writeFakeExecutable(t *testing.T, dir, name, script string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeServerCertificatePEM(t *testing.T, server *httptest.Server) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "server-cert.pem")
+	block := &pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
@@ -266,6 +285,152 @@ func TestTCPInvalidAddress(t *testing.T) {
 	if stderr == "" {
 		t.Fatal("expected error on stderr for invalid address")
 	}
+}
+
+// ── TLS ─────────────────────────────────────────────────────────────────────
+
+func TestTLSSatisfied(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	caPath := writeServerCertificatePEM(t, server)
+	mustCode(t, cli.ExitSatisfied,
+		"tls", server.Listener.Addr().String(),
+		"--servername", "example.com",
+		"--ca-file", caPath,
+		"--valid-for", "24h")
+}
+
+func TestTLSExpiryWindowTimeout(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	caPath := writeServerCertificatePEM(t, server)
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"tls", server.Listener.Addr().String(),
+		"--servername", "example.com",
+		"--ca-file", caPath,
+		"--valid-for", "1000000h")
+}
+
+func TestTLSSANMismatchTimeout(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	caPath := writeServerCertificatePEM(t, server)
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"tls", server.Listener.Addr().String(),
+		"--servername", "definitely.invalid",
+		"--ca-file", caPath)
+}
+
+func TestTLSUntrustedChainTimeout(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"tls", server.Listener.Addr().String(),
+		"--servername", "example.com")
+}
+
+func TestTLSInvalidArgs(t *testing.T) {
+	code, _, stderr := execute(t, "tls", "api.example.com", "--valid-for", "30d")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "invalid tls address") {
+		t.Fatalf("stderr %q does not mention invalid tls address", stderr)
+	}
+}
+
+// ── S3 ──────────────────────────────────────────────────────────────────────
+
+func TestS3BucketExists(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/ready-bucket" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	mustCode(t, cli.ExitSatisfied,
+		"s3", "s3://ready-bucket",
+		"--exists",
+		"--endpoint-url", server.URL)
+}
+
+func TestS3ObjectMetadataAndContentSatisfied(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/ready-bucket/path/ready.json" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("x-amz-meta-version", "42")
+		_, _ = fmt.Fprint(w, `{"ready":true}`)
+	}))
+	defer server.Close()
+
+	mustCode(t, cli.ExitSatisfied,
+		"s3", "s3://ready-bucket/path/ready.json",
+		"--endpoint-url", server.URL,
+		"--metadata", "version=42",
+		"--contains", `"ready":true`)
+}
+
+func TestS3CephRGWEndpointFromEnvironment(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/ceph/ready-bucket/path/ready.json" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	t.Setenv("AWS_ENDPOINT_URL_S3", server.URL+"/ceph")
+
+	mustCode(t, cli.ExitSatisfied,
+		"s3", "s3://ready-bucket/path/ready.json",
+		"--exists",
+		"--region", "default")
+}
+
+func TestS3ObjectMissingTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"s3", "s3://ready-bucket/path/ready.json",
+		"--endpoint-url", server.URL,
+		"--exists")
+}
+
+func TestS3InvalidArgs(t *testing.T) {
+	code, _, stderr := execute(t, "s3", "https://example.test/object", "--exists")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "invalid s3 URL") {
+		t.Fatalf("stderr %q does not mention invalid s3 URL", stderr)
+	}
+}
+
+func TestS3FatalConfig(t *testing.T) {
+	mustCode(t, cli.ExitFatal,
+		"s3", "s3://ready-bucket/path/ready.json",
+		"--access-key-id", "only",
+		"--secret-access-key", "")
 }
 
 // ── File ────────────────────────────────────────────────────────────────────
@@ -993,6 +1158,73 @@ func TestDNSAbsentMatcherConflict(t *testing.T) {
 	if !strings.Contains(stderr, "--absent cannot be combined") {
 		t.Fatalf("stderr %q does not mention absent conflict", stderr)
 	}
+}
+
+func TestProcessPIDSatisfied(t *testing.T) {
+	mustCode(t, cli.ExitSatisfied, "process", "--pid", fmt.Sprint(os.Getpid()), "--running")
+}
+
+func TestProcessNameSatisfied(t *testing.T) {
+	requirePOSIXShell(t)
+	dir := t.TempDir()
+	writeFakeExecutable(t, dir, "ps", "#!/bin/sh\nprintf '123 postgres postgres -D data\\n'\n")
+	t.Setenv("PATH", dir)
+
+	mustCode(t, cli.ExitSatisfied, "process", "--name", "postgres", "--running")
+}
+
+func TestProcessStoppedTimeout(t *testing.T) {
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"process", "--pid", fmt.Sprint(os.Getpid()), "--stopped")
+}
+
+func TestProcessInvalidArgs(t *testing.T) {
+	code, _, stderr := execute(t, "process", "--running")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "exactly one") {
+		t.Fatalf("stderr %q does not mention selector requirement", stderr)
+	}
+}
+
+func TestProcessMissingPSFatal(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	mustCode(t, cli.ExitFatal, "process", "--name", "postgres", "--running")
+}
+
+func TestSystemdActiveSatisfied(t *testing.T) {
+	requirePOSIXShell(t)
+	dir := t.TempDir()
+	writeFakeExecutable(t, dir, "systemctl", "#!/bin/sh\nprintf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\n'\n")
+	t.Setenv("PATH", dir)
+
+	mustCode(t, cli.ExitSatisfied, "systemd", "nginx.service", "--active")
+}
+
+func TestSystemdActiveTimeout(t *testing.T) {
+	requirePOSIXShell(t)
+	dir := t.TempDir()
+	writeFakeExecutable(t, dir, "systemctl", "#!/bin/sh\nprintf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\n'\n")
+	t.Setenv("PATH", dir)
+
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"systemd", "nginx.service", "--active")
+}
+
+func TestSystemdInvalidArgs(t *testing.T) {
+	code, _, stderr := execute(t, "systemd", "nginx.service", "--active", "--failed")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "mutually exclusive") {
+		t.Fatalf("stderr %q does not mention mutually exclusive", stderr)
+	}
+}
+
+func TestSystemdMissingSystemctlFatal(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	mustCode(t, cli.ExitFatal, "systemd", "nginx.service", "--active")
 }
 
 func TestDockerInvalidStatus(t *testing.T) {
