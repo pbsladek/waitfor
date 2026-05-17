@@ -336,8 +336,12 @@ type backendParser func([]string) (condition.Condition, error)
 var backendParsers = map[string]backendParser{
 	"http":    parseHTTPCondition,
 	"tcp":     parseTCPCondition,
+	"unix":    parseUnixCondition,
 	"tls":     parseTLSCondition,
+	"ssh":     parseSSHCondition,
 	"s3":      parseS3Condition,
+	"glob":    parseGlobCondition,
+	"ports":   parsePortsCondition,
 	"exec":    parseExecCondition,
 	"file":    parseFileCondition,
 	"log":     parseLogCondition,
@@ -624,6 +628,22 @@ func parseTCPCondition(segment []string) (condition.Condition, error) {
 	return condition.NewTCP(args[0]), nil
 }
 
+func parseUnixCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("unix", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("unix requires exactly one socket PATH")
+	}
+	if strings.TrimSpace(args[0]) == "" {
+		return nil, fmt.Errorf("unix socket path is required")
+	}
+	return condition.NewUnix(args[0]), nil
+}
+
 func parseTLSCondition(segment []string) (condition.Condition, error) {
 	fs := pflag.NewFlagSet("tls", pflag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -692,6 +712,38 @@ func parseTLSRootCAs(path string) (*x509.CertPool, error) {
 		return nil, fmt.Errorf("ca file contains no PEM certificates")
 	}
 	return pool, nil
+}
+
+func parseSSHCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("ssh", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	bannerContains := ""
+	user := ""
+	password := ""
+	hostKeySHA256 := ""
+	fs.StringVar(&bannerContains, "banner-contains", bannerContains, "required SSH banner substring")
+	fs.StringVar(&user, "user", user, "SSH username for password auth handshake")
+	fs.StringVar(&password, "password", password, "SSH password for auth handshake")
+	fs.StringVar(&hostKeySHA256, "host-key-sha256", hostKeySHA256, "required SSH host key SHA256 fingerprint")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("ssh requires exactly one HOST:PORT address")
+	}
+	if _, _, err := net.SplitHostPort(args[0]); err != nil {
+		return nil, fmt.Errorf("invalid ssh address %q: %w", args[0], err)
+	}
+	if (user == "") != (password == "") {
+		return nil, fmt.Errorf("--user and --password must be provided together")
+	}
+	cond := condition.NewSSH(args[0])
+	cond.BannerContains = bannerContains
+	cond.User = user
+	cond.Password = password
+	cond.HostKeySHA256 = hostKeySHA256
+	return cond, nil
 }
 
 func parseS3Condition(segment []string) (condition.Condition, error) {
@@ -808,6 +860,116 @@ func parseS3Metadata(rawValues []string) (map[string]string, error) {
 		metadata[key] = value
 	}
 	return metadata, nil
+}
+
+func parseGlobCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("glob", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	minCount := 1
+	maxCount := -1
+	absent := false
+	fs.IntVar(&minCount, "min-count", minCount, "minimum number of matches")
+	fs.IntVar(&maxCount, "max-count", maxCount, "maximum number of matches; -1 disables")
+	fs.BoolVar(&absent, "absent", absent, "wait until no files match")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("glob requires exactly one PATTERN")
+	}
+	if absent && fs.Changed("min-count") && minCount != 0 {
+		return nil, fmt.Errorf("--absent cannot be combined with positive --min-count")
+	}
+	if absent && !fs.Changed("min-count") {
+		minCount = 0
+	}
+	if err := validateGlobCLIOptions(minCount, maxCount); err != nil {
+		return nil, err
+	}
+	cond := condition.NewGlob(args[0])
+	cond.MinCount = minCount
+	cond.MaxCount = maxCount
+	cond.Absent = absent
+	return cond, nil
+}
+
+func validateGlobCLIOptions(minCount, maxCount int) error {
+	if minCount < 0 {
+		return fmt.Errorf("--min-count cannot be negative")
+	}
+	if maxCount < -1 {
+		return fmt.Errorf("--max-count cannot be less than -1")
+	}
+	if maxCount >= 0 && minCount > maxCount {
+		return fmt.Errorf("--min-count cannot exceed --max-count")
+	}
+	return nil
+}
+
+func parsePortsCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("ports", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	rangeRaw := ""
+	anyMode := false
+	allMode := false
+	fs.StringVar(&rangeRaw, "range", rangeRaw, "port range START-END")
+	fs.BoolVar(&anyMode, "any", anyMode, "succeed when any port in the range is open")
+	fs.BoolVar(&allMode, "all", allMode, "succeed when all ports in the range are open")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("ports requires exactly one HOST")
+	}
+	startPort, endPort, err := parsePortRange(rangeRaw)
+	if err != nil {
+		return nil, err
+	}
+	mode, err := parsePortsMode(anyMode, allMode)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewPorts(args[0], startPort, endPort)
+	cond.Mode = mode
+	return cond, nil
+}
+
+func parsePortRange(raw string) (int, int, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, 0, fmt.Errorf("ports requires --range START-END")
+	}
+	startRaw, endRaw, ok := strings.Cut(raw, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("invalid ports range %q", raw)
+	}
+	startPort, err := strconv.Atoi(strings.TrimSpace(startRaw))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid ports range %q", raw)
+	}
+	endPort, err := strconv.Atoi(strings.TrimSpace(endRaw))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid ports range %q", raw)
+	}
+	if !validPortRange(startPort, endPort) {
+		return 0, 0, fmt.Errorf("invalid ports range %q", raw)
+	}
+	return startPort, endPort, nil
+}
+
+func validPortRange(startPort, endPort int) bool {
+	return startPort >= 1 && endPort <= 65535 && startPort <= endPort
+}
+
+func parsePortsMode(anyMode, allMode bool) (condition.PortsMode, error) {
+	if anyMode && allMode {
+		return "", fmt.Errorf("--any and --all are mutually exclusive")
+	}
+	if anyMode {
+		return condition.PortsAny, nil
+	}
+	return condition.PortsAll, nil
 }
 
 type dnsParseOptions struct {
@@ -1544,6 +1706,7 @@ var conditionValueFlags = map[string]bool{
 	"--min-matches":       true,
 	"--equals":            true,
 	"--min-count":         true,
+	"--max-count":         true,
 	"--absent-mode":       true,
 	"--server":            true,
 	"--rcode":             true,
@@ -1552,7 +1715,12 @@ var conditionValueFlags = map[string]bool{
 	"--servername":        true,
 	"--valid-for":         true,
 	"--ca-file":           true,
+	"--banner-contains":   true,
+	"--user":              true,
+	"--password":          true,
+	"--host-key-sha256":   true,
 	"--metadata":          true,
+	"--range":             true,
 	"--endpoint-url":      true,
 	"--region":            true,
 	"--access-key-id":     true,
@@ -1767,11 +1935,27 @@ HTTP:
 TCP:
   waitfor tcp HOST:PORT
 
+Unix Socket:
+  waitfor unix PATH
+
+Ports:
+  waitfor ports [flags] HOST
+  --range START-END        Port range to check
+  --any                    Succeed when any port in the range is open
+  --all                    Succeed when every port in the range is open (default)
+
 TLS:
   waitfor tls [flags] HOST:PORT
   --servername name        TLS server name for SNI and SAN verification (default: HOST)
   --valid-for duration     Minimum remaining certificate validity, such as 720h or 30d
   --ca-file path           PEM CA bundle to trust in addition to system roots
+
+SSH:
+  waitfor ssh [flags] HOST:PORT
+  --banner-contains text   Required SSH banner substring
+  --user name              SSH username for password auth handshake
+  --password value         SSH password for auth handshake
+  --host-key-sha256 fp     Required SSH host key SHA256 fingerprint, such as SHA256:...
 
 S3:
   waitfor s3 [flags] s3://bucket[/key]
@@ -1839,6 +2023,12 @@ File:
   --nonempty               Wait until the file is non-empty
   --contains text          Required file content substring in first 10 MiB (only with --exists/--nonempty)
 
+Glob:
+  waitfor glob [flags] PATTERN
+  --min-count N            Minimum number of matching files (default: 1)
+  --max-count N            Maximum number of matching files (-1 disables)
+  --absent                 Wait until no files match
+
 Log:
   waitfor log [flags] PATH
   --contains text          Required line substring
@@ -1864,7 +2054,11 @@ Kubernetes:
 Examples:
   waitfor http https://api.example.com/health --status 200
   waitfor tcp localhost:5432
+  waitfor unix /var/run/docker.sock
+  waitfor ports localhost --range 8000-8010 --any
   waitfor tls api.example.com:443 --valid-for 30d
+  waitfor ssh host.example.com:22
+  waitfor ssh host.example.com:22 --user deploy --password "$SSH_PASSWORD"
   waitfor s3 s3://bucket/path/ready.json --exists
   waitfor s3 s3://bucket/path/ready.json --contains '"ready":true' --endpoint-url http://localhost:9000
   waitfor s3 s3://bucket/path/ready.json --endpoint-url https://ceph-rgw.example.com --region default
@@ -1873,6 +2067,7 @@ Examples:
   waitfor process --name postgres --running
   waitfor systemd nginx.service --active
   waitfor file /tmp/ready.flag --exists
+  waitfor glob '/tmp/jobs/*.done' --min-count 5
   waitfor log /var/log/app.log --contains "server ready"
   waitfor log /var/log/app.log --matches "ERROR:.*timeout" --from-start
   waitfor exec --output-contains Running -- kubectl get pod myapp

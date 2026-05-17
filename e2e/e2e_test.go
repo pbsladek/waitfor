@@ -3,6 +3,10 @@ package e2e_test
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -18,6 +22,7 @@ import (
 
 	"github.com/pbsladek/wait-for/internal/cli"
 	"github.com/pbsladek/wait-for/internal/output"
+	"golang.org/x/crypto/ssh"
 )
 
 // execute runs the CLI with the given args and returns exit code, stdout, stderr.
@@ -76,6 +81,34 @@ func refusedAddr(t *testing.T) string {
 	return addr
 }
 
+func newUnixSocketListener(t *testing.T) string {
+	t.Helper()
+	skipIfUnixSocketsUnsupported(t)
+	path := filepath.Join(t.TempDir(), "ready.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Skipf("unix sockets are not supported: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	return path
+}
+
+func skipIfUnixSocketsUnsupported(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("unix sockets are not supported on windows")
+	}
+}
+
 func requirePOSIXShell(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -99,6 +132,82 @@ func writeServerCertificatePEM(t *testing.T, server *httptest.Server) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func newSSHBannerListener(t *testing.T, banner string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				_, _ = fmt.Fprint(conn, banner)
+			}(conn)
+		}
+	}()
+	return listener.Addr().String()
+}
+
+func newSSHAuthListener(t *testing.T, user, password string) (string, string) {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &ssh.ServerConfig{
+		PasswordCallback: func(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			if conn.User() == user && string(pass) == password {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("password rejected")
+		},
+	}
+	config.AddHostKey(signer)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go handleE2ESSHAuth(conn, config)
+		}
+	}()
+	return listener.Addr().String(), e2eSSHHostKeySHA256(signer.PublicKey())
+}
+
+func handleE2ESSHAuth(conn net.Conn, config *ssh.ServerConfig) {
+	defer func() { _ = conn.Close() }()
+	sshConn, chans, reqs, err := ssh.NewServerConn(conn, config)
+	if err != nil {
+		return
+	}
+	defer func() { _ = sshConn.Close() }()
+	go ssh.DiscardRequests(reqs)
+	for ch := range chans {
+		_ = ch.Reject(ssh.Prohibited, "sessions are not supported")
+	}
+}
+
+func e2eSSHHostKeySHA256(key ssh.PublicKey) string {
+	sum := sha256.Sum256(key.Marshal())
+	return "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:])
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
@@ -287,6 +396,92 @@ func TestTCPInvalidAddress(t *testing.T) {
 	}
 }
 
+// ── Unix Socket ─────────────────────────────────────────────────────────────
+
+func TestUnixSocketSatisfied(t *testing.T) {
+	path := newUnixSocketListener(t)
+	mustCode(t, cli.ExitSatisfied, "unix", path)
+}
+
+func TestUnixSocketMissingTimeout(t *testing.T) {
+	skipIfUnixSocketsUnsupported(t)
+	path := filepath.Join(t.TempDir(), "missing.sock")
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms", "unix", path)
+}
+
+func TestUnixSocketInvalidArgs(t *testing.T) {
+	code, _, stderr := execute(t, "unix")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "unix requires") {
+		t.Fatalf("stderr %q does not mention unix parse error", stderr)
+	}
+}
+
+// ── Ports ───────────────────────────────────────────────────────────────────
+
+func TestPortsAnySatisfied(t *testing.T) {
+	addr := newTCPListener(t)
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitSatisfied, "ports", host, "--range", port+"-"+port, "--any")
+}
+
+func TestPortsAllTimeout(t *testing.T) {
+	addr := refusedAddr(t)
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"ports", host, "--range", port+"-"+port, "--all")
+}
+
+func TestPortsInvalidArgs(t *testing.T) {
+	code, _, stderr := execute(t, "ports", "localhost", "--range", "8010-8000", "--any")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "invalid ports range") {
+		t.Fatalf("stderr %q does not mention invalid ports range", stderr)
+	}
+}
+
+// ── SSH ─────────────────────────────────────────────────────────────────────
+
+func TestSSHBannerSatisfied(t *testing.T) {
+	addr := newSSHBannerListener(t, "SSH-2.0-e2e-ssh\r\n")
+	mustCode(t, cli.ExitSatisfied, "ssh", addr)
+}
+
+func TestSSHBannerContainsTimeout(t *testing.T) {
+	addr := newSSHBannerListener(t, "SSH-2.0-OpenSSH_9.9\r\n")
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"ssh", addr, "--banner-contains", "dropbear")
+}
+
+func TestSSHAuthSatisfied(t *testing.T) {
+	addr, fingerprint := newSSHAuthListener(t, "deploy", "secret")
+	mustCode(t, cli.ExitSatisfied,
+		"ssh", addr,
+		"--user", "deploy",
+		"--password", "secret",
+		"--host-key-sha256", fingerprint)
+}
+
+func TestSSHInvalidArgs(t *testing.T) {
+	code, _, stderr := execute(t, "ssh", "api.example.com", "--user", "deploy")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "invalid ssh address") {
+		t.Fatalf("stderr %q does not mention invalid ssh address", stderr)
+	}
+}
+
 // ── TLS ─────────────────────────────────────────────────────────────────────
 
 func TestTLSSatisfied(t *testing.T) {
@@ -431,6 +626,42 @@ func TestS3FatalConfig(t *testing.T) {
 		"s3", "s3://ready-bucket/path/ready.json",
 		"--access-key-id", "only",
 		"--secret-access-key", "")
+}
+
+// ── Glob ────────────────────────────────────────────────────────────────────
+
+func TestGlobMinCountSatisfied(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.done"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.done"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitSatisfied, "glob", filepath.Join(dir, "*.done"), "--min-count", "2")
+}
+
+func TestGlobAbsentSatisfied(t *testing.T) {
+	mustCode(t, cli.ExitSatisfied, "glob", filepath.Join(t.TempDir(), "*.done"), "--absent")
+}
+
+func TestGlobMinCountTimeout(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.done"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
+		"glob", filepath.Join(dir, "*.done"), "--min-count", "2")
+}
+
+func TestGlobInvalidArgs(t *testing.T) {
+	code, _, stderr := execute(t, "glob", "*.done", "--min-count", "2", "--max-count", "1")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "cannot exceed") {
+		t.Fatalf("stderr %q does not mention min/max conflict", stderr)
+	}
 }
 
 // ── File ────────────────────────────────────────────────────────────────────

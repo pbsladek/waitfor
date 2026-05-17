@@ -300,7 +300,41 @@ waitfor tls 10.0.0.12:8443 \
 
 ---
 
-## 16. Wait for an S3 object marker
+## 16. Wait for an SSH service
+
+Wait until an SSH server sends a valid identification banner:
+
+```bash
+waitfor ssh host.example.com:22
+```
+
+Require a specific banner marker:
+
+```bash
+waitfor ssh host.example.com:22 --banner-contains OpenSSH
+```
+
+Require a successful password-auth handshake before continuing:
+
+```bash
+waitfor ssh host.example.com:22 \
+  --user deploy \
+  --password "$SSH_PASSWORD"
+```
+
+Pin the expected host key fingerprint when the probe should verify host
+identity:
+
+```bash
+waitfor ssh host.example.com:22 \
+  --user deploy \
+  --password "$SSH_PASSWORD" \
+  --host-key-sha256 SHA256:abc123...
+```
+
+---
+
+## 17. Wait for an S3 object marker
 
 Wait until an S3 object exists before continuing:
 
@@ -340,7 +374,49 @@ from `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`, or `S3_ENDPOINT_URL`.
 
 ---
 
-## 17. Send an email alert when a log pattern is detected
+## 18. Wait for a filesystem glob threshold
+
+Wait until a batch of marker files exists:
+
+```bash
+waitfor glob '/tmp/jobs/*.done' --min-count 5
+```
+
+Wait until temporary files have disappeared before removing a workspace:
+
+```bash
+waitfor glob '/tmp/jobs/*.tmp' --absent && rm -rf /tmp/jobs
+```
+
+Use `--max-count` when a workflow should continue only after a queue has drained
+below a threshold:
+
+```bash
+waitfor glob '/var/spool/app/*.pending' --max-count 2
+```
+
+---
+
+## 19. Wait for a port range
+
+Wait until any port in a handoff range is open:
+
+```bash
+waitfor ports localhost --range 8000-8010 --any
+```
+
+Require every port in the range when a worker pool exposes a fixed set of
+listeners:
+
+```bash
+waitfor ports worker.internal --range 9100-9104 --all
+```
+
+`--all` is the default, so the second example can omit it.
+
+---
+
+## 20. Send an email alert when a log pattern is detected
 
 Combine `waitfor` with `mail` to alert on the first error:
 
@@ -366,7 +442,7 @@ printf "Matched line:\n%s\n" "$detail" | \
 
 ---
 
-## 18. Kubernetes init container
+## 21. Kubernetes init container
 
 Block a pod from starting its main container until the database migration job
 completes:
@@ -401,7 +477,7 @@ args:
 
 ---
 
-## 19. Wait for a Kubernetes rollout to finish
+## 22. Wait for a Kubernetes rollout to finish
 
 ```bash
 waitfor --timeout 10m \
@@ -421,7 +497,7 @@ waitfor k8s deployment/api \
 
 ---
 
-## 20. Docker Compose startup gate
+## 23. Docker Compose startup gate
 
 Wait for every service to be healthy before running smoke tests:
 
@@ -437,7 +513,7 @@ waitfor --timeout 3m --interval 2s \
 
 ---
 
-## 21. Wait for local process state
+## 24. Wait for local process state
 
 Wait for a development database process by executable name:
 
@@ -453,7 +529,7 @@ waitfor --timeout 30s process --pid "$worker_pid" --stopped
 
 ---
 
-## 22. Wait for a systemd unit
+## 25. Wait for a systemd unit
 
 On Linux hosts with systemd, wait until a service reports active:
 
@@ -469,7 +545,7 @@ waitfor systemd batch-job.service --failed
 
 ---
 
-## 23. Run a command repeatedly until it succeeds
+## 26. Run a command repeatedly until it succeeds
 
 Wait until `kubectl rollout status` returns exit code `0`:
 
@@ -490,7 +566,7 @@ waitfor --timeout 5m \
 
 ---
 
-## 24. Parse final JSON output with jq
+## 27. Parse final JSON output with jq
 
 In JSON mode `waitfor` writes one final JSON document to stdout. Human progress
 stays off stdout, so the result can be piped directly to `jq`:
@@ -503,7 +579,7 @@ waitfor --output json --interval 1s \
 
 ---
 
-## 25. CI pipeline gate with structured failure reporting
+## 28. CI pipeline gate with structured failure reporting
 
 In a CI script, emit JSON on failure so the pipeline can parse which condition
 timed out:
@@ -532,7 +608,7 @@ Example failure output on stderr:
 
 ---
 
-## 26. Wait for a lock file to be released
+## 29. Wait for a lock file to be released
 
 Block until another process deletes its lock file before proceeding:
 
@@ -545,7 +621,7 @@ waitfor --timeout 10m file /var/run/deploy.lock --deleted && \
 
 ---
 
-## 27. Log-driven deployment promotion
+## 30. Log-driven deployment promotion
 
 After deploying a canary, wait until the canary log shows no errors in the
 first 50 lines of output, using `--tail` to limit the scan window:
@@ -572,7 +648,7 @@ kubectl set image deployment/api api=my-image:v2 -n production
 
 ---
 
-## 28. Send a Slack message when a long job completes
+## 31. Send a Slack message when a long job completes
 
 ```bash
 waitfor --timeout 6h \
@@ -599,7 +675,7 @@ curl -s -X POST "$SLACK_WEBHOOK" \
 
 ---
 
-## 29. Use `--attempt-timeout` for slow health endpoints
+## 32. Use `--attempt-timeout` for slow health endpoints
 
 Some services take a long time to respond during startup. Set a per-attempt
 deadline shorter than the global timeout so a hung request does not burn the
@@ -618,7 +694,7 @@ and retried after the interval. The global 5-minute deadline still applies.
 
 ---
 
-## 30. Fail fast when a guard condition appears
+## 33. Fail fast when a guard condition appears
 
 Wait for an API, but stop immediately if startup logs show a fatal error:
 
@@ -633,7 +709,7 @@ if it matches, `waitfor` exits `3` instead of waiting for the full timeout.
 
 ---
 
-## 31. Require stable readiness before continuing
+## 34. Require stable readiness before continuing
 
 Avoid starting the next step on a one-off successful probe:
 
@@ -647,7 +723,7 @@ successful for the stable duration before the run exits `0`.
 
 ---
 
-## 32. Wait for Kubernetes rollouts and selected pods
+## 35. Wait for Kubernetes rollouts and selected pods
 
 Use typed waits instead of writing JSON expressions for common Kubernetes
 states:
@@ -660,6 +736,20 @@ waitfor k8s job/migrate --for complete --namespace production
 
 `--for complete` treats a failed job as fatal. `--selector` switches the
 resource argument from `kind/name` to plain `kind`.
+
+---
+
+## 36. Wait for a Unix socket
+
+Wait until a local Unix domain socket accepts connections:
+
+```bash
+waitfor unix /var/run/docker.sock
+```
+
+This is useful for local daemons that expose readiness over a socket path
+instead of a TCP port. Missing paths and refused connections are retried until
+the global timeout expires.
 
 ---
 

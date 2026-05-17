@@ -141,6 +141,70 @@ func writeBlackboxServerCertificatePEM(t *testing.T, server *httptest.Server) st
 	return path
 }
 
+func newBlackboxSSHBannerListener(t *testing.T, banner string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				_, _ = fmt.Fprint(conn, banner)
+			}(conn)
+		}
+	}()
+	return listener.Addr().String()
+}
+
+func newBlackboxTCPListener(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	return listener.Addr().String()
+}
+
+func skipIfBlackboxUnixSocketsUnsupported(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("unix sockets are not supported on windows")
+	}
+	path := filepath.Join(t.TempDir(), "probe.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Skipf("unix sockets are not supported: %v", err)
+	}
+	_ = listener.Close()
+}
+
+func acceptBlackboxUnixConnections(listener net.Listener) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	}
+}
+
 func TestBinaryFilePolling(t *testing.T) {
 	requireBlackbox(t)
 
@@ -166,6 +230,22 @@ func TestBinaryFileStatesAndContains(t *testing.T) {
 	requireExitCode(t, runWaitfor(t, "file", ready, "--nonempty"), 0)
 	requireExitCode(t, runWaitfor(t, "file", ready, "--contains", "ready"), 0)
 	requireExitCode(t, runWaitfor(t, "file", filepath.Join(dir, "missing"), "--deleted"), 0)
+}
+
+func TestBinaryGlobPolling(t *testing.T) {
+	requireBlackbox(t)
+
+	dir := t.TempDir()
+	timer := time.AfterFunc(150*time.Millisecond, func() {
+		_ = os.WriteFile(filepath.Join(dir, "one.done"), []byte("ready\n"), 0o600)
+		_ = os.WriteFile(filepath.Join(dir, "two.done"), []byte("ready\n"), 0o600)
+	})
+	defer timer.Stop()
+
+	pattern := filepath.Join(dir, "*.done")
+	requireExitCode(t, runWaitfor(t, "--timeout", "2s", "--interval", "25ms",
+		"glob", pattern, "--min-count", "2"), 0)
+	requireExitCode(t, runWaitfor(t, "glob", filepath.Join(dir, "*.missing"), "--absent"), 0)
 }
 
 func TestBinaryTimeoutExitCode(t *testing.T) {
@@ -195,6 +275,15 @@ func TestBinaryTLSPolling(t *testing.T) {
 		"--servername", "example.com",
 		"--ca-file", caPath,
 		"--valid-for", "1000000h"), 1)
+}
+
+func TestBinarySSHPolling(t *testing.T) {
+	requireBlackbox(t)
+
+	addr := newBlackboxSSHBannerListener(t, "SSH-2.0-blackbox-ssh\r\n")
+	requireExitCode(t, runWaitfor(t, "ssh", addr, "--banner-contains", "blackbox"), 0)
+	requireExitCode(t, runWaitfor(t, "--timeout", "75ms", "--interval", "20ms",
+		"ssh", addr, "--banner-contains", "missing"), 1)
 }
 
 func TestBinaryS3Polling(t *testing.T) {
@@ -371,6 +460,57 @@ func TestBinaryTCPPolling(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatalf("tcp listener: %v", err)
 	}
+}
+
+func TestBinaryUnixSocketPolling(t *testing.T) {
+	requireBlackbox(t)
+	skipIfBlackboxUnixSocketsUnsupported(t)
+
+	path := filepath.Join(t.TempDir(), "ready.sock")
+	listenerCh := make(chan net.Listener, 1)
+	errCh := make(chan error, 1)
+	timer := time.AfterFunc(150*time.Millisecond, func() {
+		listener, err := net.Listen("unix", path)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		listenerCh <- listener
+		go acceptBlackboxUnixConnections(listener)
+	})
+	defer timer.Stop()
+
+	requireExitCode(t, runWaitfor(t, "--timeout", "2s", "--interval", "25ms", "unix", path), 0)
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("unix listener: %v", err)
+	case listener := <-listenerCh:
+		_ = listener.Close()
+	default:
+		t.Fatal("unix listener was not started")
+	}
+	requireExitCode(t, runWaitfor(t, "--timeout", "75ms", "--interval", "20ms",
+		"unix", filepath.Join(t.TempDir(), "missing.sock")), 1)
+}
+
+func TestBinaryPortsPolling(t *testing.T) {
+	requireBlackbox(t)
+
+	addr := newBlackboxTCPListener(t)
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireExitCode(t, runWaitfor(t, "ports", host, "--range", port+"-"+port, "--any"), 0)
+
+	refused := freeTCPAddress(t)
+	host, port, err = net.SplitHostPort(refused)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireExitCode(t, runWaitfor(t, "--timeout", "75ms", "--interval", "20ms",
+		"ports", host, "--range", port+"-"+port, "--all"), 1)
 }
 
 func TestBinaryDNSLocalhost(t *testing.T) {

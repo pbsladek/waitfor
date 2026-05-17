@@ -10,10 +10,11 @@
 shell scripts, CI pipelines, Docker entrypoints, Kubernetes init containers, and
 agent workflows when a plain sleep is too brittle.
 
-It can wait for HTTP health checks, TCP ports, TLS certificates, S3 objects,
-DNS records, Docker containers, local processes, systemd units, commands,
-files, log lines, and Kubernetes resources. If the timeout expires, it exits
-`1`; invalid input exits `2`; unrecoverable condition failures exit `3`.
+It can wait for HTTP health checks, TCP ports, Unix sockets, port ranges, TLS
+certificates, SSH servers, S3 objects, DNS records, Docker containers, local
+processes, systemd units, commands, files, filesystem globs, log lines, and
+Kubernetes resources. If the timeout expires, it exits `1`; invalid input exits
+`2`; unrecoverable condition failures exit `3`.
 
 Human-readable progress is written to stderr. JSON output is written to stdout
 without progress lines so it is safe to consume from scripts.
@@ -21,7 +22,7 @@ without progress lines so it is safe to consume from scripts.
 Supported waits:
 
 ```text
-http, tcp, tls, s3, dns, docker, process, systemd, exec, file, log, k8s
+http, tcp, unix, ports, tls, ssh, s3, dns, docker, process, systemd, exec, file, glob, log, k8s
 ```
 
 ## Install
@@ -124,7 +125,10 @@ Backends:
 ```text
 http URL [--status 200|2xx] [--method GET] [--body text] [--body-file path] [--body-contains text] [--body-matches regex] [--jsonpath expr] [--header K=V] [--insecure] [--no-follow-redirects]
 tcp HOST:PORT
+unix PATH
+ports HOST --range START-END [--any|--all]
 tls HOST:PORT [--servername name] [--valid-for duration] [--ca-file path]
+ssh HOST:PORT [--banner-contains text] [--user name --password value] [--host-key-sha256 SHA256:...]
 s3 s3://bucket[/key] [--exists] [--metadata K=V] [--contains text] [--endpoint-url URL] [--virtual-hosted-style] [--region name]
 dns HOST [--resolver system|wire] [--type A|AAAA|CNAME|TXT|ANY|MX|SRV|NS|CAA|HTTPS|SVCB] [--contains text] [--equals value] [--min-count N] [--absent] [--absent-mode any|nxdomain|nodata] [--server address] [--rcode code] [--transport udp|tcp] [--edns0] [--udp-size N]
 docker CONTAINER [--status running] [--health healthy]
@@ -132,6 +136,7 @@ process (--pid PID | --name NAME) [--running|--stopped]
 systemd UNIT [--active|--inactive|--failed]
 exec [--exit-code N] [--output-contains text] [--jsonpath expr] [--cwd path] [--env K=V] [--max-output-bytes N] -- COMMAND [ARGS...]
 file PATH [--exists|--deleted|--nonempty] [--contains text]
+glob PATTERN [--min-count N] [--max-count N] [--absent]
 log PATH (--contains text | --matches regex | --jsonpath expr) [--exclude regex] [--from-start|--tail N] [--min-matches N]
 k8s RESOURCE [--condition Ready] [--for ready|rollout|complete] [--selector labels] [--all] [--namespace default] [--jsonpath expr] [--kubeconfig path]
 ```
@@ -160,7 +165,15 @@ Wait for ports and DNS:
 ```bash
 waitfor tcp localhost:5432
 
+waitfor unix /var/run/docker.sock
+
+waitfor ports localhost --range 8000-8010 --any
+
 waitfor tls api.example.com:443 --valid-for 30d
+
+waitfor ssh host.example.com:22
+
+waitfor ssh host.example.com:22 --user deploy --password "$SSH_PASSWORD"
 
 waitfor s3 s3://bucket/path/ready.json --exists
 
@@ -187,6 +200,8 @@ waitfor systemd nginx.service --active
 waitfor file /tmp/ready.flag --exists
 
 waitfor file /tmp/lock --deleted
+
+waitfor glob '/tmp/jobs/*.done' --min-count 5
 
 waitfor exec --output-contains Running -- kubectl get pod myapp
 ```

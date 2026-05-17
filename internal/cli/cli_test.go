@@ -292,6 +292,31 @@ func TestExecuteTCP(t *testing.T) {
 	<-accepted
 }
 
+func TestExecuteUnixSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ready.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Skipf("unix sockets are not supported: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	accepted := make(chan struct{})
+	go func() {
+		defer close(accepted)
+		conn, err := listener.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"unix", path}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitSatisfied, stdout.String(), stderr.String())
+	}
+	<-accepted
+}
+
 func TestExecuteModeAnyWithMultipleConditions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ready")
 	if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
@@ -518,6 +543,7 @@ func TestConditionValueFlagsCoversBackendValueFlags(t *testing.T) {
 		"--min-matches",
 		"--equals",
 		"--min-count",
+		"--max-count",
 		"--absent-mode",
 		"--server",
 		"--rcode",
@@ -526,7 +552,12 @@ func TestConditionValueFlagsCoversBackendValueFlags(t *testing.T) {
 		"--servername",
 		"--valid-for",
 		"--ca-file",
+		"--banner-contains",
+		"--user",
+		"--password",
+		"--host-key-sha256",
 		"--metadata",
+		"--range",
 		"--endpoint-url",
 		"--region",
 		"--access-key-id",
@@ -550,6 +581,152 @@ func TestConditionValueFlagsCoversBackendValueFlags(t *testing.T) {
 		if !conditionValueFlags[flag] {
 			t.Fatalf("conditionValueFlags[%q] = false, want true", flag)
 		}
+	}
+}
+
+func TestParseGlobConditionFlags(t *testing.T) {
+	cond, err := parseGlobCondition([]string{"glob", "/tmp/jobs/*.done", "--min-count", "5", "--max-count", "10"})
+	if err != nil {
+		t.Fatalf("parseGlobCondition() error = %v", err)
+	}
+	globCond, ok := cond.(*condition.GlobCondition)
+	if !ok {
+		t.Fatalf("condition type = %T, want *condition.GlobCondition", cond)
+	}
+	if globCond.Pattern != "/tmp/jobs/*.done" || globCond.MinCount != 5 || globCond.MaxCount != 10 || globCond.Absent {
+		t.Fatalf("glob condition = %+v", globCond)
+	}
+}
+
+func TestParseGlobConditionAbsent(t *testing.T) {
+	cond, err := parseGlobCondition([]string{"glob", "/tmp/jobs/*.done", "--absent"})
+	if err != nil {
+		t.Fatalf("parseGlobCondition() error = %v", err)
+	}
+	globCond, ok := cond.(*condition.GlobCondition)
+	if !ok {
+		t.Fatalf("condition type = %T, want *condition.GlobCondition", cond)
+	}
+	if !globCond.Absent || globCond.MinCount != 0 {
+		t.Fatalf("glob condition = %+v, want absent min-count 0", globCond)
+	}
+}
+
+func TestParseGlobConditionErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment []string
+		wantErr string
+	}{
+		{name: "missing pattern", segment: []string{"glob"}, wantErr: "exactly one"},
+		{name: "negative min", segment: []string{"glob", "*.done", "--min-count", "-1"}, wantErr: "negative"},
+		{name: "bad max", segment: []string{"glob", "*.done", "--max-count", "-2"}, wantErr: "less than -1"},
+		{name: "min exceeds max", segment: []string{"glob", "*.done", "--min-count", "2", "--max-count", "1"}, wantErr: "exceed"},
+		{name: "absent positive min", segment: []string{"glob", "*.done", "--absent", "--min-count", "1"}, wantErr: "absent"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseGlobCondition(tt.segment)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParsePortsConditionFlags(t *testing.T) {
+	cond, err := parsePortsCondition([]string{"ports", "localhost", "--range", "8000-8010", "--any"})
+	if err != nil {
+		t.Fatalf("parsePortsCondition() error = %v", err)
+	}
+	portsCond, ok := cond.(*condition.PortsCondition)
+	if !ok {
+		t.Fatalf("condition type = %T, want *condition.PortsCondition", cond)
+	}
+	if portsCond.Host != "localhost" || portsCond.StartPort != 8000 || portsCond.EndPort != 8010 || portsCond.Mode != condition.PortsAny {
+		t.Fatalf("ports condition = %+v", portsCond)
+	}
+}
+
+func TestParsePortsConditionDefaultsAll(t *testing.T) {
+	cond, err := parsePortsCondition([]string{"ports", "localhost", "--range", "8000-8001"})
+	if err != nil {
+		t.Fatalf("parsePortsCondition() error = %v", err)
+	}
+	portsCond, ok := cond.(*condition.PortsCondition)
+	if !ok {
+		t.Fatalf("condition type = %T, want *condition.PortsCondition", cond)
+	}
+	if portsCond.Mode != condition.PortsAll {
+		t.Fatalf("mode = %q, want all", portsCond.Mode)
+	}
+}
+
+func TestParsePortsConditionErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment []string
+		wantErr string
+	}{
+		{name: "missing host", segment: []string{"ports", "--range", "8000-8001"}, wantErr: "exactly one HOST"},
+		{name: "missing range", segment: []string{"ports", "localhost"}, wantErr: "requires --range"},
+		{name: "bad range", segment: []string{"ports", "localhost", "--range", "8000"}, wantErr: "invalid ports range"},
+		{name: "bad port", segment: []string{"ports", "localhost", "--range", "0-1"}, wantErr: "invalid ports range"},
+		{name: "reversed", segment: []string{"ports", "localhost", "--range", "2-1"}, wantErr: "invalid ports range"},
+		{name: "mode conflict", segment: []string{"ports", "localhost", "--range", "1-2", "--any", "--all"}, wantErr: "mutually exclusive"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parsePortsCondition(tt.segment)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseSSHConditionFlags(t *testing.T) {
+	cond, err := parseSSHCondition([]string{
+		"ssh", "example.test:22",
+		"--banner-contains", "OpenSSH",
+		"--user", "deploy",
+		"--password", "secret",
+		"--host-key-sha256", "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+	})
+	if err != nil {
+		t.Fatalf("parseSSHCondition() error = %v", err)
+	}
+	sshCond, ok := cond.(*condition.SSHCondition)
+	if !ok {
+		t.Fatalf("condition type = %T, want *condition.SSHCondition", cond)
+	}
+	if sshCond.Address != "example.test:22" ||
+		sshCond.BannerContains != "OpenSSH" ||
+		sshCond.User != "deploy" ||
+		sshCond.Password != "secret" ||
+		sshCond.HostKeySHA256 != "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" {
+		t.Fatalf("ssh condition = %+v", sshCond)
+	}
+}
+
+func TestParseSSHConditionErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment []string
+		wantErr string
+	}{
+		{name: "missing address", segment: []string{"ssh"}, wantErr: "exactly one"},
+		{name: "bad address", segment: []string{"ssh", "example.test"}, wantErr: "invalid ssh address"},
+		{name: "partial auth user", segment: []string{"ssh", "example.test:22", "--user", "deploy"}, wantErr: "provided together"},
+		{name: "partial auth password", segment: []string{"ssh", "example.test:22", "--password", "secret"}, wantErr: "provided together"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseSSHCondition(tt.segment)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -1215,6 +1392,46 @@ func TestParseTCPConditionNoArgs(t *testing.T) {
 	_, err := parseTCPCondition([]string{"tcp"})
 	if err == nil {
 		t.Fatal("parseTCPCondition() expected error for no args, got nil")
+	}
+}
+
+// ── parseUnixCondition ───────────────────────────────────────────────────────
+
+func TestParseUnixConditionSuccess(t *testing.T) {
+	cond, err := parseUnixCondition([]string{"unix", "/var/run/docker.sock"})
+	if err != nil {
+		t.Fatalf("parseUnixCondition() error = %v", err)
+	}
+	unixCond, ok := cond.(*condition.UnixCondition)
+	if !ok {
+		t.Fatalf("condition type = %T, want *condition.UnixCondition", cond)
+	}
+	if unixCond.Path != "/var/run/docker.sock" {
+		t.Fatalf("path = %q, want /var/run/docker.sock", unixCond.Path)
+	}
+}
+
+func TestParseUnixConditionErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment []string
+		wantErr string
+	}{
+		{name: "missing path", segment: []string{"unix"}, wantErr: "exactly one"},
+		{name: "blank path", segment: []string{"unix", "  "}, wantErr: "path is required"},
+		{name: "too many args", segment: []string{"unix", "/tmp/a.sock", "/tmp/b.sock"}, wantErr: "exactly one"},
+		{name: "unknown flag", segment: []string{"unix", "/tmp/a.sock", "--bad"}, wantErr: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseUnixCondition(tt.segment)
+			if err == nil {
+				t.Fatal("parseUnixCondition() expected error, got nil")
+			}
+			if tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("parseUnixCondition() err = %q, want to contain %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
