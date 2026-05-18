@@ -1,6 +1,7 @@
 package condition
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,6 +133,18 @@ func TestFileContainsDoesNotReadPastLimit(t *testing.T) {
 	result := c.Check(t.Context())
 	if result.Status == CheckSatisfied {
 		t.Fatal("contains past scan limit should not be satisfied")
+	}
+}
+
+func TestReaderContainsLimitFindsNeedleAcrossReadBoundary(t *testing.T) {
+	prefix := bytes.Repeat([]byte("x"), fileContainsBufferSize-2)
+	body := append(prefix, []byte("needle")...)
+	found, err := readerContainsLimit(t.Context(), bytes.NewReader(body), []byte("needle"), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("found = false, want true for needle spanning read boundary")
 	}
 }
 

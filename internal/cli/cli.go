@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ const (
 	ExitCancelled = 130
 
 	maxHTTPBodyFileBytes = 10 * 1024 * 1024
+	maxTLSCAFileBytes    = 10 * 1024 * 1024
 )
 
 type exitError struct {
@@ -332,14 +334,33 @@ func parseConditions(args []string) ([]condition.Condition, error) {
 type backendParser func([]string) (condition.Condition, error)
 
 var backendParsers = map[string]backendParser{
-	"http":   parseHTTPCondition,
-	"tcp":    parseTCPCondition,
-	"exec":   parseExecCondition,
-	"file":   parseFileCondition,
-	"log":    parseLogCondition,
-	"k8s":    parseKubernetesCondition,
-	"dns":    parseDNSCondition,
-	"docker": parseDockerCondition,
+	"http":       parseHTTPCondition,
+	"tcp":        parseTCPCondition,
+	"unix":       parseUnixCondition,
+	"tls":        parseTLSCondition,
+	"ssh":        parseSSHCondition,
+	"s3":         parseS3Condition,
+	"glob":       parseGlobCondition,
+	"ports":      parsePortsCondition,
+	"exec":       parseExecCondition,
+	"file":       parseFileCondition,
+	"log":        parseLogCondition,
+	"k8s":        parseKubernetesCondition,
+	"dns":        parseDNSCondition,
+	"docker":     parseDockerCondition,
+	"process":    parseProcessCondition,
+	"systemd":    parseSystemdCondition,
+	"launchd":    parseLaunchdCondition,
+	"pidfile":    parsePIDFileCondition,
+	"lockfile":   parseLockfileCondition,
+	"permission": parsePermissionCondition,
+	"checksum":   parseChecksumCondition,
+	"archive":    parseArchiveCondition,
+	"cosign":     parseCosignCondition,
+	"ntp":        parseNTPCondition,
+	"icmp":       parseICMPCondition,
+	"grpc":       parseGRPCCondition,
+	"websocket":  parseWebSocketCondition,
 }
 
 func parseCondition(segment []string) (condition.Condition, error) {
@@ -375,6 +396,9 @@ func parseCondition(segment []string) (condition.Condition, error) {
 }
 
 func parseConditionName(segment []string) ([]string, string, error) {
+	if conditionNameReservedForBackend(segment) {
+		return segment, "", nil
+	}
 	cleaned := []string{segment[0]}
 	name := ""
 	limit := conditionFlagLimit(segment)
@@ -407,6 +431,10 @@ func parseConditionName(segment []string) ([]string, string, error) {
 		cleaned = append(cleaned, arg)
 	}
 	return cleaned, name, nil
+}
+
+func conditionNameReservedForBackend(segment []string) bool {
+	return len(segment) > 0 && segment[0] == "process"
 }
 
 func conditionFlagLimit(segment []string) int {
@@ -460,6 +488,7 @@ func parseBodyContent(body, bodyFile string) ([]byte, error) {
 
 func parseHTTPHeaders(rawHeaders []string) (map[string]string, error) {
 	headers := make(map[string]string, len(rawHeaders))
+	seen := make(map[string]bool, len(rawHeaders))
 	for _, raw := range rawHeaders {
 		key, value, ok := splitHeader(raw)
 		if !ok {
@@ -471,6 +500,11 @@ func parseHTTPHeaders(rawHeaders []string) (map[string]string, error) {
 		if !validHTTPHeaderValue(value) {
 			return nil, fmt.Errorf("invalid HTTP header value for %q", key)
 		}
+		canonical := strings.ToLower(key)
+		if seen[canonical] {
+			return nil, fmt.Errorf("duplicate HTTP header %q", key)
+		}
+		seen[canonical] = true
 		headers[key] = value
 	}
 	return headers, nil
@@ -609,6 +643,386 @@ func parseTCPCondition(segment []string) (condition.Condition, error) {
 		return nil, fmt.Errorf("invalid tcp address %q: %w", args[0], err)
 	}
 	return condition.NewTCP(args[0]), nil
+}
+
+func parseUnixCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("unix", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("unix requires exactly one socket PATH")
+	}
+	if strings.TrimSpace(args[0]) == "" {
+		return nil, fmt.Errorf("unix socket path is required")
+	}
+	return condition.NewUnix(args[0]), nil
+}
+
+func parseTLSCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("tls", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	serverName := ""
+	validForRaw := ""
+	caFile := ""
+	fs.StringVar(&serverName, "servername", serverName, "TLS server name for SNI and SAN verification")
+	fs.StringVar(&validForRaw, "valid-for", validForRaw, "minimum remaining certificate validity, such as 720h or 30d")
+	fs.StringVar(&caFile, "ca-file", caFile, "PEM CA bundle to trust in addition to system roots")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("tls requires exactly one HOST:PORT address")
+	}
+	if _, _, err := net.SplitHostPort(args[0]); err != nil {
+		return nil, fmt.Errorf("invalid tls address %q: %w", args[0], err)
+	}
+	validFor, err := parseTLSValidFor(validForRaw)
+	if err != nil {
+		return nil, err
+	}
+	rootCAs, err := parseTLSRootCAs(caFile)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewTLS(args[0])
+	cond.ServerName = serverName
+	cond.ValidFor = validFor
+	cond.RootCAs = rootCAs
+	return cond, nil
+}
+
+func parseTLSValidFor(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	if strings.HasSuffix(raw, "d") {
+		days, err := strconv.ParseInt(strings.TrimSuffix(raw, "d"), 10, 64)
+		maxDays := int64(math.MaxInt64) / int64(24*time.Hour)
+		if err != nil || days < 0 || days > maxDays {
+			return 0, fmt.Errorf("invalid --valid-for duration %q", raw)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	duration, err := time.ParseDuration(raw)
+	if err != nil || duration < 0 {
+		return 0, fmt.Errorf("invalid --valid-for duration %q", raw)
+	}
+	return duration, nil
+}
+
+func parseTLSRootCAs(path string) (*x509.CertPool, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := readFileLimit(path, maxTLSCAFileBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read ca file: %w", err)
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("ca file contains no PEM certificates")
+	}
+	return pool, nil
+}
+
+func parseSSHCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("ssh", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	bannerContains := ""
+	user := ""
+	password := ""
+	hostKeySHA256 := ""
+	fs.StringVar(&bannerContains, "banner-contains", bannerContains, "required SSH banner substring")
+	fs.StringVar(&user, "user", user, "SSH username for password auth handshake")
+	fs.StringVar(&password, "password", password, "SSH password for auth handshake")
+	fs.StringVar(&hostKeySHA256, "host-key-sha256", hostKeySHA256, "required SSH host key SHA256 fingerprint")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("ssh requires exactly one HOST:PORT address")
+	}
+	if _, _, err := net.SplitHostPort(args[0]); err != nil {
+		return nil, fmt.Errorf("invalid ssh address %q: %w", args[0], err)
+	}
+	if (user == "") != (password == "") {
+		return nil, fmt.Errorf("--user and --password must be provided together")
+	}
+	if user != "" && hostKeySHA256 == "" {
+		return nil, fmt.Errorf("--host-key-sha256 is required with password auth")
+	}
+	cond := condition.NewSSH(args[0])
+	cond.BannerContains = bannerContains
+	cond.User = user
+	cond.Password = password
+	cond.HostKeySHA256 = hostKeySHA256
+	return cond, nil
+}
+
+func parseS3Condition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("s3", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	endpointURL := defaultS3EndpointURL()
+	region := defaultS3Region()
+	accessKeyID := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretAccessKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	sessionToken := os.Getenv("AWS_SESSION_TOKEN")
+	contains := ""
+	virtualHostedStyle := false
+	exists := false
+	var rawMetadata []string
+	fs.BoolVar(&exists, "exists", exists, "wait until the bucket or object exists")
+	fs.StringArrayVar(&rawMetadata, "metadata", nil, "required object metadata as Key=Value; repeatable")
+	fs.StringVar(&contains, "contains", contains, "required object content substring")
+	fs.StringVar(&endpointURL, "endpoint-url", endpointURL, "S3-compatible endpoint URL; defaults to AWS_ENDPOINT_URL_S3, AWS_ENDPOINT_URL, or S3_ENDPOINT_URL")
+	fs.StringVar(&region, "region", region, "AWS region or S3-compatible signing region")
+	fs.BoolVar(&virtualHostedStyle, "virtual-hosted-style", virtualHostedStyle, "use bucket.endpoint host style with --endpoint-url")
+	fs.StringVar(&accessKeyID, "access-key-id", accessKeyID, "AWS access key id; defaults to AWS_ACCESS_KEY_ID")
+	fs.StringVar(&secretAccessKey, "secret-access-key", secretAccessKey, "AWS secret access key; defaults to AWS_SECRET_ACCESS_KEY")
+	fs.StringVar(&sessionToken, "session-token", sessionToken, "AWS session token; defaults to AWS_SESSION_TOKEN")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("s3 requires exactly one s3://bucket[/key] URL")
+	}
+	target, err := condition.ParseS3URL(args[0])
+	if err != nil {
+		return nil, err
+	}
+	metadata, err := parseS3Metadata(rawMetadata)
+	if err != nil {
+		return nil, err
+	}
+	creds := condition.S3Credentials{
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: secretAccessKey,
+		SessionToken:    sessionToken,
+	}
+	if err := validateS3CLIOptions(target, endpointURL, region, contains, metadata, creds); err != nil {
+		return nil, err
+	}
+	cond := condition.NewS3(args[0])
+	cond.EndpointURL = endpointURL
+	cond.Region = region
+	cond.VirtualHostedStyle = virtualHostedStyle
+	cond.Metadata = metadata
+	cond.Contains = contains
+	cond.Credentials = creds
+	return cond, nil
+}
+
+func validateS3CLIOptions(target condition.S3Target, endpointURL, region, contains string, metadata map[string]string, creds condition.S3Credentials) error {
+	if err := validateS3CLITargetOptions(target, region, contains, metadata); err != nil {
+		return err
+	}
+	if err := validateS3EndpointURL(endpointURL); err != nil {
+		return err
+	}
+	return validateS3CLICredentialTransport(endpointURL, creds)
+}
+
+func validateS3CLITargetOptions(target condition.S3Target, region, contains string, metadata map[string]string) error {
+	if contains != "" && target.Key == "" {
+		return fmt.Errorf("--contains requires an object key")
+	}
+	if len(metadata) > 0 && target.Key == "" {
+		return fmt.Errorf("--metadata requires an object key")
+	}
+	if strings.TrimSpace(region) == "" {
+		return fmt.Errorf("--region cannot be empty")
+	}
+	return nil
+}
+
+func validateS3CLICredentialTransport(endpointURL string, creds condition.S3Credentials) error {
+	if endpointURL == "" || creds.AccessKeyID == "" {
+		return nil
+	}
+	parsed, _ := url.Parse(endpointURL)
+	if parsed.Scheme == "http" {
+		return fmt.Errorf("s3 credentials require an https endpoint")
+	}
+	return nil
+}
+
+func validateS3EndpointURL(endpointURL string) error {
+	if endpointURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(endpointURL)
+	if err != nil {
+		return fmt.Errorf("invalid s3 endpoint URL")
+	}
+	return validateParsedS3EndpointURL(parsed)
+}
+
+func validateParsedS3EndpointURL(parsed *url.URL) error {
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("invalid s3 endpoint URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("s3 endpoint URL must use http or https")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("s3 endpoint URL cannot include userinfo")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("s3 endpoint URL cannot include query or fragment")
+	}
+	return nil
+}
+
+func defaultS3Region() string {
+	if region := os.Getenv("AWS_REGION"); region != "" {
+		return region
+	}
+	if region := os.Getenv("AWS_DEFAULT_REGION"); region != "" {
+		return region
+	}
+	return "us-east-1"
+}
+
+func defaultS3EndpointURL() string {
+	for _, name := range []string{"AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL", "S3_ENDPOINT_URL"} {
+		if endpointURL := os.Getenv(name); endpointURL != "" {
+			return endpointURL
+		}
+	}
+	return ""
+}
+
+func parseS3Metadata(rawValues []string) (map[string]string, error) {
+	metadata := make(map[string]string, len(rawValues))
+	for _, raw := range rawValues {
+		key, value, ok := strings.Cut(raw, "=")
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if !ok || key == "" {
+			return nil, fmt.Errorf("invalid s3 metadata; must use Key=Value")
+		}
+		metadata[key] = value
+	}
+	return metadata, nil
+}
+
+func parseGlobCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("glob", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	minCount := 1
+	maxCount := -1
+	absent := false
+	fs.IntVar(&minCount, "min-count", minCount, "minimum number of matches")
+	fs.IntVar(&maxCount, "max-count", maxCount, "maximum number of matches; -1 disables")
+	fs.BoolVar(&absent, "absent", absent, "wait until no files match")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("glob requires exactly one PATTERN")
+	}
+	if absent && fs.Changed("min-count") && minCount != 0 {
+		return nil, fmt.Errorf("--absent cannot be combined with positive --min-count")
+	}
+	if absent && !fs.Changed("min-count") {
+		minCount = 0
+	}
+	if err := validateGlobCLIOptions(minCount, maxCount); err != nil {
+		return nil, err
+	}
+	cond := condition.NewGlob(args[0])
+	cond.MinCount = minCount
+	cond.MaxCount = maxCount
+	cond.Absent = absent
+	return cond, nil
+}
+
+func validateGlobCLIOptions(minCount, maxCount int) error {
+	if minCount < 0 {
+		return fmt.Errorf("--min-count cannot be negative")
+	}
+	if maxCount < -1 {
+		return fmt.Errorf("--max-count cannot be less than -1")
+	}
+	if maxCount >= 0 && minCount > maxCount {
+		return fmt.Errorf("--min-count cannot exceed --max-count")
+	}
+	return nil
+}
+
+func parsePortsCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("ports", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	rangeRaw := ""
+	anyMode := false
+	allMode := false
+	fs.StringVar(&rangeRaw, "range", rangeRaw, "port range START-END")
+	fs.BoolVar(&anyMode, "any", anyMode, "succeed when any port in the range is open")
+	fs.BoolVar(&allMode, "all", allMode, "succeed when all ports in the range are open")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("ports requires exactly one HOST")
+	}
+	startPort, endPort, err := parsePortRange(rangeRaw)
+	if err != nil {
+		return nil, err
+	}
+	mode, err := parsePortsMode(anyMode, allMode)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewPorts(args[0], startPort, endPort)
+	cond.Mode = mode
+	return cond, nil
+}
+
+func parsePortRange(raw string) (int, int, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, 0, fmt.Errorf("ports requires --range START-END")
+	}
+	startRaw, endRaw, ok := strings.Cut(raw, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("invalid ports range %q", raw)
+	}
+	startPort, err := strconv.Atoi(strings.TrimSpace(startRaw))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid ports range %q", raw)
+	}
+	endPort, err := strconv.Atoi(strings.TrimSpace(endRaw))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid ports range %q", raw)
+	}
+	if !validPortRange(startPort, endPort) {
+		return 0, 0, fmt.Errorf("invalid ports range %q", raw)
+	}
+	return startPort, endPort, nil
+}
+
+func validPortRange(startPort, endPort int) bool {
+	return startPort >= 1 && endPort <= 65535 && startPort <= endPort
+}
+
+func parsePortsMode(anyMode, allMode bool) (condition.PortsMode, error) {
+	if anyMode && allMode {
+		return "", fmt.Errorf("--any and --all are mutually exclusive")
+	}
+	if anyMode {
+		return condition.PortsAny, nil
+	}
+	return condition.PortsAll, nil
 }
 
 type dnsParseOptions struct {
@@ -827,6 +1241,486 @@ func parseDockerCondition(segment []string) (condition.Condition, error) {
 	cond := condition.NewDocker(args[0])
 	cond.Status = status
 	cond.Health = health
+	return cond, nil
+}
+
+func parseProcessCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("process", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	pid := 0
+	name := ""
+	running := false
+	stopped := false
+	fs.IntVar(&pid, "pid", pid, "process ID")
+	fs.StringVar(&name, "name", name, "process executable name")
+	fs.BoolVar(&running, "running", running, "wait until the process is running")
+	fs.BoolVar(&stopped, "stopped", stopped, "wait until the process is stopped")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 0 {
+		return nil, fmt.Errorf("process does not accept positional arguments; use --pid or --name")
+	}
+	state, err := parseProcessState(running, stopped)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateProcessSelector(pid, name); err != nil {
+		return nil, err
+	}
+	cond := condition.NewProcess()
+	cond.PID = pid
+	cond.Name = name
+	cond.State = state
+	return cond, nil
+}
+
+func parseProcessState(running, stopped bool) (condition.ProcessState, error) {
+	if running && stopped {
+		return "", fmt.Errorf("--running and --stopped are mutually exclusive")
+	}
+	if stopped {
+		return condition.ProcessStopped, nil
+	}
+	return condition.ProcessRunning, nil
+}
+
+func validateProcessSelector(pid int, name string) error {
+	if pid < 0 {
+		return fmt.Errorf("--pid must be positive")
+	}
+	if pid == 0 && strings.TrimSpace(name) == "" {
+		return fmt.Errorf("process requires exactly one of --pid or --name")
+	}
+	if pid > 0 && strings.TrimSpace(name) != "" {
+		return fmt.Errorf("--pid and --name are mutually exclusive")
+	}
+	return nil
+}
+
+func parseSystemdCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("systemd", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	active := false
+	inactive := false
+	failed := false
+	fs.BoolVar(&active, "active", active, "wait until the unit is active")
+	fs.BoolVar(&inactive, "inactive", inactive, "wait until the unit is inactive")
+	fs.BoolVar(&failed, "failed", failed, "wait until the unit is failed")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("systemd requires exactly one UNIT")
+	}
+	state, err := parseSystemdState(active, inactive, failed)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewSystemd(args[0])
+	cond.State = state
+	return cond, nil
+}
+
+func parseSystemdState(active, inactive, failed bool) (condition.SystemdState, error) {
+	set := 0
+	for _, value := range []bool{active, inactive, failed} {
+		if value {
+			set++
+		}
+	}
+	if set > 1 {
+		return "", fmt.Errorf("--active, --inactive, and --failed are mutually exclusive")
+	}
+	switch {
+	case inactive:
+		return condition.SystemdInactive, nil
+	case failed:
+		return condition.SystemdFailed, nil
+	default:
+		return condition.SystemdActive, nil
+	}
+}
+
+func parseLaunchdCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("launchd", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	loaded := false
+	running := false
+	fs.BoolVar(&loaded, "loaded", loaded, "wait until the service is loaded")
+	fs.BoolVar(&running, "running", running, "wait until the service is running")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("launchd requires exactly one LABEL")
+	}
+	state, err := parseLaunchdState(loaded, running)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewLaunchd(fs.Args()[0])
+	cond.State = state
+	return cond, nil
+}
+
+func parseLaunchdState(loaded, running bool) (condition.LaunchdState, error) {
+	if loaded && running {
+		return "", fmt.Errorf("--loaded and --running are mutually exclusive")
+	}
+	if loaded {
+		return condition.LaunchdLoaded, nil
+	}
+	return condition.LaunchdRunning, nil
+}
+
+func parsePIDFileCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("pidfile", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	running := false
+	stopped := false
+	fs.BoolVar(&running, "running", running, "wait until the pidfile points to a running process")
+	fs.BoolVar(&stopped, "stopped", stopped, "wait until the pidfile is absent or stale")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("pidfile requires exactly one PATH")
+	}
+	state, err := parseProcessState(running, stopped)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewPIDFile(fs.Args()[0])
+	cond.State = state
+	return cond, nil
+}
+
+func parseLockfileCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("lockfile", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	present := false
+	absent := false
+	olderThanText := ""
+	fs.BoolVar(&present, "present", present, "wait until the lockfile exists")
+	fs.BoolVar(&absent, "absent", absent, "wait until the lockfile is absent")
+	fs.StringVar(&olderThanText, "older-than", olderThanText, "wait until the lockfile exists and is at least this old")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("lockfile requires exactly one PATH")
+	}
+	state, err := parseLockfileState(present || olderThanText != "", absent)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewLockfile(fs.Args()[0])
+	cond.State = state
+	if olderThanText != "" {
+		olderThan, err := time.ParseDuration(olderThanText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --older-than: %w", err)
+		}
+		cond.OlderThan = olderThan
+	}
+	return cond, nil
+}
+
+func parseLockfileState(present, absent bool) (condition.LockfileState, error) {
+	if present && absent {
+		return "", fmt.Errorf("--present and --absent are mutually exclusive")
+	}
+	if present {
+		return condition.LockfilePresent, nil
+	}
+	return condition.LockfileAbsent, nil
+}
+
+func parsePermissionCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("permission", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	modeText := ""
+	uid := -1
+	gid := -1
+	userName := ""
+	groupName := ""
+	typeText := string(condition.PermissionAny)
+	fs.StringVar(&modeText, "mode", modeText, "required permission mode, such as 0644")
+	fs.IntVar(&uid, "uid", uid, "required numeric owner uid")
+	fs.IntVar(&gid, "gid", gid, "required numeric group gid")
+	fs.StringVar(&userName, "user", userName, "required owner user name")
+	fs.StringVar(&groupName, "group", groupName, "required group name")
+	fs.StringVar(&typeText, "type", typeText, "required path type: any, file, dir, or symlink")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("permission requires exactly one PATH")
+	}
+	cond := condition.NewPermission(fs.Args()[0])
+	if err := applyPermissionOptions(cond, modeText, uid, gid, userName, groupName, typeText); err != nil {
+		return nil, err
+	}
+	return cond, nil
+}
+
+func applyPermissionOptions(cond *condition.PermissionCondition, modeText string, uid, gid int, userName, groupName, typeText string) error {
+	if modeText != "" {
+		mode, err := strconv.ParseUint(modeText, 8, 32)
+		if err != nil {
+			return fmt.Errorf("invalid --mode %q: %w", modeText, err)
+		}
+		cond.Mode = os.FileMode(mode)
+	}
+	cond.Type = condition.PermissionPathType(strings.ToLower(typeText))
+	if err := applyOwnerOption(cond, uid, userName); err != nil {
+		return err
+	}
+	return applyGroupOption(cond, gid, groupName)
+}
+
+func applyOwnerOption(cond *condition.PermissionCondition, uid int, userName string) error {
+	if uid >= 0 && userName != "" {
+		return fmt.Errorf("--uid and --user are mutually exclusive")
+	}
+	if uid >= 0 {
+		cond.UID = &uid
+		return nil
+	}
+	if userName == "" {
+		return nil
+	}
+	parsed, err := strconv.Atoi(userName)
+	if err != nil {
+		return fmt.Errorf("--user must be a numeric uid")
+	}
+	cond.UID = &parsed
+	return nil
+}
+
+func applyGroupOption(cond *condition.PermissionCondition, gid int, groupName string) error {
+	if gid >= 0 && groupName != "" {
+		return fmt.Errorf("--gid and --group are mutually exclusive")
+	}
+	if gid >= 0 {
+		cond.GID = &gid
+		return nil
+	}
+	if groupName == "" {
+		return nil
+	}
+	parsed, err := strconv.Atoi(groupName)
+	if err != nil {
+		return fmt.Errorf("--group must be a numeric gid")
+	}
+	cond.GID = &parsed
+	return nil
+}
+
+func parseChecksumCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("checksum", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	algorithm := string(condition.ChecksumAuto)
+	expected := ""
+	fs.StringVar(&algorithm, "algorithm", algorithm, "hash algorithm: auto, sha1, sha256, or sha512")
+	fs.StringVar(&expected, "equals", expected, "expected hex checksum, optionally prefixed with algorithm:")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("checksum requires exactly one PATH")
+	}
+	cond := condition.NewChecksum(fs.Args()[0])
+	cond.Algorithm = condition.ChecksumAlgorithm(strings.ToLower(algorithm))
+	cond.Expected = expected
+	return cond, nil
+}
+
+func parseArchiveCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("archive", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	member := ""
+	matches := ""
+	format := string(condition.ArchiveAuto)
+	fs.StringVar(&member, "contains", member, "required member path inside the archive")
+	fs.StringVar(&matches, "matches", matches, "required archive member glob")
+	fs.StringVar(&format, "format", format, "archive format: auto, tar, tgz, or zip")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("archive requires exactly one PATH")
+	}
+	cond := condition.NewArchive(fs.Args()[0])
+	cond.Member = member
+	cond.Matches = matches
+	cond.Format = condition.ArchiveFormat(strings.ToLower(format))
+	return cond, nil
+}
+
+func parseCosignCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("cosign", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	blob := false
+	key := ""
+	signature := ""
+	certificate := ""
+	identity := ""
+	oidcIssuer := ""
+	fs.BoolVar(&blob, "blob", blob, "verify an artifact blob with cosign verify-blob")
+	fs.StringVar(&key, "key", key, "public key path or URI")
+	fs.StringVar(&signature, "signature", signature, "signature path for --blob")
+	fs.StringVar(&certificate, "certificate", certificate, "certificate path for keyless verification")
+	fs.StringVar(&identity, "certificate-identity", identity, "expected certificate identity for keyless verification")
+	fs.StringVar(&oidcIssuer, "certificate-oidc-issuer", oidcIssuer, "expected OIDC issuer for keyless verification")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("cosign requires exactly one TARGET")
+	}
+	cond := condition.NewCosign(fs.Args()[0])
+	cond.Key = key
+	cond.Signature = signature
+	cond.Certificate = certificate
+	cond.Identity = identity
+	cond.OIDCIssuer = oidcIssuer
+	if blob {
+		cond.Mode = condition.CosignBlob
+	}
+	return cond, nil
+}
+
+func parseNTPCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("ntp", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	maxOffsetText := ""
+	timeoutText := ""
+	fs.StringVar(&maxOffsetText, "max-offset", maxOffsetText, "maximum absolute clock offset, such as 250ms")
+	fs.StringVar(&timeoutText, "timeout", timeoutText, "per-attempt NTP query timeout")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("ntp requires exactly one HOST[:PORT]")
+	}
+	cond := condition.NewNTP(fs.Args()[0])
+	if maxOffsetText != "" {
+		maxOffset, err := time.ParseDuration(maxOffsetText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --max-offset: %w", err)
+		}
+		cond.MaxOffset = maxOffset
+	}
+	if timeoutText != "" {
+		timeout, err := time.ParseDuration(timeoutText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --timeout: %w", err)
+		}
+		cond.AttemptTimeout = timeout
+	}
+	return cond, nil
+}
+
+func parseICMPCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("icmp", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	count := 1
+	timeoutText := ""
+	fs.IntVar(&count, "count", count, "number of echo requests to send")
+	fs.StringVar(&timeoutText, "timeout", timeoutText, "per-attempt ping timeout")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("icmp requires exactly one HOST")
+	}
+	cond := condition.NewICMP(fs.Args()[0])
+	cond.Count = count
+	if timeoutText != "" {
+		timeout, err := time.ParseDuration(timeoutText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --timeout: %w", err)
+		}
+		cond.AttemptTimeout = timeout
+	}
+	return cond, nil
+}
+
+func parseGRPCCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("grpc", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	service := ""
+	status := string(condition.GRPCStatusServing)
+	useTLS := false
+	timeoutText := ""
+	fs.StringVar(&service, "service", service, "gRPC health service name")
+	fs.StringVar(&status, "status", status, "expected health status: SERVING, NOT_SERVING, UNKNOWN, or SERVICE_UNKNOWN")
+	fs.BoolVar(&useTLS, "tls", useTLS, "use TLS for host:port addresses")
+	fs.StringVar(&timeoutText, "timeout", timeoutText, "per-attempt gRPC health check timeout")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("grpc requires exactly one ADDRESS")
+	}
+	cond := condition.NewGRPC(fs.Args()[0])
+	cond.Service = service
+	cond.Status = condition.GRPCServingStatus(strings.ToUpper(status))
+	cond.UseTLS = useTLS
+	if timeoutText != "" {
+		timeout, err := time.ParseDuration(timeoutText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --timeout: %w", err)
+		}
+		cond.AttemptTimeout = timeout
+	}
+	return cond, nil
+}
+
+func parseWebSocketCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("websocket", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	send := ""
+	contains := ""
+	matches := ""
+	timeoutText := ""
+	headers := []string{}
+	fs.StringVar(&send, "send", send, "text message to send after connecting")
+	fs.StringVar(&contains, "contains", contains, "required text message substring")
+	fs.StringVar(&matches, "matches", matches, "required text message regex")
+	fs.StringVar(&timeoutText, "timeout", timeoutText, "per-attempt WebSocket timeout")
+	fs.StringArrayVar(&headers, "header", headers, "extra HTTP header, as Key: Value or Key=Value")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("websocket requires exactly one URL")
+	}
+	cond := condition.NewWebSocket(fs.Args()[0])
+	cond.Send = send
+	cond.Contains = contains
+	if matches != "" {
+		re, err := regexp.Compile(matches)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --matches regex: %w", err)
+		}
+		cond.Matches = re
+	}
+	parsedHeaders, err := parseHTTPHeaders(headers)
+	if err != nil {
+		return nil, err
+	}
+	cond.Headers = parsedHeaders
+	if timeoutText != "" {
+		timeout, err := time.ParseDuration(timeoutText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --timeout: %w", err)
+		}
+		cond.AttemptTimeout = timeout
+	}
 	return cond, nil
 }
 
@@ -1229,40 +2123,56 @@ func isValueForPreviousFlag(args []string, i int) bool {
 }
 
 var conditionValueFlags = map[string]bool{
-	"--method":           true,
-	"--status":           true,
-	"--header":           true,
-	"--body":             true,
-	"--body-file":        true,
-	"--body-contains":    true,
-	"--body-matches":     true,
-	"--jsonpath":         true,
-	"--type":             true,
-	"--resolver":         true,
-	"--contains":         true,
-	"--matches":          true,
-	"--exclude":          true,
-	"--tail":             true,
-	"--min-matches":      true,
-	"--equals":           true,
-	"--min-count":        true,
-	"--absent-mode":      true,
-	"--server":           true,
-	"--rcode":            true,
-	"--transport":        true,
-	"--udp-size":         true,
-	"--health":           true,
-	"--namespace":        true,
-	"--condition":        true,
-	"--for":              true,
-	"--selector":         true,
-	"--kubeconfig":       true,
-	"--exit-code":        true,
-	"--output-contains":  true,
-	"--cwd":              true,
-	"--env":              true,
-	"--max-output-bytes": true,
-	"--name":             true,
+	"--method":            true,
+	"--status":            true,
+	"--header":            true,
+	"--body":              true,
+	"--body-file":         true,
+	"--body-contains":     true,
+	"--body-matches":      true,
+	"--jsonpath":          true,
+	"--type":              true,
+	"--resolver":          true,
+	"--contains":          true,
+	"--matches":           true,
+	"--exclude":           true,
+	"--tail":              true,
+	"--min-matches":       true,
+	"--equals":            true,
+	"--min-count":         true,
+	"--max-count":         true,
+	"--absent-mode":       true,
+	"--server":            true,
+	"--rcode":             true,
+	"--transport":         true,
+	"--udp-size":          true,
+	"--servername":        true,
+	"--valid-for":         true,
+	"--ca-file":           true,
+	"--banner-contains":   true,
+	"--user":              true,
+	"--password":          true,
+	"--host-key-sha256":   true,
+	"--metadata":          true,
+	"--range":             true,
+	"--endpoint-url":      true,
+	"--region":            true,
+	"--access-key-id":     true,
+	"--secret-access-key": true,
+	"--session-token":     true,
+	"--health":            true,
+	"--pid":               true,
+	"--namespace":         true,
+	"--condition":         true,
+	"--for":               true,
+	"--selector":          true,
+	"--kubeconfig":        true,
+	"--exit-code":         true,
+	"--output-contains":   true,
+	"--cwd":               true,
+	"--env":               true,
+	"--max-output-bytes":  true,
+	"--name":              true,
 }
 
 func isExecCommandSeparator(current []string) bool {
@@ -1390,18 +2300,14 @@ func indexOf(items []string, want string) int {
 }
 
 func readFileLimit(path string, limit int64) ([]byte, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("file must be a regular file")
-	}
-	file, err := os.Open(path) // #nosec G304 -- body-file is an explicit user-selected CLI input.
+	file, info, err := openRegularFile(path)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = file.Close() }()
+	if info.Size() > limit {
+		return nil, fmt.Errorf("file exceeds %d bytes", limit)
+	}
 
 	data, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
@@ -1437,6 +2343,7 @@ Global flags:
 
 Condition flag:
   --name label             Human-readable condition label for text and JSON output
+                           For process, --name selects the executable instead.
 
 Doctor:
   waitfor doctor [--output text|json] [--require check]
@@ -1457,6 +2364,43 @@ HTTP:
 
 TCP:
   waitfor tcp HOST:PORT
+
+Unix Socket:
+  waitfor unix PATH
+
+Ports:
+  waitfor ports [flags] HOST
+  --range START-END        Port range to check
+  --any                    Succeed when any port in the range is open
+  --all                    Succeed when every port in the range is open (default)
+
+TLS:
+  waitfor tls [flags] HOST:PORT
+  --servername name        TLS server name for SNI and SAN verification (default: HOST)
+  --valid-for duration     Minimum remaining certificate validity, such as 720h or 30d
+  --ca-file path           PEM CA bundle to trust in addition to system roots
+
+SSH:
+  waitfor ssh [flags] HOST:PORT
+  --banner-contains text   Required SSH banner substring
+  --user name              SSH username for password auth handshake
+  --password value         SSH password for auth handshake
+  --host-key-sha256 fp     Required SSH host key SHA256 fingerprint, such as SHA256:...
+
+S3:
+  waitfor s3 [flags] s3://bucket[/key]
+  --exists                 Wait until the bucket or object exists (default)
+  --metadata Key=Value     Required object metadata from x-amz-meta-Key (repeatable)
+  --contains text          Required object content substring, capped at 10 MiB
+  --endpoint-url URL       S3-compatible endpoint URL, including MinIO, R2, and Ceph RGW;
+                           uses path-style requests by default
+  --virtual-hosted-style   Use bucket.endpoint host style with --endpoint-url
+  --region name            AWS region or S3-compatible signing region
+                           (default: AWS_REGION, AWS_DEFAULT_REGION, or us-east-1)
+  --access-key-id value    AWS access key id (default: AWS_ACCESS_KEY_ID)
+  --secret-access-key value
+                           AWS secret access key (default: AWS_SECRET_ACCESS_KEY)
+  --session-token value    AWS session token (default: AWS_SESSION_TOKEN)
 
 DNS:
   waitfor dns [flags] HOST
@@ -1480,6 +2424,60 @@ Docker:
   --status running         Container status: any|created|running|paused|restarting|removing|exited|dead
   --health healthy         Container health: healthy|unhealthy|starting|none
 
+Process:
+  waitfor process (--pid PID | --name NAME) [--running|--stopped]
+  --pid PID                Process ID to check
+  --name name              Process executable name to check
+  --running                Wait until the process is running (default)
+  --stopped                Wait until the process is stopped
+
+Systemd:
+  waitfor systemd UNIT [--active|--inactive|--failed]
+  --active                 Wait until the unit is active (default)
+  --inactive               Wait until the unit is inactive
+  --failed                 Wait until the unit is failed
+
+Launchd:
+  waitfor launchd LABEL [--running|--loaded]
+  --running                Wait until launchctl reports a non-zero pid (default)
+  --loaded                 Wait until launchctl can print the service
+
+PID file:
+  waitfor pidfile PATH [--running|--stopped]
+  --running                Wait until the pidfile points to a live process (default)
+  --stopped                Wait until the pidfile is absent or stale
+
+Lockfile:
+  waitfor lockfile PATH [--absent|--present] [--older-than DURATION]
+  --absent                 Wait until the lockfile is absent (default)
+  --present                Wait until the lockfile exists
+  --older-than duration    Wait until the lockfile exists and is at least this old
+
+Permission:
+  waitfor permission PATH [--mode 0644] [--uid UID|--user UID] [--gid GID|--group GID] [--type any|file|dir|symlink]
+
+Checksum:
+  waitfor checksum PATH --equals [ALGORITHM:]HEX [--algorithm auto|sha256|sha512|sha1]
+
+Archive:
+  waitfor archive PATH (--contains MEMBER | --matches GLOB) [--format auto|tar|tgz|zip]
+
+Cosign:
+  waitfor cosign IMAGE [--key KEY] [--certificate CERT] [--certificate-identity ID] [--certificate-oidc-issuer URL]
+  waitfor cosign --blob FILE --signature SIG [--key KEY] [--certificate CERT]
+
+NTP:
+  waitfor ntp HOST[:PORT] [--max-offset DURATION] [--timeout DURATION]
+
+ICMP:
+  waitfor icmp HOST [--count N] [--timeout DURATION]
+
+gRPC:
+  waitfor grpc ADDRESS [--service NAME] [--status SERVING|NOT_SERVING|UNKNOWN|SERVICE_UNKNOWN] [--tls] [--timeout DURATION]
+
+WebSocket:
+  waitfor websocket ws://HOST/PATH [--send TEXT] [--contains TEXT|--matches REGEX] [--header Key=Value] [--timeout DURATION]
+
 Exec:
   waitfor exec [flags] -- COMMAND [ARGS...]
   --exit-code 0            Expected exit code (default: 0)
@@ -1495,6 +2493,12 @@ File:
   --deleted                Wait until the file is deleted
   --nonempty               Wait until the file is non-empty
   --contains text          Required file content substring in first 10 MiB (only with --exists/--nonempty)
+
+Glob:
+  waitfor glob [flags] PATTERN
+  --min-count N            Minimum number of matching files (default: 1)
+  --max-count N            Maximum number of matching files (-1 disables)
+  --absent                 Wait until no files match
 
 Log:
   waitfor log [flags] PATH
@@ -1521,9 +2525,31 @@ Kubernetes:
 Examples:
   waitfor http https://api.example.com/health --status 200
   waitfor tcp localhost:5432
+  waitfor unix /var/run/docker.sock
+  waitfor ports localhost --range 8000-8010 --any
+  waitfor tls api.example.com:443 --valid-for 30d
+  waitfor ssh host.example.com:22
+  waitfor ssh host.example.com:22 --user deploy --password "$SSH_PASSWORD" --host-key-sha256 SHA256:...
+  waitfor s3 s3://bucket/path/ready.json --exists
+  waitfor s3 s3://bucket/path/ready.json --contains '"ready":true' --endpoint-url http://localhost:9000
+  waitfor s3 s3://bucket/path/ready.json --endpoint-url https://ceph-rgw.example.com --region default
   waitfor dns api.internal --type A
   waitfor docker postgres --health healthy
+  waitfor process --name postgres --running
+  waitfor systemd nginx.service --active
+  waitfor launchd system/com.example.agent --running
+  waitfor pidfile /var/run/app.pid --running
+  waitfor lockfile /var/run/app.lock --older-than 5m
+  waitfor permission /var/run/app.conf --mode 0640 --gid 1000 --type file
+  waitfor checksum dist/app.tar.gz --equals "sha256:$SHA256"
+  waitfor archive dist/app.tar.gz --matches 'bin/*'
+  waitfor cosign ghcr.io/org/app:v1.2.3 --certificate-identity "$IDENTITY"
+  waitfor ntp time.cloudflare.com --max-offset 250ms --timeout 1s
+  waitfor icmp 192.0.2.10 --count 3 --timeout 1s
+  waitfor grpc localhost:50051 --service grpc.health.v1.Health --tls --timeout 2s
+  waitfor websocket ws://localhost:8080/events --matches 'ready|ok' --header 'Authorization=Bearer ...'
   waitfor file /tmp/ready.flag --exists
+  waitfor glob '/tmp/jobs/*.done' --min-count 5
   waitfor log /var/log/app.log --contains "server ready"
   waitfor log /var/log/app.log --matches "ERROR:.*timeout" --from-start
   waitfor exec --output-contains Running -- kubectl get pod myapp

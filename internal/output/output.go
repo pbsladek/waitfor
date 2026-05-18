@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -15,6 +16,8 @@ const (
 	FormatText Format = "text"
 	FormatJSON Format = "json"
 )
+
+const maxTextFieldBytes = 512
 
 type Printer struct {
 	w       io.Writer
@@ -85,14 +88,14 @@ func (p *Printer) Attempt(event Attempt) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if event.Satisfied {
-		_, _ = fmt.Fprintf(p.w, "[waitfor] [ok] %s (attempt %d, %.1fs) %s\n", event.Name, event.Attempt, event.Elapsed.Seconds(), event.Detail)
+		_, _ = fmt.Fprintf(p.w, "[waitfor] [ok] %s (attempt %d, %.1fs) %s\n", sanitizeTextField(event.Name), event.Attempt, event.Elapsed.Seconds(), sanitizeTextField(event.Detail))
 		return
 	}
 	if event.Error != "" {
-		_, _ = fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", event.Name, event.Attempt, event.Error)
+		_, _ = fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", sanitizeTextField(event.Name), event.Attempt, sanitizeTextField(event.Error))
 		return
 	}
-	_, _ = fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", event.Name, event.Attempt, event.Detail)
+	_, _ = fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", sanitizeTextField(event.Name), event.Attempt, sanitizeTextField(event.Detail))
 }
 
 func (p *Printer) Outcome(report Report) error {
@@ -119,18 +122,29 @@ func (p *Printer) printUnsatisfiedConditions(conditions []ConditionReport) {
 		if rec.Satisfied {
 			continue
 		}
-		_, _ = fmt.Fprintf(p.w, "[waitfor] unsatisfied: %s%s\n", rec.Name, conditionIssue(rec))
+		_, _ = fmt.Fprintf(p.w, "[waitfor] unsatisfied: %s%s\n", sanitizeTextField(rec.Name), conditionIssue(rec))
 	}
 }
 
 func conditionIssue(rec ConditionReport) string {
 	if rec.LastError != "" {
-		return ": " + rec.LastError
+		return ": " + sanitizeTextField(rec.LastError)
 	}
 	if rec.Detail != "" {
-		return ": " + rec.Detail
+		return ": " + sanitizeTextField(rec.Detail)
 	}
 	return ""
+}
+
+func sanitizeTextField(value string) string {
+	if len(value) > maxTextFieldBytes {
+		value = value[:maxTextFieldBytes] + "...(truncated)"
+	}
+	quoted := strconv.QuoteToASCII(value)
+	if len(quoted) < 2 {
+		return quoted
+	}
+	return quoted[1 : len(quoted)-1]
 }
 
 func WriteJSON(w io.Writer, report Report) error {

@@ -3,9 +3,9 @@ package runner
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"math"
-	"math/big"
 	"reflect"
 	"strconv"
 	"sync"
@@ -592,11 +592,12 @@ func (s *pollSchedule) withJitter(interval time.Duration) time.Duration {
 }
 
 func randomUnitFloat() float64 {
-	n, err := cryptorand.Int(cryptorand.Reader, big.NewInt(1_000_000))
-	if err != nil {
+	var buf [8]byte
+	if _, err := cryptorand.Read(buf[:]); err != nil {
 		return 0.5
 	}
-	return float64(n.Int64()) / 1_000_000
+	n := binary.BigEndian.Uint64(buf[:]) >> 11
+	return float64(n) / (1 << 53)
 }
 
 func minDuration(a, b time.Duration) time.Duration {

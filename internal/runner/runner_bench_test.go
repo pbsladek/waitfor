@@ -112,3 +112,10 @@ func BenchmarkRunPerAttemptTimeout(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkRandomUnitFloat(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = randomUnitFloat()
+	}
+}

@@ -8,6 +8,7 @@ require (
 	codeberg.org/miekg/dns v0.6.73
 	github.com/spf13/cobra v1.10.1
 	github.com/spf13/pflag v1.0.9
+	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.19.0
 	k8s.io/apimachinery v0.35.0
 	k8s.io/client-go v0.35.0
@@ -31,7 +32,6 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect

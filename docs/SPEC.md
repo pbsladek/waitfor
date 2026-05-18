@@ -20,10 +20,18 @@ Runs have one final status:
 | ------- | ------- | ----- |
 | `http` | `waitfor http URL --status 2xx --body-contains ok` | HTTP request with configurable method, status, headers, body matchers, and TLS options. |
 | `tcp` | `waitfor tcp HOST:PORT` | Opens and immediately closes a TCP connection. |
+| `unix` | `waitfor unix /var/run/docker.sock` | Opens and immediately closes a Unix domain socket connection. |
+| `ports` | `waitfor ports localhost --range 8000-8010 --any` | Scans a port range and succeeds when any or all ports are open. |
+| `tls` | `waitfor tls api.example.com:443 --valid-for 30d` | Verifies certificate chain, SAN match, current validity, and minimum remaining validity. |
+| `ssh` | `waitfor ssh host.example.com:22` | Checks the SSH identification banner or completes a password-auth handshake. |
+| `s3` | `waitfor s3 s3://bucket/path/ready.json --exists` | Checks S3-compatible bucket existence, object existence, object metadata, and object content markers. |
 | `dns` | `waitfor dns HOST --type A --min-count 1` | System resolver by default; `--resolver wire` for protocol-level checks. |
 | `docker` | `waitfor docker CONTAINER --status running --health healthy` | Shells out to `docker inspect` for container state and health. |
+| `process` | `waitfor process --name postgres --running` | Checks local process state by PID or executable name. |
+| `systemd` | `waitfor systemd nginx.service --active` | Checks Linux systemd unit active state through `systemctl show`. |
 | `exec` | `waitfor exec --output-contains ok -- COMMAND [ARGS...]` | Runs a command and checks exit code, output substring, or JSON expression. |
 | `file` | `waitfor file PATH --exists` | Checks filesystem state: exists, deleted, or non-empty; optional substring match. |
+| `glob` | `waitfor glob '/tmp/jobs/*.done' --min-count 5` | Checks filesystem glob matches, absence, and match-count thresholds. |
 | `log` | `waitfor log PATH --contains "ready"` | Tails a file and matches lines using substring, regex, and/or JSON expression. Tracks byte offset across polls; detects log rotation. |
 | `k8s` | `waitfor k8s deployment/myapp --condition Available` | Checks Kubernetes resource conditions or arbitrary fields via JSONPath. |
 
@@ -45,9 +53,10 @@ exec-condition := exec [exec-flags] -- command [args ...]
 `exec` uses `--` to separate its own flags from the command being run. After
 that separator, tokens belong to the command until a later `-- BACKEND` or
 `-- guard BACKEND` condition separator is encountered. This means an exec
-command that passes a literal `-- http`, `-- tcp`, `-- dns`, `-- docker`,
-`-- exec`, `-- file`, `-- log`, `-- k8s`, or `-- guard BACKEND` token sequence
-cannot be followed unambiguously by a second waitfor condition.
+command that passes a literal `-- http`, `-- tcp`, `-- unix`, `-- ports`, `-- tls`,
+`-- ssh`, `-- s3`, `-- dns`, `-- docker`, `-- process`, `-- systemd`,
+`-- exec`, `-- file`, `-- glob`, `-- log`, `-- k8s`, or `-- guard BACKEND`
+token sequence cannot be followed unambiguously by a second waitfor condition.
 
 A `--` that appears immediately after a value-taking backend flag (such as
 `--contains`) is treated as that flag's value, not as a condition separator:
@@ -92,6 +101,33 @@ http URL
 
 tcp HOST:PORT
 
+unix PATH
+
+ports HOST
+      --range START-END
+      [--any | --all]               # default: --all
+
+tls HOST:PORT
+    [--servername NAME]             # default: HOST
+    [--valid-for DURATION]          # accepts Go durations and day suffixes such as 30d
+    [--ca-file PATH]                # PEM CA bundle added to system roots
+
+ssh HOST:PORT
+    [--banner-contains TEXT]        # optional substring match on the SSH identification banner
+    [--user USER --password PASS]   # require a successful password-auth handshake
+    [--host-key-sha256 FINGERPRINT] # optional host key pinning, SHA256:...
+
+s3 s3://BUCKET[/KEY]
+   [--exists]                       # default; bucket if no key, object if key is present
+   [--metadata KEY=VALUE ...]       # repeatable; checks x-amz-meta-KEY
+   [--contains TEXT]                # object body substring; first 10 MiB only
+   [--endpoint-url URL]             # S3-compatible endpoint; path-style by default
+   [--virtual-hosted-style]         # use bucket.endpoint host style with --endpoint-url
+   [--region REGION]                # default: AWS_REGION, AWS_DEFAULT_REGION, or us-east-1
+   [--access-key-id VALUE]          # default: AWS_ACCESS_KEY_ID
+   [--secret-access-key VALUE]      # default: AWS_SECRET_ACCESS_KEY
+   [--session-token VALUE]          # default: AWS_SESSION_TOKEN
+
 dns HOST
     [--type TYPE]                   # A|AAAA|CNAME|TXT|ANY|MX|SRV|NS|CAA|HTTPS|SVCB (default: A)
     [--resolver system|wire]        # default: system
@@ -123,6 +159,11 @@ file PATH
      [--deleted]
      [--nonempty]
      [--contains TEXT]              # substring match on file content; first 10 MiB only
+
+glob PATTERN
+     [--min-count N]                # default: 1
+     [--max-count N]                # -1 disables maximum checks (default)
+     [--absent]                     # wait until no files match
 
 log PATH
     (--contains TEXT | --matches REGEX | --jsonpath EXPR)  # at least one required
@@ -165,6 +206,62 @@ Status matchers accept an exact code (`200`, `404`) or a class (`2xx`, `5xx`).
 `HOST:PORT` format is validated at parse time. Each check opens a TCP
 connection with the attempt context and closes it immediately on success.
 Dial failures are retryable.
+
+### Unix Socket
+
+`PATH` is required and names a local Unix domain socket. Each check opens a
+Unix socket connection with the attempt context and closes it immediately on
+success. Missing socket paths, refused connections, and other dial failures are
+retryable because the owning service may still be starting. Blank paths are
+invalid configuration.
+
+### Ports
+
+`HOST` is required and `--range START-END` is validated at parse time. Each
+check scans the range in ascending order, opening a TCP connection with the
+attempt context and closing it immediately on success. `--all` is the default
+and requires every port in the range to be open. `--any` stops after the first
+open port. Dial failures are retryable.
+
+### SSH
+
+`HOST:PORT` format is validated at parse time. Without credentials, each check
+opens a TCP connection and reads the SSH identification string. The condition is
+satisfied when a line starting with `SSH-` is received; `--banner-contains`
+adds a substring matcher against that banner.
+
+When `--user` and `--password` are provided together, the condition performs an
+SSH password-auth handshake using the requested credentials. Authentication
+failures, handshake failures, banner mismatches, and network errors are
+retryable because a host may be starting up or policy may not be ready yet.
+Malformed addresses, partial credentials, and invalid host key fingerprints are
+invalid configuration. Host keys are not verified by default in readiness
+probes; set `--host-key-sha256 SHA256:...` to pin the expected server key.
+
+### S3
+
+Targets use `s3://bucket` for bucket existence or `s3://bucket/key` for object
+existence and object matchers. `--exists` is the default. `--metadata KEY=VALUE`
+checks object custom metadata through `x-amz-meta-KEY`; `--contains TEXT`
+downloads up to the first 10 MiB of the object and searches for the marker.
+
+By default, AWS S3 requests use virtual-hosted URLs of the form
+`https://bucket.s3.REGION.amazonaws.com/key`. `--endpoint-url` enables
+S3-compatible stores such as MinIO, R2, and Ceph RGW and uses path-style
+requests by default: `ENDPOINT/bucket/key`. Endpoint base paths are preserved,
+so a Ceph RGW endpoint such as `https://ceph-rgw.example.com/s3` becomes
+`https://ceph-rgw.example.com/s3/bucket/key`. Add `--virtual-hosted-style` when
+the endpoint expects the bucket in the host name.
+
+Credentials are optional so public buckets can be checked without signing. When
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (or matching flags) are present,
+requests are signed with AWS SigV4 for service `s3`; `AWS_SESSION_TOKEN` is
+included when present. `--endpoint-url` defaults from `AWS_ENDPOINT_URL_S3`,
+`AWS_ENDPOINT_URL`, or `S3_ENDPOINT_URL`, in that order. Network errors and
+non-2xx responses are retryable. Malformed targets, malformed endpoint URLs,
+object matchers without an object key, blank regions, and partial credentials
+are fatal for direct construction and argument errors or fatal condition errors
+through the CLI.
 
 ### DNS
 
@@ -261,6 +358,15 @@ first 10 MiB. It is valid only with `--exists` or `--nonempty`; combining it
 with `--deleted` is invalid. Content checks on non-regular files (directories,
 devices) are fatal. Missing paths, empty files, and substring mismatches are
 retryable.
+
+### Glob
+
+Patterns use Go `filepath.Glob` syntax and are evaluated once per check.
+Malformed patterns and invalid count thresholds are fatal for direct
+construction and argument errors through the CLI where possible. By default the
+condition succeeds when at least one path matches. `--min-count` raises that
+threshold, `--max-count` requires no more than the given number of matches, and
+`--absent` waits until zero paths match. Count mismatches are retryable.
 
 ### Log
 

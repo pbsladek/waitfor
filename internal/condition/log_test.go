@@ -217,7 +217,7 @@ func TestLogAndMatchersAllMustPass(t *testing.T) {
 
 // ── matched line in detail ────────────────────────────────────────────────────
 
-func TestLogMatchedLineAppearsInDetail(t *testing.T) {
+func TestLogMatchedLineDetailDoesNotExposeLine(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.log")
 	if err := os.WriteFile(path, []byte("service: ready at port 8080\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -230,14 +230,14 @@ func TestLogMatchedLineAppearsInDetail(t *testing.T) {
 	if result.Status != CheckSatisfied {
 		t.Fatalf("Status = %s, want satisfied", result.Status)
 	}
-	if !strings.Contains(result.Detail, "ready at port 8080") {
-		t.Fatalf("Detail = %q, want matched line content", result.Detail)
+	if result.Detail != "matched line" || strings.Contains(result.Detail, "ready at port 8080") {
+		t.Fatalf("Detail = %q, want generic matched-line detail", result.Detail)
 	}
 }
 
-func TestLogDetailTruncatesLongLines(t *testing.T) {
+func TestLogDetailDoesNotExposeLongLines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.log")
-	long := strings.Repeat("x", maxMatchDetail+50) + "\n"
+	long := strings.Repeat("x", 512) + "\n"
 	if err := os.WriteFile(path, []byte(long), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -249,8 +249,8 @@ func TestLogDetailTruncatesLongLines(t *testing.T) {
 	if result.Status != CheckSatisfied {
 		t.Fatalf("Status = %s, want satisfied", result.Status)
 	}
-	if !strings.HasSuffix(result.Detail, "...") {
-		t.Fatalf("Detail = %q, want truncated with ...", result.Detail)
+	if result.Detail != "matched line" {
+		t.Fatalf("Detail = %q, want generic matched-line detail", result.Detail)
 	}
 }
 

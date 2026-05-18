@@ -71,3 +71,11 @@ func TestMainHelperProcess(t *testing.T) {
 	}
 	os.Exit(2)
 }
+
+func TestSignalHelpers(t *testing.T) {
+	signals := terminationSignals()
+	if len(signals) != 2 {
+		t.Fatalf("signals = %v, want 2", signals)
+	}
+	ignoreBrokenPipe()
+}

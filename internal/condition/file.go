@@ -9,6 +9,7 @@ import (
 )
 
 const maxFileContainsBytes int64 = 10 * 1024 * 1024
+const fileContainsBufferSize = 32 * 1024
 
 type FileState string
 
@@ -107,22 +108,109 @@ func checkFileContent(ctx context.Context, path, contains string) Result {
 		return Unsatisfied("", ctx.Err())
 	default:
 	}
-	body, err := readFileContentLimit(path, maxFileContainsBytes)
+	found, err := streamFileContainsLimit(ctx, path, []byte(contains), maxFileContainsBytes)
 	if err != nil {
 		return Unsatisfied("", err)
 	}
-	if !bytes.Contains(body, []byte(contains)) {
+	if !found {
 		return Unsatisfied("file substring not found", fmt.Errorf("file does not contain required substring"))
 	}
 	return Satisfied("file contains required substring")
 }
 
-func readFileContentLimit(path string, limit int64) ([]byte, error) {
-	file, err := os.Open(path) // #nosec G304 -- file polling intentionally reads the user-selected target.
+func streamFileContainsLimit(ctx context.Context, path string, needle []byte, limit int64) (bool, error) {
+	file, _, err := openRegularFile(path)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
 	defer func() { _ = file.Close() }()
 
-	return io.ReadAll(io.LimitReader(file, limit))
+	return readerContainsLimit(ctx, file, needle, limit)
+}
+
+func readerContainsLimit(ctx context.Context, reader io.Reader, needle []byte, limit int64) (bool, error) {
+	if len(needle) == 0 {
+		return true, nil
+	}
+	buf := make([]byte, fileContainsBufferSize)
+	carry := []byte(nil)
+	remaining := limit
+	for remaining > 0 {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		n, err := reader.Read(buf[:limitedReadSize(len(buf), remaining)])
+		if n > 0 {
+			remaining -= int64(n)
+			found, nextCarry := containsWithCarry(carry, buf[:n], needle)
+			if found {
+				return true, nil
+			}
+			carry = nextCarry
+		}
+		if err != nil {
+			if err == io.EOF {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func limitedReadSize(size int, remaining int64) int {
+	if int64(size) > remaining {
+		return int(remaining)
+	}
+	return size
+}
+
+func containsWithCarry(carry, chunk, needle []byte) (bool, []byte) {
+	if bytes.Contains(chunk, needle) || boundaryContains(carry, chunk, needle) {
+		return true, nil
+	}
+	return false, trailingWindow(carry, chunk, len(needle)-1)
+}
+
+func boundaryContains(carry, chunk, needle []byte) bool {
+	if len(carry) == 0 || len(chunk) == 0 || len(needle) <= 1 {
+		return false
+	}
+	prefixLen := minInt(len(needle)-1, len(chunk))
+	window := make([]byte, 0, len(carry)+prefixLen)
+	window = append(window, carry...)
+	window = append(window, chunk[:prefixLen]...)
+	return bytes.Contains(window, needle)
+}
+
+func trailingWindow(carry, chunk []byte, n int) []byte {
+	if n <= 0 {
+		return nil
+	}
+	if len(chunk) >= n {
+		return trailingBytes(chunk, n)
+	}
+	window := make([]byte, 0, len(carry)+len(chunk))
+	window = append(window, carry...)
+	window = append(window, chunk...)
+	return trailingBytes(window, n)
+}
+
+func trailingBytes(data []byte, n int) []byte {
+	if n <= 0 {
+		return nil
+	}
+	if len(data) > n {
+		data = data[len(data)-n:]
+	}
+	out := make([]byte, len(data))
+	copy(out, data)
+	return out
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

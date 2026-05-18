@@ -11,6 +11,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/rest"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 func TestKubernetesConditionNamedCondition(t *testing.T) {
@@ -141,6 +143,22 @@ func TestKubernetesConditionDeploymentRolloutWaitsForOldReplicas(t *testing.T) {
 	}
 	if result.Detail != "total replicas after old replicas terminate 4, expected 3" {
 		t.Fatalf("detail = %q, want old replica detail", result.Detail)
+	}
+}
+
+func TestKubernetesConditionDeploymentRolloutProgressDeadlineFatal(t *testing.T) {
+	obj := rolloutDeployObject(3, 1, 1, 1, 2, 2)
+	obj.Object["status"].(map[string]any)["conditions"] = []any{
+		map[string]any{"type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded"},
+	}
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme(), obj)
+	cond := NewKubernetes("deployment/myapp")
+	cond.Getter = NewDynamicKubernetesGetterWithClient(client)
+	cond.WaitFor = "rollout"
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("status = %s, want fatal", result.Status)
 	}
 }
 
@@ -291,6 +309,22 @@ func TestKubernetesConditionSelectorNoMatches(t *testing.T) {
 	result := cond.Check(t.Context())
 	if result.Status != CheckUnsatisfied {
 		t.Fatalf("status = %s, want unsatisfied", result.Status)
+	}
+}
+
+func TestKubernetesConditionSelectorTooManyMatchesFatal(t *testing.T) {
+	items := make([]map[string]any, maxKubernetesSelectorItems+1)
+	for i := range items {
+		items[i] = podObject("True").Object
+	}
+	cond := NewKubernetes("pod")
+	cond.Getter = &listGetter{items: items}
+	cond.Selector = "app=api"
+	cond.WaitFor = "ready"
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("status = %s, want fatal", result.Status)
 	}
 }
 
@@ -583,6 +617,13 @@ func TestBuildKubeConfigBadPath(t *testing.T) {
 	_, err := buildKubeConfig("/nonexistent/kubeconfig.yaml")
 	if err == nil {
 		t.Fatal("buildKubeConfig('/nonexistent/kubeconfig.yaml') expected error, got nil")
+	}
+}
+
+func TestValidateKubeConfigRejectsExecProvider(t *testing.T) {
+	_, err := validateKubeConfig(&rest.Config{ExecProvider: &clientcmdapi.ExecConfig{Command: "evil"}}, nil)
+	if err == nil {
+		t.Fatal("validateKubeConfig() accepted exec credential plugin")
 	}
 }
 

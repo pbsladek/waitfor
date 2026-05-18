@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,6 +16,8 @@ import (
 	"github.com/pbsladek/wait-for/internal/output"
 	"github.com/spf13/pflag"
 )
+
+const maxDoctorCommandOutput = 64 * 1024
 
 type doctorStatus string
 
@@ -247,7 +248,7 @@ func runDoctorCommand(ctx context.Context, name string, args ...string) (string,
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- doctor runs fixed diagnostics, not user-supplied commands.
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr doctorLimitedBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
@@ -263,6 +264,34 @@ func runDoctorCommand(ctx context.Context, name string, args ...string) (string,
 		return "", fmt.Errorf("%s: %s", name, detail)
 	}
 	return out, nil
+}
+
+type doctorLimitedBuffer struct {
+	data      strings.Builder
+	truncated bool
+}
+
+func (b *doctorLimitedBuffer) Write(p []byte) (int, error) {
+	remaining := maxDoctorCommandOutput - b.data.Len()
+	if remaining <= 0 {
+		b.truncated = true
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		b.truncated = true
+		_, _ = b.data.Write(p[:remaining])
+		return len(p), nil
+	}
+	_, _ = b.data.Write(p)
+	return len(p), nil
+}
+
+func (b *doctorLimitedBuffer) String() string {
+	out := b.data.String()
+	if b.truncated {
+		return out + "...(truncated)"
+	}
+	return out
 }
 
 func writeDoctorReport(w io.Writer, format output.Format, report doctorReport) error {

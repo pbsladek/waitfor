@@ -138,6 +138,13 @@ func TestDockerConditionEmptyContainerFatal(t *testing.T) {
 	}
 }
 
+func TestDockerConditionOptionLikeContainerFatal(t *testing.T) {
+	result := NewDocker("--help").Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("status = %s, want fatal", result.Status)
+	}
+}
+
 func TestDockerConditionInvalidDirectConfigFatal(t *testing.T) {
 	tests := []struct {
 		name  string

@@ -38,6 +38,9 @@ func (c *DockerCondition) Check(ctx context.Context) Result {
 	if strings.TrimSpace(c.Container) == "" {
 		return Fatal(fmt.Errorf("docker container is required"))
 	}
+	if err := rejectOptionLike("docker container", c.Container); err != nil {
+		return Fatal(err)
+	}
 	if !validDockerStatus(c.status()) {
 		return Fatal(fmt.Errorf("invalid docker status %q", c.Status))
 	}
@@ -64,13 +67,15 @@ func (c *DockerCondition) inspect(ctx context.Context) (DockerState, error) {
 	if c.Inspect != nil {
 		return c.Inspect(ctx, c.Container)
 	}
-	cmd := exec.CommandContext(ctx, "docker", "inspect", "--type", "container", "--format", "{{json .State}}", c.Container) // #nosec G204 -- Docker backend intentionally shells out to docker inspect with the requested container.
-	out, err := cmd.CombinedOutput()
+	out, err := runLimitedCommand(ctx, "docker", "inspect", "--type", "container", "--format", "{{json .State}}", "--", c.Container)
 	if err != nil {
-		return DockerState{}, classifyDockerInspectError(err, string(out))
+		if ctx.Err() != nil {
+			return DockerState{}, ctx.Err()
+		}
+		return DockerState{}, classifyDockerInspectError(err, string(out.combined(maxExternalCommandOutputBytes)))
 	}
 	var state DockerState
-	if err := json.Unmarshal(out, &state); err != nil {
+	if err := json.Unmarshal(out.stdout, &state); err != nil {
 		return DockerState{}, fmt.Errorf("parse docker inspect output: %w", err)
 	}
 	return state, nil

@@ -278,7 +278,145 @@ waitfor --timeout 30m --interval 30s \
 
 ---
 
-## 15. Send an email alert when a log pattern is detected
+## 15. Check a TLS certificate before continuing
+
+Wait until a TLS endpoint presents a certificate that verifies against trusted
+roots, matches the requested server name, is currently valid, and will remain
+valid for at least 30 days:
+
+```bash
+waitfor tls api.example.com:443 --valid-for 30d
+```
+
+Use `--servername` when the TCP address and certificate name differ, and
+`--ca-file` for a private CA bundle:
+
+```bash
+waitfor tls 10.0.0.12:8443 \
+  --servername api.internal.example.com \
+  --ca-file /etc/pki/internal-ca.pem \
+  --valid-for 168h
+```
+
+---
+
+## 16. Wait for an SSH service
+
+Wait until an SSH server sends a valid identification banner:
+
+```bash
+waitfor ssh host.example.com:22
+```
+
+Require a specific banner marker:
+
+```bash
+waitfor ssh host.example.com:22 --banner-contains OpenSSH
+```
+
+Require a successful password-auth handshake before continuing:
+
+```bash
+waitfor ssh host.example.com:22 \
+  --user deploy \
+  --password "$SSH_PASSWORD"
+```
+
+Pin the expected host key fingerprint when the probe should verify host
+identity:
+
+```bash
+waitfor ssh host.example.com:22 \
+  --user deploy \
+  --password "$SSH_PASSWORD" \
+  --host-key-sha256 SHA256:abc123...
+```
+
+---
+
+## 17. Wait for an S3 object marker
+
+Wait until an S3 object exists before continuing:
+
+```bash
+waitfor s3 s3://bucket/path/ready.json --exists
+```
+
+Require custom metadata and a marker in the object body:
+
+```bash
+waitfor s3 s3://bucket/path/ready.json \
+  --metadata version=42 \
+  --contains '"ready":true'
+```
+
+Use `--endpoint-url` for S3-compatible object storage such as MinIO, R2, or
+Ceph RGW. Endpoint overrides use path-style requests by default:
+
+```bash
+waitfor s3 s3://bucket/path/ready.json \
+  --endpoint-url http://localhost:9000 \
+  --region us-east-1
+```
+
+For Ceph RGW, use the RGW S3 endpoint and the region configured for the zone,
+often `default`:
+
+```bash
+waitfor s3 s3://bucket/path/ready.json \
+  --endpoint-url https://ceph-rgw.example.com \
+  --region default
+```
+
+Credentials come from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
+`AWS_SESSION_TOKEN`, or from the matching flags. The endpoint can also come
+from `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`, or `S3_ENDPOINT_URL`.
+
+---
+
+## 18. Wait for a filesystem glob threshold
+
+Wait until a batch of marker files exists:
+
+```bash
+waitfor glob '/tmp/jobs/*.done' --min-count 5
+```
+
+Wait until temporary files have disappeared before removing a workspace:
+
+```bash
+waitfor glob '/tmp/jobs/*.tmp' --absent && rm -rf /tmp/jobs
+```
+
+Use `--max-count` when a workflow should continue only after a queue has drained
+below a threshold:
+
+```bash
+waitfor glob '/var/spool/app/*.pending' --max-count 2
+```
+
+---
+
+## 19. Wait for a port range
+
+Wait until any port in a handoff range is open:
+
+```bash
+waitfor ports localhost --range 8000-8010 --any
+```
+
+Require every port in the range when a worker pool exposes a fixed set of
+listeners:
+
+```bash
+waitfor ports worker.internal --range 9100-9104 --all
+```
+
+`--all` is the default, so the second example can omit it.
+
+---
+
+## 20. Send an email alert when a log pattern is detected
 
 Combine `waitfor` with `mail` to alert on the first error:
 
@@ -304,7 +442,7 @@ printf "Matched line:\n%s\n" "$detail" | \
 
 ---
 
-## 16. Kubernetes init container
+## 21. Kubernetes init container
 
 Block a pod from starting its main container until the database migration job
 completes:
@@ -339,7 +477,7 @@ args:
 
 ---
 
-## 17. Wait for a Kubernetes rollout to finish
+## 22. Wait for a Kubernetes rollout to finish
 
 ```bash
 waitfor --timeout 10m \
@@ -359,7 +497,7 @@ waitfor k8s deployment/api \
 
 ---
 
-## 18. Docker Compose startup gate
+## 23. Docker Compose startup gate
 
 Wait for every service to be healthy before running smoke tests:
 
@@ -375,7 +513,39 @@ waitfor --timeout 3m --interval 2s \
 
 ---
 
-## 19. Run a command repeatedly until it succeeds
+## 24. Wait for local process state
+
+Wait for a development database process by executable name:
+
+```bash
+waitfor process --name postgres --running
+```
+
+Wait for a known PID to exit before continuing a cleanup script:
+
+```bash
+waitfor --timeout 30s process --pid "$worker_pid" --stopped
+```
+
+---
+
+## 25. Wait for a systemd unit
+
+On Linux hosts with systemd, wait until a service reports active:
+
+```bash
+waitfor systemd nginx.service --active
+```
+
+The backend also supports inactive and failed waits:
+
+```bash
+waitfor systemd batch-job.service --failed
+```
+
+---
+
+## 26. Run a command repeatedly until it succeeds
 
 Wait until `kubectl rollout status` returns exit code `0`:
 
@@ -396,7 +566,7 @@ waitfor --timeout 5m \
 
 ---
 
-## 20. Parse final JSON output with jq
+## 27. Parse final JSON output with jq
 
 In JSON mode `waitfor` writes one final JSON document to stdout. Human progress
 stays off stdout, so the result can be piped directly to `jq`:
@@ -409,7 +579,7 @@ waitfor --output json --interval 1s \
 
 ---
 
-## 21. CI pipeline gate with structured failure reporting
+## 28. CI pipeline gate with structured failure reporting
 
 In a CI script, emit JSON on failure so the pipeline can parse which condition
 timed out:
@@ -438,7 +608,7 @@ Example failure output on stderr:
 
 ---
 
-## 22. Wait for a lock file to be released
+## 29. Wait for a lock file to be released
 
 Block until another process deletes its lock file before proceeding:
 
@@ -451,7 +621,7 @@ waitfor --timeout 10m file /var/run/deploy.lock --deleted && \
 
 ---
 
-## 23. Log-driven deployment promotion
+## 30. Log-driven deployment promotion
 
 After deploying a canary, wait until the canary log shows no errors in the
 first 50 lines of output, using `--tail` to limit the scan window:
@@ -478,7 +648,7 @@ kubectl set image deployment/api api=my-image:v2 -n production
 
 ---
 
-## 24. Send a Slack message when a long job completes
+## 31. Send a Slack message when a long job completes
 
 ```bash
 waitfor --timeout 6h \
@@ -505,7 +675,7 @@ curl -s -X POST "$SLACK_WEBHOOK" \
 
 ---
 
-## 25. Use `--attempt-timeout` for slow health endpoints
+## 32. Use `--attempt-timeout` for slow health endpoints
 
 Some services take a long time to respond during startup. Set a per-attempt
 deadline shorter than the global timeout so a hung request does not burn the
@@ -524,7 +694,7 @@ and retried after the interval. The global 5-minute deadline still applies.
 
 ---
 
-## 26. Fail fast when a guard condition appears
+## 33. Fail fast when a guard condition appears
 
 Wait for an API, but stop immediately if startup logs show a fatal error:
 
@@ -539,7 +709,7 @@ if it matches, `waitfor` exits `3` instead of waiting for the full timeout.
 
 ---
 
-## 27. Require stable readiness before continuing
+## 34. Require stable readiness before continuing
 
 Avoid starting the next step on a one-off successful probe:
 
@@ -553,7 +723,7 @@ successful for the stable duration before the run exits `0`.
 
 ---
 
-## 28. Wait for Kubernetes rollouts and selected pods
+## 35. Wait for Kubernetes rollouts and selected pods
 
 Use typed waits instead of writing JSON expressions for common Kubernetes
 states:
@@ -566,6 +736,20 @@ waitfor k8s job/migrate --for complete --namespace production
 
 `--for complete` treats a failed job as fatal. `--selector` switches the
 resource argument from `kind/name` to plain `kind`.
+
+---
+
+## 36. Wait for a Unix socket
+
+Wait until a local Unix domain socket accepts connections:
+
+```bash
+waitfor unix /var/run/docker.sock
+```
+
+This is useful for local daemons that expose readiness over a socket path
+instead of a TCP port. Missing paths and refused connections are retried until
+the global timeout expires.
 
 ---
 

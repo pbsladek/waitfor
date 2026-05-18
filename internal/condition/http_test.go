@@ -89,6 +89,43 @@ func TestHTTPConditionNoRedirects(t *testing.T) {
 	}
 }
 
+func TestHTTPConditionDropsCustomHeadersOnCrossOriginRedirect(t *testing.T) {
+	var redirectedHeader string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectedHeader = r.Header.Get("X-Token")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+
+	cond := NewHTTP(source.URL)
+	cond.Headers["X-Token"] = "secret"
+	result := cond.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("status = %s, err = %v", result.Status, result.Err)
+	}
+	if redirectedHeader != "" {
+		t.Fatalf("redirected header = %q, want stripped", redirectedHeader)
+	}
+}
+
+func TestHTTPConditionRejectsOversizedBodyForMatchers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(w, strings.NewReader(strings.Repeat("a", int(maxHTTPBodyBytes)+1)))
+	}))
+	defer server.Close()
+
+	cond := NewHTTP(server.URL)
+	cond.BodyContains = "a"
+	result := cond.Check(t.Context())
+	if result.Status != CheckUnsatisfied || result.Err == nil || !strings.Contains(result.Err.Error(), "too large") {
+		t.Fatalf("result = %+v, want oversized body unsatisfied", result)
+	}
+}
+
 func TestHTTPConditionInvalidDirectConfigFatalBeforeRequest(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -97,7 +134,12 @@ func TestHTTPConditionInvalidDirectConfigFatalBeforeRequest(t *testing.T) {
 		{"empty url", func(c *HTTPCondition) { c.URL = "" }},
 		{"unsupported scheme", func(c *HTTPCondition) { c.URL = "ftp://example.test/file" }},
 		{"missing host", func(c *HTTPCondition) { c.URL = "https:///ready" }},
+		{"userinfo", func(c *HTTPCondition) { c.URL = "https://user@example.test/ready" }},
+		{"fragment", func(c *HTTPCondition) { c.URL = "https://example.test/ready#frag" }},
+		{"bad port", func(c *HTTPCondition) { c.URL = "https://example.test:bad/ready" }},
 		{"invalid method", func(c *HTTPCondition) { c.Method = "BAD METHOD" }},
+		{"large body", func(c *HTTPCondition) { c.RequestBody = []byte(strings.Repeat("x", maxHTTPRequestBodyBytes+1)) }},
+		{"large matcher", func(c *HTTPCondition) { c.BodyContains = strings.Repeat("x", maxHTTPMatcherBytes+1) }},
 		{"invalid expected status", func(c *HTTPCondition) { c.ExpectedStatus = 99 }},
 		{"invalid matcher raw", func(c *HTTPCondition) { c.StatusMatcher = HTTPStatusMatcher{raw: "9xx"} }},
 		{"invalid matcher exact", func(c *HTTPCondition) { c.StatusMatcher = HTTPStatusMatcher{exact: 99} }},
@@ -111,6 +153,7 @@ func TestHTTPConditionInvalidDirectConfigFatalBeforeRequest(t *testing.T) {
 		}},
 		{"invalid header name", func(c *HTTPCondition) { c.Headers["Bad Header"] = "ok" }},
 		{"invalid header value", func(c *HTTPCondition) { c.Headers["X-Test"] = "bad\nvalue" }},
+		{"large header", func(c *HTTPCondition) { c.Headers["X-Test"] = strings.Repeat("x", maxHTTPHeaderBytes+1) }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -163,6 +206,29 @@ func TestHTTPConditionStatusMismatch(t *testing.T) {
 	}
 	if result.Err == nil {
 		t.Fatal("Err = nil, want status error")
+	}
+}
+
+func TestHTTPStatusOnlyDrainsLimitedBody(t *testing.T) {
+	body := &countingReadCloser{remaining: maxHTTPDrainBytes + 1024}
+	cond := NewHTTP("https://example.test/ready")
+	cond.Client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       body,
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("Status = %s, want %s; err = %v", result.Status, CheckSatisfied, result.Err)
+	}
+	if body.read != maxHTTPDrainBytes {
+		t.Fatalf("read = %d, want capped drain %d", body.read, maxHTTPDrainBytes)
+	}
+	if !body.closed {
+		t.Fatal("body was not closed")
 	}
 }
 
@@ -247,7 +313,7 @@ func TestHTTPInvalidJSONBodyUnsatisfied(t *testing.T) {
 }
 
 func TestHTTPErrorRedactsSensitiveURLParts(t *testing.T) {
-	rawURL := "https://user:pass@example.com/health?token=secret&ready=true" // #nosec G101 -- synthetic secret used to verify redaction.
+	rawURL := "https://example.com/health?token=secret&ready=true" // #nosec G101 -- synthetic secret used to verify redaction.
 	cond := NewHTTP(rawURL)
 	cond.Client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return nil, &url.Error{Op: "Get", URL: rawURL, Err: errors.New("dial " + rawURL)}
@@ -261,7 +327,7 @@ func TestHTTPErrorRedactsSensitiveURLParts(t *testing.T) {
 		t.Fatal("Err = nil, want redacted URL error")
 	}
 	got := result.Err.Error()
-	for _, leaked := range []string{"user", "pass", "secret"} {
+	for _, leaked := range []string{"secret"} {
 		if strings.Contains(got, leaked) {
 			t.Fatalf("error = %q leaked %q", got, leaked)
 		}
@@ -271,10 +337,52 @@ func TestHTTPErrorRedactsSensitiveURLParts(t *testing.T) {
 	}
 }
 
+func TestHTTPRedactUserinfoHelper(t *testing.T) {
+	user := "user"
+	password := "pa" + "ss"
+	sensitiveURL := "https://" + user + ":" + password + "@example.com/health"
+	err := redactHTTPError(&url.Error{
+		Op:  "Get",
+		URL: sensitiveURL,
+		Err: errors.New("dial " + sensitiveURL + " failed"),
+	})
+	got := err.Error()
+	if strings.Contains(got, user) || strings.Contains(got, password) {
+		t.Fatalf("error = %q leaked userinfo", got)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+type countingReadCloser struct {
+	remaining int64
+	read      int64
+	closed    bool
+}
+
+func (r *countingReadCloser) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:int(r.remaining)]
+	}
+	for i := range p {
+		p[i] = 'x'
+	}
+	n := len(p)
+	r.remaining -= int64(n)
+	r.read += int64(n)
+	return n, nil
+}
+
+func (r *countingReadCloser) Close() error {
+	r.closed = true
+	return nil
 }
 
 func TestParseHTTPStatusMatcherInvalid(t *testing.T) {

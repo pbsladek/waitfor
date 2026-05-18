@@ -10,6 +10,7 @@ import (
 	"time"
 
 	wdns "codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsutil"
 )
 
 type DNSRecordType string
@@ -157,6 +158,16 @@ func (c *DNSCondition) validateResolverOptions() error {
 	if c.RCode != "" && !ValidDNSRCode(c.RCode) {
 		return fmt.Errorf("unsupported dns rcode %q", c.RCode)
 	}
+	if err := c.validateWireResolverOptions(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *DNSCondition) validateWireResolverOptions() error {
+	if c.UDPSize > 0 && c.UDPSize < 512 {
+		return fmt.Errorf("dns udp size must be at least 512")
+	}
 	if c.resolverMode() == DNSResolverWire && c.Server == "" && c.WireExchange == nil {
 		return fmt.Errorf("dns wire resolver requires a server")
 	}
@@ -213,10 +224,10 @@ func (c *DNSCondition) rcodeOnly() bool {
 }
 
 func (c *DNSCondition) checkRCode(response dnsLookupResponse) (Result, bool) {
-	if c.RCode == "" || strings.EqualFold(response.RCode, c.RCode) {
+	if c.RCode == "" || strings.EqualFold(response.RCode, strings.TrimSpace(c.RCode)) {
 		return Result{}, false
 	}
-	detail := fmt.Sprintf("rcode %s, expected %s", response.RCode, strings.ToUpper(c.RCode))
+	detail := fmt.Sprintf("rcode %s, expected %s", response.RCode, strings.ToUpper(strings.TrimSpace(c.RCode)))
 	return Unsatisfied(detail, errors.New(detail)), true
 }
 
@@ -286,24 +297,35 @@ func (c *DNSCondition) lookupSystemValues(ctx context.Context) ([]string, error)
 }
 
 func (c *DNSCondition) lookupWire(ctx context.Context) (dnsLookupResponse, error) {
-	msg := wdns.NewMsg(c.Host, c.wireType())
+	msg := wdns.NewMsg(dnsutil.Fqdn(c.Host), c.wireType())
 	if msg == nil {
 		return dnsLookupResponse{}, fmt.Errorf("unsupported dns record type %q", c.RecordType)
 	}
 	if c.EDNS0 || c.UDPSize > 0 {
 		msg.UDPSize = c.udpSize()
 	}
-	response, err := c.exchangeWireResponse(ctx, msg, c.transport())
+	response, err := c.exchangeWireWithQuestion(ctx, msg, c.transport())
 	if err != nil {
 		return dnsLookupResponse{}, err
 	}
 	if response.Truncated && c.transport() == DNSTransportUDP {
-		response, err = c.exchangeWireResponse(ctx, msg, DNSTransportTCP)
+		response, err = c.exchangeWireWithQuestion(ctx, msg, DNSTransportTCP)
 		if err != nil {
 			return dnsLookupResponse{}, err
 		}
 	}
 	return c.responseFromWire(response), nil
+}
+
+func (c *DNSCondition) exchangeWireWithQuestion(ctx context.Context, msg *wdns.Msg, transport DNSTransport) (*wdns.Msg, error) {
+	response, err := c.exchangeWireResponse(ctx, msg, transport)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validateWireQuestion(response); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 func (c *DNSCondition) exchangeWireResponse(ctx context.Context, msg *wdns.Msg, transport DNSTransport) (*wdns.Msg, error) {
@@ -325,8 +347,25 @@ func (c *DNSCondition) exchangeWire(ctx context.Context, msg *wdns.Msg, network 
 	return response, err
 }
 
+func (c *DNSCondition) validateWireQuestion(msg *wdns.Msg) error {
+	if len(msg.Question) != 1 {
+		return fmt.Errorf("dns response question mismatch")
+	}
+	question := msg.Question[0]
+	if dnsCanonicalName(question.Header().Name) != dnsCanonicalName(c.Host) {
+		return fmt.Errorf("dns response question name mismatch")
+	}
+	if wdns.RRToType(question) != c.wireType() {
+		return fmt.Errorf("dns response question type mismatch")
+	}
+	if question.Header().Class != wdns.ClassINET {
+		return fmt.Errorf("dns response question class mismatch")
+	}
+	return nil
+}
+
 func (c *DNSCondition) responseFromWire(msg *wdns.Msg) dnsLookupResponse {
-	values := dnsValuesFromRRs(msg.Answer, c.recordType())
+	values := dnsValuesFromRRs(msg.Answer, c.recordType(), c.Host)
 	return dnsLookupResponse{
 		Values:    values,
 		RCode:     dnsRCodeString(msg.Rcode),
@@ -336,15 +375,43 @@ func (c *DNSCondition) responseFromWire(msg *wdns.Msg) dnsLookupResponse {
 	}
 }
 
-func dnsValuesFromRRs(records []wdns.RR, recordType DNSRecordType) []string {
+func dnsValuesFromRRs(records []wdns.RR, recordType DNSRecordType, host string) []string {
+	owners := dnsAcceptedOwners(records, host)
 	values := make([]string, 0, len(records))
 	for _, rr := range records {
+		if !owners[dnsCanonicalName(rr.Header().Name)] {
+			continue
+		}
 		if !dnsRRMatchesType(rr, recordType) {
 			continue
 		}
 		values = append(values, dnsValueFromRR(rr))
 	}
 	return values
+}
+
+func dnsAcceptedOwners(records []wdns.RR, host string) map[string]bool {
+	owners := map[string]bool{dnsCanonicalName(host): true}
+	changed := true
+	for changed {
+		changed = false
+		for _, rr := range records {
+			cname, ok := rr.(*wdns.CNAME)
+			if !ok || !owners[dnsCanonicalName(cname.Header().Name)] {
+				continue
+			}
+			target := dnsCanonicalName(cname.Target)
+			if !owners[target] {
+				owners[target] = true
+				changed = true
+			}
+		}
+	}
+	return owners
+}
+
+func dnsCanonicalName(name string) string {
+	return strings.ToLower(dnsutil.Fqdn(name))
 }
 
 func dnsRRMatchesType(rr wdns.RR, recordType DNSRecordType) bool {
@@ -705,6 +772,9 @@ func validateDNSLabels(labels []string) error {
 }
 
 func validDNSLabel(label string) bool {
+	if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+		return false
+	}
 	for i := 0; i < len(label); i++ {
 		if !validDNSLabelChar(label[i]) {
 			return false

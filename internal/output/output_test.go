@@ -214,6 +214,19 @@ func TestPrinterTextAttemptUnsatisfiedDetailOnly(t *testing.T) {
 	}
 }
 
+func TestPrinterTextEscapesControlCharacters(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewPrinter(&buf, FormatText, true)
+	p.Attempt(Attempt{Name: "bad\nname", Attempt: 1, Satisfied: false, Error: "\x1b[31mboom"})
+	got := buf.String()
+	if strings.Contains(got, "bad\nname") || strings.Contains(got, "\x1b") {
+		t.Fatalf("output %q contains raw control characters", got)
+	}
+	if !strings.Contains(got, `bad\nname`) || !strings.Contains(got, `\x1b`) {
+		t.Fatalf("output %q does not contain escaped controls", got)
+	}
+}
+
 func TestPrinterJSONOutcomeWritesJSON(t *testing.T) {
 	var buf bytes.Buffer
 	p := NewPrinter(&buf, FormatJSON, false)

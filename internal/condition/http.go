@@ -43,6 +43,15 @@ type HTTPStatusMatcher struct {
 
 var userinfoInURLPattern = regexp.MustCompile(`://[^/\s"@]+@`)
 
+const (
+	maxHTTPBodyBytes        int64 = 10 * 1024 * 1024
+	maxHTTPDrainBytes       int64 = 512 * 1024
+	maxHTTPRequestBodyBytes       = 10 * 1024 * 1024
+	maxHTTPMatcherBytes           = 1 * 1024 * 1024
+	maxHTTPHeaderCount            = 64
+	maxHTTPHeaderBytes            = 32 * 1024
+)
+
 func ParseHTTPStatusMatcher(raw string) (HTTPStatusMatcher, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -116,10 +125,7 @@ func (c *HTTPCondition) Check(ctx context.Context) Result {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Always read the full body (capped at 10 MB) so the connection is
-	// returned to the keep-alive pool. Closing without draining discards
-	// the connection on every poll cycle.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	body, err := c.responseBodyForCheck(resp.Body)
 	if err != nil {
 		return Unsatisfied("", err)
 	}
@@ -132,6 +138,33 @@ func (c *HTTPCondition) Check(ctx context.Context) Result {
 	return c.checkResponseBody(body, resp.StatusCode)
 }
 
+func (c *HTTPCondition) responseBodyForCheck(body io.Reader) ([]byte, error) {
+	if c.needsResponseBody() {
+		return readHTTPBody(body)
+	}
+	return nil, drainHTTPBody(body)
+}
+
+func (c *HTTPCondition) needsResponseBody() bool {
+	return c.BodyContains != "" || c.BodyRegex != nil || c.BodyJSONExpr != nil
+}
+
+func readHTTPBody(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxHTTPBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxHTTPBodyBytes {
+		return nil, fmt.Errorf("HTTP response body too large")
+	}
+	return data, nil
+}
+
+func drainHTTPBody(body io.Reader) error {
+	_, err := io.Copy(io.Discard, io.LimitReader(body, maxHTTPDrainBytes))
+	return err
+}
+
 func validateHTTPConfig(c *HTTPCondition) error {
 	if err := validateHTTPURL(c.URL); err != nil {
 		return err
@@ -142,6 +175,12 @@ func validateHTTPConfig(c *HTTPCondition) error {
 	if err := validateHTTPStatusConfig(c); err != nil {
 		return err
 	}
+	if len(c.RequestBody) > maxHTTPRequestBodyBytes {
+		return fmt.Errorf("HTTP request body is too large")
+	}
+	if len(c.BodyContains) > maxHTTPMatcherBytes {
+		return fmt.Errorf("HTTP body substring matcher is too large")
+	}
 	return validateHTTPHeaders(c.Headers)
 }
 
@@ -150,8 +189,35 @@ func validateHTTPURL(rawURL string) error {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return fmt.Errorf("invalid HTTP URL")
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+	if err := validateHTTPScheme(parsed.Scheme); err != nil {
+		return err
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("HTTP URL userinfo is not allowed")
+	}
+	if parsed.Fragment != "" {
+		return fmt.Errorf("HTTP URL fragment is not allowed")
+	}
+	return validateHTTPAuthority(parsed)
+}
+
+func validateHTTPScheme(scheme string) error {
+	if scheme != "http" && scheme != "https" {
 		return fmt.Errorf("HTTP URL must use http or https")
+	}
+	return nil
+}
+
+func validateHTTPAuthority(parsed *url.URL) error {
+	if parsed.Hostname() == "" || containsSpaceOrControl(parsed.Hostname()) {
+		return fmt.Errorf("invalid HTTP URL host")
+	}
+	if parsed.Port() == "" && strings.Contains(parsed.Host, ":") &&
+		(!strings.HasPrefix(parsed.Host, "[") || !strings.HasSuffix(parsed.Host, "]")) {
+		return fmt.Errorf("invalid HTTP URL port")
+	}
+	if port := parsed.Port(); port != "" && !validPortNumber(port) {
+		return fmt.Errorf("invalid HTTP URL port")
 	}
 	return nil
 }
@@ -199,12 +265,20 @@ func validHTTPStatusCode(code int) bool {
 }
 
 func validateHTTPHeaders(headers map[string]string) error {
+	if len(headers) > maxHTTPHeaderCount {
+		return fmt.Errorf("too many HTTP headers")
+	}
+	total := 0
 	for key, value := range headers {
 		if !validHTTPToken(key) {
 			return fmt.Errorf("invalid HTTP header name %q", key)
 		}
 		if !validHTTPHeaderValue(value) {
 			return fmt.Errorf("invalid HTTP header value for %q", key)
+		}
+		total += len(key) + len(value)
+		if total > maxHTTPHeaderBytes {
+			return fmt.Errorf("HTTP headers are too large")
 		}
 	}
 	return nil
@@ -300,7 +374,8 @@ func (c *HTTPCondition) client() *http.Client {
 	if c.Client != nil {
 		return c.Client
 	}
-	if !c.Insecure && !c.NoRedirects {
+	needsRedirectPolicy := len(c.Headers) > 0
+	if !c.Insecure && !c.NoRedirects && !needsRedirectPolicy {
 		return http.DefaultClient
 	}
 	c.clientOnce.Do(func() {
@@ -312,13 +387,40 @@ func (c *HTTPCondition) client() *http.Client {
 			Timeout:   30 * time.Second,
 			Transport: transport,
 		}
-		if c.NoRedirects {
-			c.clientCache.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			}
-		}
+		configureHTTPRedirectPolicy(c.clientCache, c, needsRedirectPolicy)
 	})
 	return c.clientCache
+}
+
+func configureHTTPRedirectPolicy(client *http.Client, c *HTTPCondition, needsRedirectPolicy bool) {
+	if c.NoRedirects {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		return
+	}
+	if needsRedirectPolicy {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return stripHeadersOnCrossOriginRedirect(req, via, c.Headers)
+		}
+	}
+}
+
+func stripHeadersOnCrossOriginRedirect(req *http.Request, via []*http.Request, headers map[string]string) error {
+	if len(via) == 0 || sameHTTPOrigin(req.URL, via[0].URL) {
+		return nil
+	}
+	for key := range headers {
+		req.Header.Del(key)
+	}
+	return nil
+}
+
+func sameHTTPOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
 }
 
 func redactHTTPURL(raw string) string {

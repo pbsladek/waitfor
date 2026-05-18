@@ -1,7 +1,6 @@
 package condition
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -15,7 +14,6 @@ import (
 const (
 	maxLogScanBytes  int64 = 10 * 1024 * 1024
 	maxTailScanBytes int64 = 1 * 1024 * 1024
-	maxMatchDetail         = 200
 )
 
 // LogCondition tails a file and returns Satisfied when enough matching lines
@@ -117,18 +115,24 @@ func (c *LogCondition) readNewContent(info os.FileInfo) (logChunk, error) {
 	}
 	c.prevInfo = info
 
-	f, err := os.Open(c.Path) // #nosec G304 -- log polling intentionally reads the user-selected target.
+	f, openedInfo, err := openRegularFile(c.Path)
 	if err != nil {
 		return logChunk{}, err
 	}
 	defer func() { _ = f.Close() }()
+	if openedInfo.Size() < c.offset {
+		c.offset = 0
+	}
 
 	if _, err := f.Seek(c.offset, io.SeekStart); err != nil {
 		return logChunk{}, err
 	}
-	data, err := io.ReadAll(io.LimitReader(f, maxLogScanBytes))
+	data, err := io.ReadAll(io.LimitReader(f, maxLogScanBytes+1))
 	if err != nil {
 		return logChunk{}, err
+	}
+	if int64(len(data)) > maxLogScanBytes {
+		return logChunk{}, fmt.Errorf("log scan exceeds %d bytes", maxLogScanBytes)
 	}
 	return logChunk{data: data, nextOffset: c.offset + int64(len(data))}, nil
 }
@@ -165,24 +169,19 @@ func (c *LogCondition) initOffset(info os.FileInfo) error {
 }
 
 func (c *LogCondition) scanLines(ctx context.Context, data []byte) (Result, bool) {
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	scanner.Buffer(make([]byte, 0, 64*1024), int(maxLogScanBytes))
 	matches := 0
 	var lastMatch []byte
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			return Unsatisfied("", ctx.Err()), false
-		default:
-		}
-		line := scanner.Bytes()
+	complete, err := scanLogLines(ctx, data, func(line []byte) {
 		if c.matchLine(line) {
 			matches++
 			lastMatch = append(lastMatch[:0], line...)
 		}
-	}
-	if err := scanner.Err(); err != nil {
+	})
+	if err != nil {
 		return Unsatisfied("log scan failed", err), false
+	}
+	if !complete {
+		return Unsatisfied("", ctx.Err()), false
 	}
 	c.matchCount += matches
 	if c.matchCount >= c.requiredMatches() && matches > 0 {
@@ -191,16 +190,38 @@ func (c *LogCondition) scanLines(ctx context.Context, data []byte) (Result, bool
 	return c.unsatisfiedResult(), true
 }
 
+func scanLogLines(ctx context.Context, data []byte, visit func([]byte)) (bool, error) {
+	for len(data) > 0 {
+		if err := ctx.Err(); err != nil {
+			return false, nil
+		}
+		line, rest := nextLogLine(data)
+		if len(line) > int(maxLogScanBytes) {
+			return false, fmt.Errorf("bufio.Scanner: token too long")
+		}
+		visit(line)
+		data = rest
+	}
+	return true, nil
+}
+
+func nextLogLine(data []byte) ([]byte, []byte) {
+	idx := bytes.IndexByte(data, '\n')
+	if idx < 0 {
+		return data, nil
+	}
+	return data[:idx], data[idx+1:]
+}
+
 func (c *LogCondition) requiredMatches() int {
 	return c.MinMatches
 }
 
 func (c *LogCondition) satisfiedDetail(line []byte) string {
-	detail := truncateLogLine(line)
 	if c.requiredMatches() > 1 {
-		return fmt.Sprintf("%d matches; last: %s", c.matchCount, detail)
+		return fmt.Sprintf("%d matches", c.matchCount)
 	}
-	return "matched: " + detail
+	return "matched line"
 }
 
 func (c *LogCondition) unsatisfiedResult() Result {
@@ -232,28 +253,24 @@ func (c *LogCondition) matchLine(line []byte) bool {
 	return true
 }
 
-func truncateLogLine(line []byte) string {
-	if len(line) > maxMatchDetail {
-		return string(line[:maxMatchDetail]) + "..."
-	}
-	return string(line)
-}
-
 // computeTailOffset returns the file byte offset at which the last `lines`
 // lines begin, reading at most maxTailScanBytes from the end of the file.
 func computeTailOffset(path string, size int64, lines int) (int64, error) {
 	if lines <= 0 || size == 0 {
 		return size, nil
 	}
-	readFrom := size - maxTailScanBytes
-	if readFrom < 0 {
-		readFrom = 0
-	}
-	f, err := os.Open(path) // #nosec G304 -- log polling intentionally reads the user-selected target.
+	f, openedInfo, err := openRegularFile(path)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = f.Close() }()
+	if openedInfo.Size() < size {
+		size = openedInfo.Size()
+	}
+	readFrom := size - maxTailScanBytes
+	if readFrom < 0 {
+		readFrom = 0
+	}
 	if _, err := f.Seek(readFrom, io.SeekStart); err != nil {
 		return 0, err
 	}
