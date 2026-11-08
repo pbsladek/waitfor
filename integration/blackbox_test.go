@@ -24,9 +24,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 var waitforBinary string
@@ -290,7 +287,10 @@ func newBlackboxGRPCHealthServer(t *testing.T, status byte) string {
 		_, _ = w.Write(blackboxGRPCFrame([]byte{0x08, status}))
 		w.Header().Set("Grpc-Status", "0")
 	})
-	server := httptest.NewServer(h2c.NewHandler(handler, &http2.Server{}))
+	server := httptest.NewUnstartedServer(handler)
+	server.Config.Protocols = &http.Protocols{}
+	server.Config.Protocols.SetUnencryptedHTTP2(true)
+	server.Start()
 	t.Cleanup(server.Close)
 	return "grpc://" + strings.TrimPrefix(server.URL, "http://")
 }
@@ -409,6 +409,42 @@ func TestBinaryFileStatesAndContains(t *testing.T) {
 	requireExitCode(t, runWaitfor(t, "file", ready, "--nonempty"), 0)
 	requireExitCode(t, runWaitfor(t, "file", ready, "--contains", "ready"), 0)
 	requireExitCode(t, runWaitfor(t, "file", filepath.Join(dir, "missing"), "--deleted"), 0)
+}
+
+func TestBinaryLogPartialLinesAndStability(t *testing.T) {
+	requireBlackbox(t)
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("rea"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requireExitCode(t, runWaitfor(t, "--timeout", "50ms", "--interval", "5ms", "log", path, "--contains", "ready", "--from-start"), 1)
+	timer := time.AfterFunc(100*time.Millisecond, func() {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- test appends to its t.TempDir file.
+		if err != nil {
+			return
+		}
+		defer func() { _ = f.Close() }()
+		_, _ = f.WriteString("dy\n")
+	})
+	defer timer.Stop()
+	requireExitCode(t, runWaitfor(t, "--timeout", "2s", "--interval", "10ms", "--successes", "3", "--stable-for", "30ms",
+		"log", path, "--contains", "ready", "--from-start"), 0)
+}
+
+func TestBinaryRejectsInvalidRecipes(t *testing.T) {
+	requireBlackbox(t)
+	for _, body := range []string{
+		"unknown: true\nconditions:\n  - file: /tmp/ready\n",
+		"successes: 0\nconditions:\n  - file: /tmp/ready\n",
+		"successes: -1\nconditions:\n  - file: /tmp/ready\n",
+		"conditions:\n  - file: /tmp/ready\n    tcp: localhost:80\n",
+	} {
+		path := filepath.Join(t.TempDir(), "recipe.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		requireExitCode(t, runWaitfor(t, "--config", path, "--explain"), 2)
+	}
 }
 
 func TestBinaryGlobPolling(t *testing.T) {
@@ -946,6 +982,35 @@ func TestBinaryInvalidArgsExitCode(t *testing.T) {
 
 	result := runWaitfor(t, "tcp", "not-a-host-port")
 	requireExitCode(t, result, 2)
+}
+
+func TestBinaryBrokenOutputPipe(t *testing.T) {
+	requireBlackbox(t)
+	for _, format := range []string{"text", "json", "ndjson"} {
+		t.Run(format, func(t *testing.T) {
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = writer.Close() }()
+			if err := reader.Close(); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, waitforBinary, "--output", format, "file", t.TempDir(), "--exists") // #nosec G204 -- runs the just-built binary with test-controlled args.
+			cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+			if format == "text" {
+				cmd.Stderr = writer
+			} else {
+				cmd.Stdout = writer
+			}
+			var exitErr *exec.ExitError
+			if err := cmd.Run(); !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+				t.Fatalf("broken output error=%v, want exit 3", err)
+			}
+		})
+	}
 }
 
 func TestBinaryDockerContainerStatusAndHealthPolling(t *testing.T) {

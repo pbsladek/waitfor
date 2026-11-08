@@ -28,7 +28,7 @@ type LogCondition struct {
 	JSONExpr   *expr.Expression
 	FromStart  bool
 	Tail       int // scan last N lines of existing content before tailing
-	MinMatches int // require N cumulative matching lines (0 or 1 both mean 1)
+	MinMatches int // require N cumulative matching lines (must be at least 1)
 
 	// mutable per-instance state; safe because the runner calls Check
 	// from exactly one goroutine per condition.
@@ -127,14 +127,19 @@ func (c *LogCondition) readNewContent(info os.FileInfo) (logChunk, error) {
 	if _, err := f.Seek(c.offset, io.SeekStart); err != nil {
 		return logChunk{}, err
 	}
-	data, err := io.ReadAll(io.LimitReader(f, maxLogScanBytes+1))
+	return readLogChunk(f, c.offset)
+}
+
+func readLogChunk(reader io.Reader, offset int64) (logChunk, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, maxLogScanBytes+1))
 	if err != nil {
 		return logChunk{}, err
 	}
-	if int64(len(data)) > maxLogScanBytes {
-		return logChunk{}, fmt.Errorf("log scan exceeds %d bytes", maxLogScanBytes)
+	end := bytes.LastIndexByte(data, '\n') + 1
+	if end == 0 && int64(len(data)) > maxLogScanBytes {
+		return logChunk{}, fmt.Errorf("log line exceeds %d bytes", maxLogScanBytes)
 	}
-	return logChunk{data: data, nextOffset: c.offset + int64(len(data))}, nil
+	return logChunk{data: data[:end], nextOffset: offset + int64(end)}, nil
 }
 
 func (c *LogCondition) resetOnRotation(info os.FileInfo) {
@@ -184,7 +189,7 @@ func (c *LogCondition) scanLines(ctx context.Context, data []byte) (Result, bool
 		return Unsatisfied("", ctx.Err()), false
 	}
 	c.matchCount += matches
-	if c.matchCount >= c.requiredMatches() && matches > 0 {
+	if c.matchCount >= c.requiredMatches() {
 		return Satisfied(c.satisfiedDetail(lastMatch)), true
 	}
 	return c.unsatisfiedResult(), true

@@ -420,6 +420,9 @@ func configureHTTPRedirectPolicy(client *http.Client, c *HTTPCondition, needsRed
 }
 
 func stripHeadersOnCrossOriginRedirect(req *http.Request, via []*http.Request, headers map[string]string) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
 	if len(via) == 0 || sameHTTPOrigin(req.URL, via[0].URL) {
 		return nil
 	}

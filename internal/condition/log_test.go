@@ -1,7 +1,9 @@
 package condition
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,6 +12,110 @@ import (
 
 	"github.com/pbsladek/wait-for/internal/expr"
 )
+
+func TestLogPreservesPartialLines(t *testing.T) {
+	tests := []struct {
+		name, first, rest string
+		setup             func(*LogCondition)
+	}{
+		{"substring", "rea", "dy\n", func(c *LogCondition) { c.Contains = "ready" }},
+		{"regex", "rea", "dy\n", func(c *LogCondition) { c.Regex = regexp.MustCompile("^ready$") }},
+		{"json", `{"ready":`, "true}\n", func(c *LogCondition) { c.JSONExpr = expr.MustCompile(".ready == true") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "app.log")
+			if err := os.WriteFile(path, []byte("unrelated\n"+tt.first), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			c := NewLog(path)
+			c.FromStart = true
+			tt.setup(c)
+			for range 2 {
+				if result := c.Check(t.Context()); result.Status != CheckUnsatisfied {
+					t.Fatalf("partial line result = %+v", result)
+				}
+				if c.offset != int64(len("unrelated\n")) || c.matchCount != 0 {
+					t.Fatalf("partial line committed: offset=%d matches=%d", c.offset, c.matchCount)
+				}
+			}
+			appendLogContent(t, path, tt.rest)
+			if result := c.Check(t.Context()); result.Status != CheckSatisfied {
+				t.Fatalf("completed line result = %+v", result)
+			}
+		})
+	}
+}
+
+func TestLogProcessesBacklogInChunks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	data := append([]byte("ready\n"), bytes.Repeat([]byte("unrelated\n"), int(maxLogScanBytes)/len("unrelated\n")+2)...)
+	data = append(data, []byte("ready\n")...)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := NewLog(path)
+	c.Contains = "ready"
+	c.FromStart = true
+	c.MinMatches = 2
+	if result := c.Check(t.Context()); result.Status != CheckUnsatisfied || c.offset == 0 || c.matchCount != 1 {
+		t.Fatalf("first chunk result=%+v offset=%d matches=%d", result, c.offset, c.matchCount)
+	}
+	if result := c.Check(t.Context()); result.Status != CheckSatisfied || c.matchCount != 2 || c.offset != int64(len(data)) {
+		t.Fatalf("second chunk result=%+v offset=%d matches=%d", result, c.offset, c.matchCount)
+	}
+	if result := c.Check(t.Context()); result.Status != CheckSatisfied || c.matchCount != 2 {
+		t.Fatalf("idle poll result=%+v matches=%d", result, c.matchCount)
+	}
+}
+
+func TestLogRejectsOversizedSingleLine(t *testing.T) {
+	if _, err := readLogChunk(strings.NewReader(strings.Repeat("x", int(maxLogScanBytes)+1)), 0); err == nil {
+		t.Fatal("oversized single line was accepted")
+	}
+}
+
+func TestLogSatisfiedStateResetsOnRotation(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(fmt.Sprint(replace), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "app.log")
+			if err := os.WriteFile(path, []byte("ready\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			c := NewLog(path)
+			c.Contains = "ready"
+			c.FromStart = true
+			for range 2 {
+				if result := c.Check(t.Context()); result.Status != CheckSatisfied {
+					t.Fatalf("matched or idle result = %+v", result)
+				}
+			}
+			if replace {
+				if err := os.Rename(path, path+".old"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(path, []byte("x\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if result := c.Check(t.Context()); result.Status != CheckUnsatisfied || c.matchCount != 0 {
+				t.Fatalf("rotated result=%+v matches=%d", result, c.matchCount)
+			}
+		})
+	}
+}
+
+func appendLogContent(t *testing.T, path, data string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- test appends to a t.TempDir file.
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.WriteString(data); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestLogMissingFile(t *testing.T) {
 	c := NewLog(filepath.Join(t.TempDir(), "missing.log"))

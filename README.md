@@ -262,6 +262,11 @@ waitfor log /var/log/app.log --matches "ERROR:.*timeout" --from-start
 waitfor log /var/log/app.log --contains ready --tail 100 --min-matches 2
 ```
 
+Log checks wait for newline-terminated lines and process large backlogs in
+bounded chunks. Once the required match count is reached, the condition stays
+satisfied until log rotation or truncation resets it, so it works with
+`--successes` and `--stable-for`.
+
 Wait for Kubernetes resources:
 
 ```bash
@@ -405,9 +410,9 @@ and Kubernetes resources.
 
 ## Docker Image
 
-The image is built from Docker Hardened Images: `dhi.io/golang:1.26-dev` for
+The image is built from Docker Hardened Images: `dhi.io/golang:1.27-dev` for
 compilation and `dhi.io/static:20250419` for the distroless runtime. The DHI
-builder image intentionally follows the maintained Go 1.26 dev tag, while
+builder image intentionally follows the maintained Go 1.27 dev tag, while
 CI and release builds pin the exact Go patch version declared in `go.mod` and
 the GitHub workflows.
 
@@ -448,7 +453,7 @@ Kubernetes configuration.
 
 ## Maintainers
 
-The project targets Go 1.26 and pins the toolchain to Go 1.26.2.
+The project requires Go 1.27 or newer and pins the toolchain to Go 1.27.3.
 
 ```bash
 make test

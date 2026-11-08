@@ -74,8 +74,8 @@ func validateSSHConfig(c *SSHCondition) error {
 
 func validSSHHostKeySHA256(value string) bool {
 	value = strings.TrimPrefix(strings.TrimSpace(value), "SHA256:")
-	_, err := base64.RawStdEncoding.DecodeString(value)
-	return err == nil && value != ""
+	decoded, err := base64.RawStdEncoding.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
 }
 
 func (c *SSHCondition) authMode() bool {
@@ -109,23 +109,34 @@ func (c *SSHCondition) checkBanner(ctx context.Context, conn net.Conn) Result {
 }
 
 func readSSHBanner(ctx context.Context, conn net.Conn) (string, error) {
-	reader := bufio.NewReaderSize(conn, maxSSHBannerBytes)
+	reader := bufio.NewReaderSize(conn, maxSSHBannerBytes+2)
 	for i := 0; i < maxSSHBannerLines; i++ {
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		default:
 		}
-		line, err := reader.ReadString('\n')
+		line, err := readSSHBannerLine(reader)
 		if err != nil {
 			return "", fmt.Errorf("read ssh banner: %w", err)
 		}
-		line = strings.TrimRight(line, "\r\n")
 		if validSSHBanner(line) {
 			return line, nil
 		}
 	}
 	return "", fmt.Errorf("ssh banner not found")
+}
+
+func readSSHBannerLine(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadSlice('\n')
+	if err != nil {
+		return "", err
+	}
+	text := strings.TrimRight(string(line), "\r\n")
+	if len(text) > maxSSHBannerBytes {
+		return "", fmt.Errorf("ssh banner line exceeds %d bytes", maxSSHBannerBytes)
+	}
+	return text, nil
 }
 
 func validSSHBanner(line string) bool {

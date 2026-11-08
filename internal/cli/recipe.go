@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -19,7 +21,7 @@ type recipeFile struct {
 	Backoff        string           `yaml:"backoff"`
 	Jitter         string           `yaml:"jitter"`
 	AttemptTimeout string           `yaml:"attempt_timeout"`
-	Successes      int              `yaml:"successes"`
+	Successes      *int             `yaml:"successes"`
 	StableFor      string           `yaml:"stable_for"`
 	Output         string           `yaml:"output"`
 	Mode           string           `yaml:"mode"`
@@ -34,7 +36,7 @@ func applyRecipeConfig(opts globalOptions) (globalOptions, []condition.Condition
 		return opts, nil, err
 	}
 	var recipe recipeFile
-	if err := yaml.Unmarshal(data, &recipe); err != nil {
+	if err := decodeRecipe(data, &recipe); err != nil {
 		return opts, nil, fmt.Errorf("invalid recipe config: %w", err)
 	}
 	opts, err = applyRecipeOptions(opts, recipe)
@@ -50,6 +52,19 @@ func applyRecipeConfig(opts globalOptions) (globalOptions, []condition.Condition
 		return opts, nil, err
 	}
 	return opts, conditions, nil
+}
+
+func decodeRecipe(data []byte, recipe *recipeFile) error {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(recipe); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("recipe must contain exactly one YAML document")
+	}
+	return nil
 }
 
 func applyRecipeOptions(opts globalOptions, recipe recipeFile) (globalOptions, error) {
@@ -111,8 +126,8 @@ func applyRecipeStabilityOptions(opts globalOptions, recipe recipeFile) (globalO
 			return opts, fmt.Errorf("invalid recipe attempt_timeout: %w", err)
 		}
 	}
-	if recipe.Successes > 0 && !opts.changed["successes"] {
-		opts.requiredSuccesses = recipe.Successes
+	if recipe.Successes != nil && !opts.changed["successes"] {
+		opts.requiredSuccesses = *recipe.Successes
 	}
 	if recipe.StableFor != "" && !opts.changed["stable-for"] {
 		opts.stableFor, err = time.ParseDuration(recipe.StableFor)
@@ -183,8 +198,8 @@ func appendConditionSegment(args []string, segment []string) []string {
 }
 
 func recipeConditionSegment(item map[string]any, forceGuard bool) ([]string, error) {
-	if rawArgs, ok := item["args"]; ok {
-		return recipeArgsSegment(rawArgs, forceGuard || boolValue(item["guard"]))
+	if _, ok := item["args"]; ok {
+		return recipeArgsConditionSegment(item, forceGuard)
 	}
 	backend, raw, err := recipeBackend(item)
 	if err != nil {
@@ -203,6 +218,13 @@ func recipeConditionSegment(item map[string]any, forceGuard bool) ([]string, err
 	return segment, nil
 }
 
+func recipeArgsConditionSegment(item map[string]any, forceGuard bool) ([]string, error) {
+	if err := validateRecipeConditionKeys(item); err != nil {
+		return nil, err
+	}
+	return recipeArgsSegment(item["args"], forceGuard || boolValue(item["guard"]))
+}
+
 func recipeArgsSegment(rawArgs any, guard bool) ([]string, error) {
 	segment, err := stringList(rawArgs)
 	if err != nil {
@@ -215,6 +237,9 @@ func recipeArgsSegment(rawArgs any, guard bool) ([]string, error) {
 }
 
 func recipeBackend(item map[string]any) (string, any, error) {
+	if err := validateRecipeConditionKeys(item); err != nil {
+		return "", nil, err
+	}
 	for key, value := range item {
 		switch key {
 		case "name", "guard", "args":
@@ -224,6 +249,19 @@ func recipeBackend(item map[string]any) (string, any, error) {
 		}
 	}
 	return "", nil, fmt.Errorf("recipe condition requires a backend")
+}
+
+func validateRecipeConditionKeys(item map[string]any) error {
+	count := 0
+	for key := range item {
+		if key != "name" && key != "guard" {
+			count++
+		}
+	}
+	if count != 1 {
+		return fmt.Errorf("recipe condition requires exactly one backend or args")
+	}
+	return nil
 }
 
 func recipeBackendSegment(backend string, raw any) ([]string, error) {

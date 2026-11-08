@@ -195,6 +195,11 @@ conditions satisfied in 6.1s
 The report confirms that a line matched but does not copy log contents into
 text or JSON output. This avoids leaking secrets from matched lines.
 
+Only newline-terminated lines are evaluated. Partial lines are retained for the
+next poll, and large backlogs are processed in bounded chunks. A completed
+match threshold stays satisfied until rotation or truncation resets it; no
+additional matching lines are needed for `--successes` or `--stable-for`.
+
 ---
 
 ## 11. Scan a log from the beginning for an error pattern
@@ -233,7 +238,7 @@ waitfor log /var/log/nginx/access.log \
 
 ## 13. Require N heartbeats before declaring a service stable
 
-Some services emit periodic heartbeats. Require three consecutive appearances
+Some services emit periodic heartbeats. Require three matching lines
 before trusting the service is stable:
 
 ```bash
@@ -770,6 +775,10 @@ Explicit flags override recipe values, recipe values override profile defaults,
 and profile defaults override built-in defaults. The `ci` profile uses a
 10-minute timeout, one-second interval, and JSON output. The `local` profile
 uses a two-minute timeout, 500-millisecond interval, and verbose text output.
+
+Recipe files accept one YAML document and reject unknown top-level fields.
+Each condition must specify exactly one backend or an `args` list. An explicit
+`successes` value must be at least 1 unless overridden by `--successes`.
 
 ---
 

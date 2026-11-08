@@ -297,6 +297,13 @@ conditions:
 
 func TestRecipeValidationErrors(t *testing.T) {
 	tests := []string{
+		"unknown_option: true\nconditions:\n  - file: /tmp/ready\n",
+		"successes: 0\nconditions:\n  - file: /tmp/ready\n",
+		"successes: -2\nconditions:\n  - file: /tmp/ready\n",
+		"conditions:\n  - file: /tmp/ready\n    tcp: localhost:80\n",
+		"conditions:\n  - args: [file, /tmp/ready]\n    file: /tmp/other\n",
+		"conditions:\n  - args: [file, /tmp/ready]\n    typo: true\n",
+		"conditions:\n  - file: /tmp/ready\n---\nconditions:\n  - file: /tmp/other\n",
 		"output: xml\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
 		"mode: one\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
 		"timeout: nope\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
@@ -328,6 +335,65 @@ func TestRecipeValidationErrors(t *testing.T) {
 	}
 }
 
+func TestRecipeSuccessesCLIOverride(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recipe.yaml")
+	if err := os.WriteFile(path, []byte("successes: 0\nconditions:\n  - file: /tmp/ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"--config", path, "--successes", "2", "--explain", "--output", "json"}, nil, &stdout, &stderr)
+	if code != ExitSatisfied || !strings.Contains(stdout.String(), `"required_successes": 2`) {
+		t.Fatalf("code=%d stdout=%s stderr=%s", code, &stdout, &stderr)
+	}
+}
+
+func TestExecuteOutputFailure(t *testing.T) {
+	for _, format := range []string{"text", "ndjson", "json"} {
+		t.Run(format, func(t *testing.T) {
+			var stderr bytes.Buffer
+			stdout := io.Writer(errWriter{})
+			errorOutput := io.Writer(&stderr)
+			if format == "text" {
+				errorOutput = errWriter{}
+			}
+			code := Execute(t.Context(), []string{"--output", format, "file", t.TempDir(), "--exists"}, nil, stdout, errorOutput)
+			if code != ExitFatal {
+				t.Fatalf("code=%d, want fatal", code)
+			}
+		})
+	}
+}
+
+func TestExecuteCancelsAfterProgressOutputFailure(t *testing.T) {
+	for _, format := range []string{"text", "ndjson"} {
+		t.Run(format, func(t *testing.T) {
+			writer := &progressErrorWriter{}
+			stdout, stderr := io.Writer(io.Discard), io.Writer(io.Discard)
+			if format == "text" {
+				stderr = writer
+			} else {
+				stdout = writer
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			code := Execute(ctx, []string{"--timeout", "30s", "--output", format, "--verbose", "file", filepath.Join(t.TempDir(), "missing"), "--exists"}, nil, stdout, stderr)
+			if code != ExitFatal || ctx.Err() != nil {
+				t.Fatalf("code=%d context=%v, want prompt fatal output error", code, ctx.Err())
+			}
+		})
+	}
+}
+
+type progressErrorWriter struct{ calls int }
+
+func (w *progressErrorWriter) Write(data []byte) (int, error) {
+	w.calls++
+	if w.calls == 2 {
+		return 0, fmt.Errorf("progress output failed")
+	}
+	return len(data), nil
+}
+
 func TestRecipeHelperBranches(t *testing.T) {
 	opts := globalOptions{
 		timeout:           time.Minute,
@@ -348,10 +414,11 @@ func TestRecipeHelperBranches(t *testing.T) {
 		},
 	}
 	verbose := true
+	successes := 3
 	applied, err := applyRecipeOptions(opts, recipeFile{
 		Timeout:        "1s",
 		AttemptTimeout: "2s",
-		Successes:      3,
+		Successes:      &successes,
 		StableFor:      "4s",
 		Output:         "json",
 		Mode:           "any",

@@ -4,7 +4,7 @@ DOCKER_IMAGE ?= pwbsladek/waitfor
 DOCKER_TAG ?= local
 DOCKER_PLATFORMS ?= linux/amd64,linux/arm64
 # DHI tracks Go patch updates behind the minor-version dev tag; CI/release pin the exact patch.
-DHI_GO_IMAGE ?= dhi.io/golang:1.26-dev
+DHI_GO_IMAGE ?= dhi.io/golang:1.27-dev
 DHI_RUNTIME_IMAGE ?= dhi.io/static:20250419
 VERSION ?=
 

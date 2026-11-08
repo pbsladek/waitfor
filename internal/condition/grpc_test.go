@@ -2,15 +2,62 @@ package condition
 
 import (
 	"bytes"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 )
+
+func TestGRPCHTTP2Transport(t *testing.T) {
+	for _, useTLS := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tls=%t", useTLS), func(t *testing.T) {
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.ProtoMajor != 2 {
+					t.Errorf("HTTP version = %s, want HTTP/2", r.Proto)
+				}
+				w.Header().Set("Content-Type", "application/grpc")
+				w.Header().Set("Trailer", "Grpc-Status")
+				_, _ = w.Write(grpcFrame([]byte{0x08, 0x01}))
+				w.Header().Set("Grpc-Status", "0")
+			}))
+			server.EnableHTTP2 = true
+			server.Config.Protocols = &http.Protocols{}
+			server.Config.Protocols.SetHTTP2(useTLS)
+			server.Config.Protocols.SetUnencryptedHTTP2(!useTLS)
+			if useTLS {
+				server.StartTLS()
+			} else {
+				server.Start()
+			}
+			t.Cleanup(server.Close)
+
+			cond := NewGRPC(server.URL)
+			if useTLS {
+				if result := cond.Check(t.Context()); result.Status != CheckUnsatisfied {
+					t.Fatalf("untrusted TLS result = %+v, want unsatisfied", result)
+				}
+			}
+			client := grpcHTTPClient(0, useTLS)
+			t.Cleanup(client.CloseIdleConnections)
+			transport := client.Transport.(*http.Transport)
+			roots := x509.NewCertPool()
+			if useTLS {
+				roots.AddCert(server.Certificate())
+			}
+			transport.TLSClientConfig.RootCAs = roots
+			cond.Client = client
+			if result := cond.Check(t.Context()); result.Status != CheckSatisfied {
+				t.Fatalf("HTTP/2 health result = %+v, want satisfied", result)
+			}
+		})
+	}
+}
 
 func TestGRPCConditionCheckUsesHealthRequest(t *testing.T) {
 	var seenPath, seenContentType string

@@ -1,6 +1,7 @@
 package condition
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,7 +10,9 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pbsladek/wait-for/internal/expr"
 )
@@ -120,6 +123,26 @@ func TestHTTPConditionDropsCustomHeadersOnCrossOriginRedirect(t *testing.T) {
 	}
 	if redirectedHeader != "" {
 		t.Fatalf("redirected header = %q, want stripped", redirectedHeader)
+	}
+}
+
+func TestHTTPConditionLimitsRedirectsWithCustomHeaders(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Redirect(w, r, "/loop", http.StatusFound)
+	}))
+	defer server.Close()
+	cond := NewHTTP(server.URL)
+	cond.Headers["X-Token"] = "secret"
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	result := cond.Check(ctx)
+	if result.Status != CheckUnsatisfied || result.Err == nil || !strings.Contains(result.Err.Error(), "stopped after 10 redirects") {
+		t.Fatalf("redirect result = %+v", result)
+	}
+	if got := requests.Load(); got != 10 {
+		t.Fatalf("requests = %d, want 10", got)
 	}
 }
 

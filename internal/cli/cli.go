@@ -181,6 +181,11 @@ func runWithOptions(ctx context.Context, opts globalOptions, conditions []condit
 	}
 	printer := output.NewPrinter(outputWriter, opts.format, opts.verbose)
 	printer.Start(len(conditions), opts.timeout, opts.interval)
+	if err := printer.Err(); err != nil {
+		return ExitFatal, err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	runCfg.OnAttempt = func(event runner.AttemptEvent) {
 		printer.Attempt(output.Attempt{
 			Name:      event.Name,
@@ -190,6 +195,9 @@ func runWithOptions(ctx context.Context, opts globalOptions, conditions []condit
 			Error:     event.Error,
 			Elapsed:   event.Elapsed,
 		})
+		if printer.Err() != nil {
+			cancel()
+		}
 	}
 	out, err := runner.Run(ctx, runCfg)
 	if err != nil {

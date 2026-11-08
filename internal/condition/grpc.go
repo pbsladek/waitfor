@@ -13,8 +13,6 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"golang.org/x/net/http2"
 )
 
 const (
@@ -188,20 +186,15 @@ func grpcHTTPClient(timeout time.Duration, useTLS bool) *http.Client {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	transport := &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			dialer := net.Dialer{Timeout: timeout}
-			if !useTLS {
-				return dialer.DialContext(ctx, network, addr)
-			}
-			if cfg == nil {
-				cfg = &tls.Config{MinVersion: tls.VersionTLS12}
-			}
-			tlsDialer := tls.Dialer{NetDialer: &dialer, Config: cfg}
-			return tlsDialer.DialContext(ctx, network, addr)
-		},
-		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	protocols := &http.Protocols{}
+	protocols.SetHTTP2(useTLS)
+	protocols.SetUnencryptedHTTP2(!useTLS)
+	dialer := &net.Dialer{Timeout: timeout}
+	transport := &http.Transport{
+		Protocols:           protocols,
+		DialContext:         dialer.DialContext,
+		TLSHandshakeTimeout: timeout,
+		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
 	}
 	return &http.Client{Transport: transport, Timeout: timeout}
 }
