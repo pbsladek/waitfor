@@ -188,17 +188,12 @@ waitfor log /var/log/app.log --contains "listening on port"
 ```
 checking 1 condition (timeout 5m, interval 2s)
 [..] log /var/log/app.log — no matching log line
-[ok] log /var/log/app.log — matched: 2024-06-01T12:00:03Z INFO listening on port 8080
+[ok] log /var/log/app.log — matched line
 conditions satisfied in 6.1s
 ```
 
-Then pipe the detail into another command via JSON:
-
-```bash
-detail=$(waitfor --output json log /var/log/app.log \
-  --contains "listening on port" | jq -r '.conditions[0].detail')
-echo "service is up: $detail"
-```
+The report confirms that a line matched but does not copy log contents into
+text or JSON output. This avoids leaking secrets from matched lines.
 
 ---
 
@@ -252,7 +247,7 @@ waitfor --timeout 2m \
 checking 1 condition (timeout 2m, interval 2s)
 [..] log /var/log/app.log — 1 of 3 required matches
 [..] log /var/log/app.log — 2 of 3 required matches
-[ok] log /var/log/app.log — 3 matches; last: heartbeat ok at 12:00:09
+[ok] log /var/log/app.log — 3 matches
 conditions satisfied in 14.3s
 ```
 
@@ -429,16 +424,9 @@ waitfor --timeout 24h \
     mail -s "Alert: app error" ops@example.com
 ```
 
-Or capture the matched line for the email body:
-
-```bash
-detail=$(waitfor --output json \
-  log /var/log/app.log --matches "ERROR|CRITICAL" --from-start |
-  jq -r '.conditions[0].detail')
-
-printf "Matched line:\n%s\n" "$detail" | \
-  mail -s "Alert: app error" ops@example.com
-```
+The result deliberately omits the matched line. Include the log path in the
+alert and inspect the protected log at the source rather than copying
+potentially sensitive content into notification systems.
 
 ---
 
@@ -613,7 +601,7 @@ Example failure output on stderr:
 Block until another process deletes its lock file before proceeding:
 
 ```bash
-waitfor --timeout 10m file /var/run/deploy.lock --deleted && \
+waitfor --timeout 10m lockfile /var/run/deploy.lock --absent && \
   touch /var/run/deploy.lock && \
   ./deploy.sh; \
   rm -f /var/run/deploy.lock
@@ -750,6 +738,137 @@ waitfor unix /var/run/docker.sock
 This is useful for local daemons that expose readiness over a socket path
 instead of a TCP port. Missing paths and refused connections are retried until
 the global timeout expires.
+
+---
+
+## 37. Stream attempt events as NDJSON
+
+Use NDJSON when a log processor or CI step should receive progress as it
+happens instead of waiting for the final JSON document:
+
+```bash
+waitfor --output ndjson --timeout 2m \
+  http https://api.example.com/health --status 200 | \
+  jq -c 'select(.event == "attempt" or .event == "outcome")'
+```
+
+The stream starts with a `start` event, emits one `attempt` event after each
+check, and ends with an `outcome` event containing the final report.
+
+---
+
+## 38. Preview profiles and recipe files
+
+Use `--explain` or its `--dry-run` alias to validate and display the resolved
+plan without contacting any target:
+
+```bash
+waitfor --profile ci --config waitfor.yaml --explain --output json | jq .
+```
+
+Explicit flags override recipe values, recipe values override profile defaults,
+and profile defaults override built-in defaults. The `ci` profile uses a
+10-minute timeout, one-second interval, and JSON output. The `local` profile
+uses a two-minute timeout, 500-millisecond interval, and verbose text output.
+
+---
+
+## 39. Wait for local service and process markers
+
+On macOS, check whether a launchd service has a live PID:
+
+```bash
+waitfor launchd system/com.example.agent --running
+```
+
+Use a pidfile when the application publishes its process ID:
+
+```bash
+waitfor pidfile /var/run/app.pid --running
+```
+
+Check a deployed file's type, mode, and numeric owner IDs together:
+
+```bash
+waitfor permission /etc/app/config.yaml \
+  --type file --mode 0640 --uid 1000 --gid 1000
+```
+
+---
+
+## 40. Verify downloaded artifacts
+
+Wait until a file has the expected digest and archive layout:
+
+```bash
+waitfor checksum dist/app.tar.gz --equals "sha256:$SHA256" \
+  -- archive dist/app.tar.gz --matches 'bin/*'
+```
+
+Verify a container image signature before deployment:
+
+```bash
+waitfor cosign ghcr.io/org/app:v1.2.3 \
+  --certificate-identity "$IDENTITY" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The cosign backend invokes the installed `cosign` command. A missing binary is
+fatal; verification failures remain retryable until the global timeout.
+
+---
+
+## 41. Check clock synchronization and ICMP reachability
+
+Require an NTP response whose calculated clock offset is within 250
+milliseconds:
+
+```bash
+waitfor ntp time.cloudflare.com --max-offset 250ms --timeout 1s
+```
+
+Require three successful echo requests using the platform `ping` command:
+
+```bash
+waitfor icmp 192.0.2.10 --count 3 --timeout 1s
+```
+
+---
+
+## 42. Wait for gRPC health and reflection
+
+Check the standard health service and first verify that the service descriptor
+is available through server reflection:
+
+```bash
+waitfor grpc api.example.com:443 \
+  --tls \
+  --service com.example.v1.API \
+  --reflect \
+  --status SERVING \
+  --timeout 2s
+```
+
+Use `grpc://`, `grpcs://`, `http://`, or `https://` when the address needs an
+explicit scheme.
+
+---
+
+## 43. Wait for a WebSocket signal
+
+Connect, send a subscription message, and wait for a matching text response:
+
+```bash
+waitfor websocket wss://events.example.com/readiness \
+  --header "Authorization=Bearer $TOKEN" \
+  --send '{"type":"subscribe","topic":"readiness"}' \
+  --matches '"status":"ready"' \
+  --ping \
+  --read-timeout 2s
+```
+
+Connection, handshake, message, ping, and close-code checks are retried until
+they succeed or the global timeout expires.
 
 ---
 

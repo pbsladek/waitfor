@@ -10,19 +10,20 @@
 shell scripts, CI pipelines, Docker entrypoints, Kubernetes init containers, and
 agent workflows when a plain sleep is too brittle.
 
-It can wait for HTTP health checks, TCP ports, Unix sockets, port ranges, TLS
-certificates, SSH servers, S3 objects, DNS records, Docker containers, local
-processes, systemd units, commands, files, filesystem globs, log lines, and
-Kubernetes resources. If the timeout expires, it exits `1`; invalid input exits
-`2`; unrecoverable condition failures exit `3`.
+It can wait for network services, cloud and orchestration resources, local
+processes and service managers, commands, files, logs, and artifact checks. If
+the timeout expires, it exits `1`; invalid input exits `2`; unrecoverable
+condition failures exit `3`.
 
-Human-readable progress is written to stderr. JSON output is written to stdout
-without progress lines so it is safe to consume from scripts.
+Human-readable progress is written to stderr. JSON and NDJSON output are written
+to stdout without text progress lines, so they are safe to consume from scripts.
 
 Supported waits:
 
 ```text
-http, tcp, unix, ports, tls, ssh, s3, dns, docker, process, systemd, exec, file, glob, log, k8s
+http, tcp, unix, tls, ssh, s3, glob, ports, exec, file, log, k8s, dns,
+docker, process, systemd, launchd, pidfile, lockfile, permission, checksum,
+archive, cosign, ntp, icmp, grpc, websocket
 ```
 
 ## Install
@@ -42,7 +43,7 @@ sudo mv waitfor /usr/local/bin/waitfor
 Install a specific Linux x86_64 release:
 
 ```bash
-VERSION=v0.8.0
+VERSION=v0.9.0
 curl -fsSLO "https://github.com/pbsladek/wait-for/releases/download/${VERSION}/waitfor_linux_amd64.tar.gz"
 tar -xzf waitfor_linux_amd64.tar.gz waitfor
 chmod +x waitfor
@@ -61,7 +62,7 @@ sudo mv waitfor /usr/local/bin/waitfor
 Install a specific macOS Apple Silicon release:
 
 ```bash
-VERSION=v0.8.0
+VERSION=v0.9.0
 curl -fsSLO "https://github.com/pbsladek/wait-for/releases/download/${VERSION}/waitfor_darwin_arm64.tar.gz"
 tar -xzf waitfor_darwin_arm64.tar.gz waitfor
 chmod +x waitfor
@@ -140,6 +141,15 @@ websocket ws://HOST/PATH [--send TEXT] [--contains TEXT|--matches REGEX] [--ping
 docker CONTAINER [--status running] [--health healthy]
 process (--pid PID | --name NAME) [--running|--stopped]
 systemd UNIT [--active|--inactive|--failed]
+launchd LABEL [--running|--loaded]
+pidfile PATH [--running|--stopped]
+lockfile PATH [--absent|--present] [--older-than duration]
+permission PATH [--mode 0644] [--uid UID|--user UID] [--gid GID|--group GID] [--type any|file|dir|symlink]
+checksum PATH --equals [ALGORITHM:]HEX [--algorithm auto|sha1|sha256|sha512]
+archive PATH (--contains MEMBER | --matches GLOB) [--format auto|tar|tgz|zip]
+cosign TARGET [--blob] [--signature SIG] [--key KEY] [--certificate CERT] [--certificate-identity ID] [--certificate-oidc-issuer URL]
+ntp HOST[:PORT] [--max-offset duration] [--timeout duration]
+icmp HOST [--count N] [--timeout duration]
 exec [--exit-code N] [--output-contains text] [--jsonpath expr] [--cwd path] [--env K=V] [--max-output-bytes N] -- COMMAND [ARGS...]
 file PATH [--exists|--deleted|--nonempty] [--contains text]
 glob PATTERN [--min-count N] [--max-count N] [--absent]
@@ -212,6 +222,36 @@ waitfor glob '/tmp/jobs/*.done' --min-count 5
 waitfor exec --output-contains Running -- kubectl get pod myapp
 ```
 
+Wait for local markers and artifact checks:
+
+```bash
+waitfor launchd system/com.example.agent --running
+
+waitfor pidfile /var/run/app.pid --running
+
+waitfor lockfile /var/run/app.lock --absent
+
+waitfor permission /etc/app.conf --mode 0640 --gid 1000 --type file
+
+waitfor checksum dist/app.tar.gz --equals "sha256:$SHA256"
+
+waitfor archive dist/app.tar.gz --matches 'bin/*'
+
+waitfor cosign ghcr.io/org/app:v1.2.3 --certificate-identity "$IDENTITY"
+```
+
+Wait for protocol-level readiness:
+
+```bash
+waitfor ntp time.cloudflare.com --max-offset 250ms --timeout 1s
+
+waitfor icmp 192.0.2.10 --count 3 --timeout 1s
+
+waitfor grpc localhost:50051 --service grpc.health.v1.Health
+
+waitfor websocket ws://localhost:8080/events --matches 'ready|ok'
+```
+
 Wait for log output:
 
 ```bash
@@ -242,7 +282,7 @@ waitfor --stable-for 30s http https://api.example.com/health --status 200
 waitfor --backoff exponential --max-interval 5s --jitter 20% http https://api.example.com/health --name api
 ```
 
-Use JSON output in scripts:
+Use machine-readable output and explain plans:
 
 ```bash
 waitfor --output json http https://api.example.com/health --status 200
@@ -301,6 +341,12 @@ Docker polling shells out to the Docker CLI and inspects container state. A
 missing Docker binary is fatal; missing containers, daemon connection failures,
 or containers in the wrong state remain retryable until the timeout and are
 reported with the last observed inspect detail.
+
+Local integration waits cover both service managers (`systemd`, `launchd`) and
+process markers (`process`, `pidfile`, `lockfile`). Artifact waits can verify
+permissions, checksums, archive members, and cosign signatures. Network-level
+checks include NTP clock offset, ICMP reachability, gRPC health/reflection, and
+WebSocket connection or message behavior.
 
 Kubernetes typed waits cover common rollout gates without custom JSON
 expressions: `--for rollout` for deployments, statefulsets, and daemonsets;
@@ -372,6 +418,11 @@ docker login dhi.io
 make docker-build
 make docker-run ARGS="http https://api.example.com/health --status 200"
 ```
+
+The published image contains only the `waitfor` binary. Backends that invoke
+host tools, such as `docker`, `systemd`, `launchd`, `cosign`, `icmp`, and
+`exec`, need those executables supplied by a derived image or mounted into the
+container.
 
 Publishing a multi-arch image:
 

@@ -36,6 +36,17 @@ func TestHTTPConditionSatisfied(t *testing.T) {
 	}
 }
 
+func TestHTTPMethodDefaults(t *testing.T) {
+	if got := (&HTTPCondition{}).method(); got != http.MethodGet {
+		t.Fatalf("default method = %q", got)
+	}
+	cond := NewHTTP("https://example.test")
+	cond.Method = http.MethodPost
+	if got := cond.method(); got != http.MethodPost {
+		t.Fatalf("explicit method = %q", got)
+	}
+}
+
 func TestHTTPConditionStatusRangeRequestBodyAndRegex(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

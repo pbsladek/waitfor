@@ -31,6 +31,9 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Check backend file layout
+        run: make layout
+
       - name: Run Go tests
         run: go test ./...
 

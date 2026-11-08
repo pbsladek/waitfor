@@ -2,6 +2,7 @@ package condition
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -20,6 +21,25 @@ func TestDockerConditionRunningSatisfied(t *testing.T) {
 	result := cond.Check(t.Context())
 	if result.Status != CheckSatisfied {
 		t.Fatalf("status = %s, err = %v", result.Status, result.Err)
+	}
+}
+
+func TestDockerDefaultHelpers(t *testing.T) {
+	if got := (&DockerCondition{}).status(); got != "running" {
+		t.Fatalf("default status = %q", got)
+	}
+	cond := &DockerCondition{Health: "HEALTHY"}
+	if got := cond.health(); got != "healthy" {
+		t.Fatalf("normalized health = %q", got)
+	}
+	if checkDockerStatus(DockerState{Status: "running"}, "running") != nil {
+		t.Fatal("matching status returned unsatisfied result")
+	}
+	if checkDockerHealth(DockerState{Status: "running", Health: &DockerHealth{Status: "starting"}}, "none") == nil {
+		t.Fatal("none health accepted a health state")
+	}
+	if err := classifyDockerInspectError(exec.ErrNotFound, ""); !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("classify missing docker = %v", err)
 	}
 }
 
