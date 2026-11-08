@@ -1,6 +1,7 @@
 package condition
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,7 +10,9 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pbsladek/wait-for/internal/expr"
 )
@@ -33,6 +36,17 @@ func TestHTTPConditionSatisfied(t *testing.T) {
 	result := cond.Check(t.Context())
 	if result.Status != CheckSatisfied {
 		t.Fatalf("Satisfied = false, err = %v, detail = %q", result.Err, result.Detail)
+	}
+}
+
+func TestHTTPMethodDefaults(t *testing.T) {
+	if got := (&HTTPCondition{}).method(); got != http.MethodGet {
+		t.Fatalf("default method = %q", got)
+	}
+	cond := NewHTTP("https://example.test")
+	cond.Method = http.MethodPost
+	if got := cond.method(); got != http.MethodPost {
+		t.Fatalf("explicit method = %q", got)
 	}
 }
 
@@ -109,6 +123,26 @@ func TestHTTPConditionDropsCustomHeadersOnCrossOriginRedirect(t *testing.T) {
 	}
 	if redirectedHeader != "" {
 		t.Fatalf("redirected header = %q, want stripped", redirectedHeader)
+	}
+}
+
+func TestHTTPConditionLimitsRedirectsWithCustomHeaders(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Redirect(w, r, "/loop", http.StatusFound)
+	}))
+	defer server.Close()
+	cond := NewHTTP(server.URL)
+	cond.Headers["X-Token"] = "secret"
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	result := cond.Check(ctx)
+	if result.Status != CheckUnsatisfied || result.Err == nil || !strings.Contains(result.Err.Error(), "stopped after 10 redirects") {
+		t.Fatalf("redirect result = %+v", result)
+	}
+	if got := requests.Load(); got != 10 {
+		t.Fatalf("requests = %d, want 10", got)
 	}
 }
 

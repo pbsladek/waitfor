@@ -27,8 +27,6 @@ import (
 	"github.com/pbsladek/wait-for/internal/cli"
 	"github.com/pbsladek/wait-for/internal/output"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 // execute runs the CLI with the given args and returns exit code, stdout, stderr.
@@ -752,6 +750,15 @@ func TestLogContainsSatisfied(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustCode(t, cli.ExitSatisfied, "log", path, "--contains", "ready", "--from-start")
+}
+
+func TestLogMatchRemainsSatisfiedForStability(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustCode(t, cli.ExitSatisfied, "--timeout", "1s", "--interval", "5ms", "--successes", "3", "--stable-for", "15ms",
+		"log", path, "--contains", "ready", "--from-start")
 }
 
 func TestLogContainsTimeout(t *testing.T) {
@@ -1719,7 +1726,10 @@ func newGRPCHealthServerWithStatus(t *testing.T, status byte) string {
 		_, _ = w.Write(grpcE2EFrame([]byte{0x08, status}))
 		w.Header().Set("Grpc-Status", "0")
 	})
-	server := httptest.NewServer(h2c.NewHandler(handler, &http2.Server{}))
+	server := httptest.NewUnstartedServer(handler)
+	server.Config.Protocols = &http.Protocols{}
+	server.Config.Protocols.SetUnencryptedHTTP2(true)
+	server.Start()
 	t.Cleanup(server.Close)
 	return "grpc://" + strings.TrimPrefix(server.URL, "http://")
 }

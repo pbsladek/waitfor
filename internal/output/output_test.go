@@ -2,10 +2,68 @@ package output
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestPrinterPreservesOutputFailures(t *testing.T) {
+	for _, format := range []Format{FormatText, FormatNDJSON} {
+		for _, failAt := range []int{1, 2, 3, 4} {
+			t.Run(fmt.Sprintf("%s/write-%d", format, failAt), func(t *testing.T) {
+				failure := errors.New("output failed")
+				writer := &failingOnceWriter{failAt: failAt, failure: failure}
+				p := NewPrinter(writer, format, true)
+				p.Start(1, time.Second, time.Millisecond)
+				if failAt == 1 && !errors.Is(p.Err(), failure) {
+					t.Fatalf("start error = %v", p.Err())
+				}
+				p.Attempt(Attempt{Name: "ready", Satisfied: false})
+				if failAt == 2 && !errors.Is(p.Err(), failure) {
+					t.Fatalf("attempt error = %v", p.Err())
+				}
+				report := Report{Status: "timeout", Conditions: []ConditionReport{{Name: "ready"}}}
+				err := p.Outcome(report)
+				if format == FormatNDJSON && failAt == 4 {
+					// NDJSON encodes the report and its conditions in one write.
+					err = p.Outcome(report)
+				}
+				if !errors.Is(err, failure) || !errors.Is(p.Err(), failure) {
+					t.Fatalf("outcome error=%v stored=%v", err, p.Err())
+				}
+				if writer.calls != failAt {
+					t.Fatalf("writes=%d, want %d; writes continued after failure", writer.calls, failAt)
+				}
+			})
+		}
+	}
+	for _, format := range []Format{FormatText, FormatJSON, FormatNDJSON} {
+		p := NewPrinter(shortWriter{}, format, false)
+		if err := p.Outcome(Report{Status: "satisfied"}); !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("%s short write error = %v", format, err)
+		}
+	}
+}
+
+type failingOnceWriter struct {
+	calls, failAt int
+	failure       error
+}
+
+func (w *failingOnceWriter) Write(data []byte) (int, error) {
+	w.calls++
+	if w.calls == w.failAt {
+		return 0, w.failure
+	}
+	return len(data), nil
+}
+
+type shortWriter struct{}
+
+func (shortWriter) Write(data []byte) (int, error) { return len(data) - 1, nil }
 
 func TestWriteJSON(t *testing.T) {
 	var buf bytes.Buffer

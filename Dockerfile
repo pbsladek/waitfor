@@ -2,7 +2,7 @@
 
 # DHI currently tracks Go patch updates behind the minor-version dev tag.
 # CI and release builds pin the exact patch version in go.mod/workflows.
-ARG GO_IMAGE=dhi.io/golang:1.26-dev
+ARG GO_IMAGE=dhi.io/golang:1.27-dev
 ARG RUNTIME_IMAGE=dhi.io/static:20250419
 
 FROM ${GO_IMAGE} AS build

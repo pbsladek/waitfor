@@ -7,6 +7,7 @@ Every backend should have evidence for these behavior classes:
 | http | unit, e2e, black-box | e2e | cli tests | unit | runner | json/e2e |
 | tcp | unit, e2e, black-box | e2e | cli tests | unit | runner | json/e2e |
 | unix | unit, black-box | black-box | cli tests | unit | runner | json/e2e |
+| ports | unit, e2e, black-box | e2e | cli tests | unit | runner | json/e2e |
 | tls | unit, black-box | black-box | cli tests | unit | runner | json/e2e |
 | ssh | unit, black-box | black-box | cli tests | unit | runner | json/e2e |
 | s3 | unit, e2e, black-box | e2e | cli tests | unit | runner | json/e2e |
@@ -33,4 +34,3 @@ Every backend should have evidence for these behavior classes:
 
 When a backend is added or expanded, update this matrix and add tests for any
 cell that would otherwise rely only on parser coverage.
-

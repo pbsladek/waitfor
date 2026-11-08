@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strings"
@@ -59,6 +60,39 @@ func TestSSHSkipsPreBannerLines(t *testing.T) {
 	}
 }
 
+func TestSSHBannerReadIsBounded(t *testing.T) {
+	reader := strings.NewReader(strings.Repeat("x", 10*maxSSHBannerBytes))
+	size := reader.Len()
+	if _, err := readSSHBanner(t.Context(), readOnlyConn{Reader: reader}); err == nil {
+		t.Fatal("unterminated oversized banner was accepted")
+	}
+	if read := size - reader.Len(); read > maxSSHBannerBytes+2 {
+		t.Fatalf("read %d bytes before rejecting oversized banner", read)
+	}
+	for _, ending := range []string{"\n", "\r\n"} {
+		banner := "SSH-2.0-" + strings.Repeat("x", maxSSHBannerBytes-len("SSH-2.0-"))
+		got, err := readSSHBanner(t.Context(), readOnlyConn{Reader: strings.NewReader(banner + ending)})
+		if err != nil || got != banner {
+			t.Fatalf("maximum banner with %q: got %q, err %v", ending, got, err)
+		}
+	}
+	oversized := strings.Repeat("x", maxSSHBannerBytes+1) + "\n"
+	if _, err := readSSHBanner(t.Context(), readOnlyConn{Reader: strings.NewReader(oversized)}); err == nil {
+		t.Fatal("oversized terminated line was accepted")
+	}
+}
+
+func TestSSHHostKeyFingerprintLength(t *testing.T) {
+	for _, size := range []int{0, 1, 31, 32, 33} {
+		value := base64.RawStdEncoding.EncodeToString(make([]byte, size))
+		for _, prefix := range []string{"", "SHA256:"} {
+			if got := validSSHHostKeySHA256(prefix + value); got != (size == 32) {
+				t.Errorf("valid fingerprint size %d prefix %q = %t", size, prefix, got)
+			}
+		}
+	}
+}
+
 func TestSSHAuthSatisfied(t *testing.T) {
 	addr, fingerprint := startSSHAuthServer(t, "deploy", "secret")
 
@@ -111,6 +145,7 @@ func TestSSHInvalidDirectConfigFatal(t *testing.T) {
 		{"partial auth", func(c *SSHCondition) { c.User = "deploy" }},
 		{"auth without host key", func(c *SSHCondition) { c.User = "deploy"; c.Password = "secret" }},
 		{"bad fingerprint", func(c *SSHCondition) { c.HostKeySHA256 = "not-base64" }},
+		{"short fingerprint", func(c *SSHCondition) { c.HostKeySHA256 = "SHA256:YQ" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

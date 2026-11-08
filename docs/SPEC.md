@@ -29,6 +29,17 @@ Runs have one final status:
 | `docker` | `waitfor docker CONTAINER --status running --health healthy` | Shells out to `docker inspect` for container state and health. |
 | `process` | `waitfor process --name postgres --running` | Checks local process state by PID or executable name. |
 | `systemd` | `waitfor systemd nginx.service --active` | Checks Linux systemd unit active state through `systemctl show`. |
+| `launchd` | `waitfor launchd system/com.example.agent --running` | Checks whether a macOS launchd service is loaded or running. |
+| `pidfile` | `waitfor pidfile /var/run/app.pid --running` | Reads a pidfile and checks whether its referenced process exists. |
+| `lockfile` | `waitfor lockfile /var/run/app.lock --absent` | Checks lockfile presence, absence, or minimum age. |
+| `permission` | `waitfor permission /etc/app.conf --mode 0640 --type file` | Checks path type, permission bits, UID, and GID. |
+| `checksum` | `waitfor checksum artifact.tar.gz --equals sha256:HEX` | Streams a file through SHA-1, SHA-256, or SHA-512 and compares its digest. |
+| `archive` | `waitfor archive artifact.tar.gz --matches 'bin/*'` | Checks tar, tar.gz, or zip archives for an exact or globbed member. |
+| `cosign` | `waitfor cosign IMAGE --certificate-identity ID` | Shells out to cosign to verify an image or signed blob. |
+| `ntp` | `waitfor ntp time.example.test --max-offset 250ms` | Queries an NTP server and optionally bounds the local clock offset. |
+| `icmp` | `waitfor icmp HOST --count 3` | Shells out to the platform ping command. |
+| `grpc` | `waitfor grpc HOST:PORT --service NAME` | Performs gRPC health checks and optional reflection checks. |
+| `websocket` | `waitfor websocket ws://HOST/PATH --contains ready` | Performs a WebSocket handshake and optional ping, close, send, or message checks. |
 | `exec` | `waitfor exec --output-contains ok -- COMMAND [ARGS...]` | Runs a command and checks exit code, output substring, or JSON expression. |
 | `file` | `waitfor file PATH --exists` | Checks filesystem state: exists, deleted, or non-empty; optional substring match. |
 | `glob` | `waitfor glob '/tmp/jobs/*.done' --min-count 5` | Checks filesystem glob matches, absence, and match-count thresholds. |
@@ -52,11 +63,9 @@ exec-condition := exec [exec-flags] -- command [args ...]
 
 `exec` uses `--` to separate its own flags from the command being run. After
 that separator, tokens belong to the command until a later `-- BACKEND` or
-`-- guard BACKEND` condition separator is encountered. This means an exec
-command that passes a literal `-- http`, `-- tcp`, `-- unix`, `-- ports`, `-- tls`,
-`-- ssh`, `-- s3`, `-- dns`, `-- docker`, `-- process`, `-- systemd`,
-`-- exec`, `-- file`, `-- glob`, `-- log`, `-- k8s`, or `-- guard BACKEND`
-token sequence cannot be followed unambiguously by a second waitfor condition.
+`-- guard BACKEND` condition separator is encountered. An exec command that
+passes one of those literal token sequences cannot be followed unambiguously by
+a second waitfor condition when `BACKEND` is any registered backend name.
 
 A `--` that appears immediately after a value-taking backend flag (such as
 `--contains`) is treated as that flag's value, not as a condition separator:
@@ -81,9 +90,12 @@ waitfor log /var/log/app.log --contains -- -- http https://api.example.com
 | `--attempt-timeout duration` | `0` (disabled) | Per-attempt deadline; `0` means each attempt receives the remaining global time. |
 | `--successes N` | `1` | Consecutive successful checks required before a non-guard condition is complete. |
 | `--stable-for duration` | `0` (disabled) | Required continuous success duration before a non-guard condition is complete. |
-| `--output text\|json` | `text` | Output format. JSON is written to stdout; text progress goes to stderr. |
+| `--output text\|json\|ndjson` | `text` | Output format. JSON and NDJSON are written to stdout; text progress goes to stderr. |
 | `--mode all\|any` | `all` | `all` requires every condition to satisfy; `any` stops after the first. |
 | `--verbose` | `false` | Emit a line per attempt in text mode. |
+| `--profile ci\|local` | `$WAITFOR_PROFILE` or unset | Apply CI or local defaults unless the corresponding flag was set explicitly. |
+| `--config PATH` | unset | Load global options, conditions, and guards from a YAML recipe. Explicit CLI flags override recipe options. Positional CLI conditions replace recipe conditions. |
+| `--explain`, `--dry-run` | `false` | Print the parsed plan without performing checks. |
 
 ### Backend Grammar
 
@@ -98,6 +110,9 @@ http URL
      [--jsonpath EXPR]
      [--insecure]
      [--no-follow-redirects]
+     [--bearer-token TOKEN]
+     [--basic-user USER --basic-password PASS]
+     [--client-cert CERT --client-key KEY]
 
 tcp HOST:PORT
 
@@ -145,6 +160,68 @@ dns HOST
 docker CONTAINER
        [--status STATUS]            # any|created|running|paused|restarting|removing|exited|dead (default: running)
        [--health HEALTH]            # healthy|unhealthy|starting|none (default: disabled)
+
+process (--pid PID | --name NAME)
+        [--running | --stopped]      # default: --running
+
+systemd UNIT
+        [--active | --inactive | --failed]  # default: --active
+
+launchd LABEL
+        [--running | --loaded]       # default: --running
+
+pidfile PATH
+        [--running | --stopped]      # default: --running
+
+lockfile PATH
+         [--absent | --present]      # default: --absent
+         [--older-than DURATION]     # implies --present
+
+permission PATH
+           [--mode OCTAL]
+           [--uid UID | --user UID]
+           [--gid GID | --group GID]
+           [--type any|file|dir|symlink]
+
+checksum PATH
+         --equals [ALGORITHM:]HEX
+         [--algorithm auto|sha1|sha256|sha512]
+
+archive PATH
+        (--contains MEMBER | --matches GLOB)
+        [--format auto|tar|tgz|zip]
+
+cosign TARGET
+       [--blob --signature SIG]
+       [--key KEY]
+       [--certificate CERT]
+       [--certificate-identity ID]
+       [--certificate-oidc-issuer URL]
+
+ntp HOST[:PORT]
+    [--max-offset DURATION]
+    [--timeout DURATION]
+
+icmp HOST
+     [--count N]
+     [--timeout DURATION]
+
+grpc ADDRESS
+     [--service NAME]
+     [--method /pkg.Service/Method]
+     [--reflect]
+     [--status SERVING|NOT_SERVING|UNKNOWN|SERVICE_UNKNOWN]
+     [--tls]
+     [--timeout DURATION]
+
+websocket ws://HOST/PATH
+          [--send TEXT]
+          [--contains TEXT | --matches REGEX]
+          [--ping]
+          [--expect-close-code N]
+          [--read-timeout DURATION]
+          [--header KEY=VALUE ...]
+          [--timeout DURATION]
 
 exec [--exit-code N]               # default: 0
      [--output-contains TEXT]
@@ -200,6 +277,10 @@ service may emit non-JSON output before becoming ready. `--body` and
 TLS verification is enabled by default.
 
 Status matchers accept an exact code (`200`, `404`) or a class (`2xx`, `5xx`).
+`--bearer-token` and `--basic-user`/`--basic-password` provide mutually
+exclusive Authorization helpers. `--client-cert` and `--client-key` configure
+mutual TLS and must be supplied together. URL userinfo and query values are
+redacted from descriptors and error output.
 
 ### TCP
 
@@ -222,6 +303,17 @@ check scans the range in ascending order, opening a TCP connection with the
 attempt context and closing it immediately on success. `--all` is the default
 and requires every port in the range to be open. `--any` stops after the first
 open port. Dial failures are retryable.
+
+### TLS
+
+`HOST:PORT` is validated at parse time. Each check completes a TLS handshake,
+verifies the certificate chain and hostname, confirms the leaf certificate is
+currently valid, and optionally requires at least `--valid-for` remaining
+validity. `--servername` overrides the SNI and hostname-verification name.
+`--ca-file` adds PEM certificates to the system root pool. Network, handshake,
+and certificate mismatches are retryable because a service may still be
+rotating or provisioning its certificate; malformed addresses, durations, and
+CA files are invalid configuration.
 
 ### SSH
 
@@ -330,6 +422,117 @@ check. Valid health values: `healthy`, `unhealthy`, `starting`, `none`.
 Empty string (the default) disables the health check; `none` means the
 container has no health configuration.
 
+### Process
+
+Exactly one of `--pid` or `--name` is required. PID checks use the platform's
+process lookup; name checks inspect the local process table and compare the
+executable basename. `--running` is the default, while `--stopped` inverts the
+condition. A missing `ps` command for a name check is fatal; process absence,
+presence in the wrong state, and transient inspection errors are retryable.
+
+### Systemd
+
+Runs `systemctl show UNIT --property=LoadState,ActiveState,SubState` and compares
+the active state with `active` (default), `inactive`, or `failed`. A missing
+`systemctl` binary or an unavailable systemd bus is fatal. Missing units,
+command failures that may clear, and non-matching states are retryable.
+
+### Launchd
+
+Runs `launchctl print LABEL`. `--running` is the default and requires the
+reported service to have a non-zero PID; `--loaded` only requires the command to
+succeed. A missing `launchctl` binary is fatal. Missing services and other
+command failures are retryable.
+
+### PID file
+
+Reads up to 4 KiB from a regular file, parses a positive PID, and checks whether
+that process exists. `--running` is the default. `--stopped` succeeds when the
+pidfile is absent or points to a process that no longer exists. Missing files,
+stale PIDs in running mode, malformed contents, and transient filesystem errors
+are retryable.
+
+### Lockfile
+
+`--absent` is the default; `--present` waits for the path to exist.
+`--older-than DURATION` implies `--present` and also requires the file's
+modification age to reach the requested duration. Presence, absence, and age
+mismatches are retryable. Negative durations and contradictory state flags are
+invalid configuration.
+
+### Permission
+
+Checks a path with `os.Lstat`. At least one of `--mode`, `--uid`/`--user`,
+`--gid`/`--group`, or a non-default `--type` is required. Modes are exact octal
+permission-bit matches; types are `file`, `dir`, or `symlink`. The user and
+group aliases currently accept numeric IDs. Missing paths and mismatches are
+retryable. Owner checks are fatal on platforms that cannot report UID/GID.
+
+### Checksum
+
+Streams a regular file through SHA-1, SHA-256, or SHA-512 and compares the
+lowercase hexadecimal digest. The algorithm may be selected with `--algorithm`,
+prefixed in `--equals` (for example `sha256:...`), or inferred from a 40-, 64-,
+or 128-character digest. Invalid algorithms and digest lengths are invalid
+configuration. Missing files and checksum mismatches are retryable.
+
+### Archive
+
+Checks tar, gzip-compressed tar, and zip files for either an exact member path
+(`--contains`) or a `filepath.Match` glob (`--matches`). The format can be
+explicit or inferred from `.zip`, `.tgz`, or `.tar.gz`; other names default to
+tar. Scans are bounded to 100,000 entries and 512 MiB of archive/member data.
+Invalid matcher combinations and formats are invalid configuration. Missing,
+incomplete, or non-matching archives are retryable.
+
+### Cosign
+
+Shells out to `cosign verify TARGET` for images or `cosign verify-blob` with
+`--blob --signature SIG` for artifacts. Key, certificate, expected identity,
+and expected OIDC issuer options are passed through as separate arguments. A
+missing cosign binary and invalid option combinations are fatal. Verification
+failures are retryable so a signature published after its artifact can still
+satisfy the condition.
+
+### NTP
+
+Sends one NTPv4 client request over UDP to `HOST[:PORT]`, defaulting to port
+123, and validates the response version, mode, stratum, originate timestamp,
+and receive/transmit timestamps. `--max-offset` limits the absolute calculated
+clock offset. Queries have a two-second default per-attempt timeout. Network,
+protocol, and offset failures are retryable; invalid addresses or negative
+durations are invalid configuration.
+
+### ICMP
+
+Runs the platform `ping` command with the requested packet count and per-attempt
+timeout. Command arguments differ across Linux, macOS, and Windows. A missing
+ping binary is fatal; unreachable hosts and non-zero command results are
+retryable. Hosts beginning with `-`, non-positive counts, and invalid timeouts
+are rejected.
+
+### gRPC
+
+Uses HTTP/2 directly to call the standard gRPC health check, expecting
+`SERVING` by default. `--service` sets the health request service name;
+`--method` replaces the request path. `--reflect` first asks the v1alpha server
+reflection service for the selected service descriptor. Addresses may be
+`HOST:PORT`, `grpc://`, `grpcs://`, `http://`, or `https://`; `--tls` enables TLS
+for a bare host and port. Network, protocol, reflection, and status mismatches
+are retryable. Malformed addresses, methods, and expected statuses are invalid
+configuration. Responses are limited to 4 MiB and compressed messages are not
+supported.
+
+### WebSocket
+
+Performs an RFC 6455 `ws` or `wss` handshake. A condition can connect only,
+send one text message, wait for a text message matching `--contains` or
+`--matches`, send a ping and require a pong, or require a close code. Extra HTTP
+headers are allowed except for handshake headers managed by waitfor. Connection,
+handshake, frame, timeout, and matcher failures are retryable. Invalid URLs,
+headers, regexes, close codes, or durations are invalid configuration. Send
+payloads are capped at 1 MiB and received messages at 16 MiB.
+
 ### Exec
 
 Starts the command with the attempt context. A missing binary or spawn failure
@@ -403,12 +606,11 @@ They may be combined freely; all must pass (AND). `--exclude` may be combined
 with any of them.
 
 **Satisfaction.** The condition is satisfied when the cumulative match count
-reaches `--min-matches` (default: `1`). The `Result.Detail` field of a
-satisfied result contains the matched line, truncated to 200 characters with
-a `...` suffix if longer. When `--min-matches` is greater than one, the detail
-is prefixed with the count: `"3 matches; last: <line>"`. Unsatisfied results
-report progress when at least one match has been counted: `"1 of 3 required
-matches"`.
+reaches `--min-matches` (default: `1`). The result reports `"matched line"` for
+a single required match or the cumulative count, such as `"3 matches"`, when
+more than one is required. Matched line contents are not copied into output.
+Unsatisfied results report progress after the first match, for example `"1 of
+3 required matches"`.
 
 **Constraints.** `--from-start` and `--tail` are mutually exclusive.
 `--min-matches` must be at least `1`. A missing file is retryable (the service
@@ -442,6 +644,50 @@ matched objects. With `--all`, every selected object must satisfy the typed
 wait; without it, the first satisfied object completes the condition. An empty
 selector result is retryable. `--condition`, `--jsonpath`, and `--for` are
 mutually exclusive.
+
+## Profiles, Recipes, and Explain Mode
+
+Profiles set defaults only for options that were not explicitly supplied:
+
+| Profile | Timeout | Interval | Output and verbosity |
+| ------- | ------- | -------- | -------------------- |
+| `ci` | `10m` | `1s` | JSON output |
+| `local` | `2m` | `500ms` | Verbose text output |
+
+`--profile` overrides `WAITFOR_PROFILE`. The effective precedence is explicit
+flags, recipe values, profile defaults, then built-in defaults.
+
+`--config PATH` loads a YAML recipe. The supported top-level keys are
+`timeout`, `interval`, `max_interval`, `backoff`, `jitter`, `attempt_timeout`,
+`successes`, `stable_for`, `output`, `mode`, `verbose`, `conditions`, and
+`guards`. Each condition can use a backend key plus its target and options, or
+an `args` string list that follows normal CLI grammar. A `name` adds the output
+label and `guard: true` converts a normal condition into a guard. Entries under
+`guards` are always guards. Explicit global flags override recipe options. If
+positional conditions are also supplied, they replace the recipe's conditions
+and guards while retaining recipe-level defaults. A recipe must contain at
+least one condition or guard even when positional conditions will replace it.
+
+```yaml
+timeout: 10m
+mode: all
+conditions:
+  - name: api
+    http:
+      url: https://api.example.test/health
+      status: 200
+      jsonpath: ".ready == true"
+guards:
+  - log:
+      path: /var/log/api.log
+      matches: "FATAL|panic"
+```
+
+`--explain` and `--dry-run` validate the complete configuration and print the
+resolved plan without calling any backend. Text plans go to stdout. JSON emits
+the plan object, and NDJSON emits one `explain` event containing that object.
+Descriptors used by explain mode omit HTTP credentials and redact URL userinfo
+and query values.
 
 ## Core Contract
 
@@ -519,9 +765,9 @@ run stops immediately. Once all non-guard conditions have completed in
 
 ## Output
 
-Human-readable progress and summaries are written to **stderr**. JSON output
-is written to **stdout** with no progress lines, making it safe to consume in
-scripts.
+Human-readable progress and summaries are written to **stderr**. JSON and
+NDJSON output are written to **stdout** with nothing on stderr unless parsing or
+report writing itself fails, making machine output safe to consume in scripts.
 
 JSON schema (stable):
 
@@ -547,7 +793,7 @@ JSON schema (stable):
       "satisfied": true,
       "attempts": 3,
       "elapsed_seconds": 1.0,
-      "detail": "matched: service ready at port 8080",
+      "detail": "matched line",
       "last_error": "",
       "fatal": false,
       "guard": false
@@ -561,10 +807,19 @@ is omitted for the constant strategy; `jitter` is omitted when zero.
 `per_attempt_timeout_seconds` is omitted when the per-attempt timeout is zero.
 `required_successes` is omitted when it is `1`; `stable_for_seconds` is omitted
 when the stable duration is zero. `guard` is omitted or false for normal
-readiness conditions.
-`last_error` is omitted or empty when no error was recorded. Text summaries on
+readiness conditions. `last_error` is omitted or empty when no error was
+recorded. Unsatisfied reports may include a stable `reason` classification and
+a human-facing `suggestion`; both are omitted when empty. Text summaries on
 failure list each unsatisfied condition with its last error when available,
 otherwise its last detail.
+
+NDJSON writes one JSON object per line in execution order:
+
+1. A `start` event with condition count and timing.
+2. An `attempt` event after each recorded check.
+3. One `outcome` event containing the same final report used by JSON mode.
+
+Explain mode emits one `explain` event instead of this execution sequence.
 
 ## Exit Codes
 
@@ -582,7 +837,10 @@ otherwise its last detail.
 1. **One file per backend.** `internal/condition/<name>.go` implementing
    `condition.Condition`; parser wiring in `internal/cli/cli.go`; unit tests in
    `internal/condition/<name>_test.go`; e2e coverage in `e2e/e2e_test.go` for
-   the satisfied, timeout, invalid-args, and fatal paths.
+   the satisfied, timeout, invalid-args, and fatal paths. Catch-all backend
+   source or test files are not allowed. `make layout` derives the canonical
+   source and test filenames from the CLI backend registry and enforces this
+   invariant in CI.
 
 2. **Cyclomatic complexity ≤ 9.** Every production function must stay at or
    below gocyclo score 9. Extract package-level helpers for validation and
@@ -605,5 +863,6 @@ otherwise its last detail.
    individual findings with `// #nosec GXXX -- <reason>` and a justification;
    never disable the linter globally.
 
-7. **CI gates.** Coverage must stay at or above 90% total. The lint, gosec,
-   and gocyclo `-over 9` passes must be clean before merge.
+7. **CI gates.** Backend layout must pass `make layout`, and coverage must stay
+   at or above 90% total. The lint, gosec, and gocyclo `-over 9` passes must be
+   clean before merge.

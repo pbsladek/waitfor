@@ -9,7 +9,7 @@ init containers, and agent workflows.
 ```
 cmd/waitfor/        entrypoint — signal handling, delegates to internal/cli
 internal/cli/       argument parsing, doctor command, backend wiring, exit codes
-internal/condition/ one file per backend: http, tcp, dns, docker, file, log, exec, k8s
+internal/condition/ canonical `<backend>.go` and `<backend>_test.go` ownership
 internal/runner/    polling loop — timeout, interval, backoff/jitter, all/any, parallelism
 internal/output/    text/JSON formatters (progress → stderr, JSON → stdout)
 internal/expr/      minimal JSONPath evaluator used by http, exec, log, and k8s
@@ -30,6 +30,7 @@ make coverage    # go test -coverpkg=./... then open coverage.html
 Always run before finishing any change:
 
 ```bash
+make layout
 go build ./... && go test ./... && golangci-lint run --enable=gosec ./...
 gocyclo -over 9 $(find . -name '*.go' -not -name '*_test.go')
 ```
@@ -147,9 +148,18 @@ Established extraction patterns to follow:
 7. Use `condition.Fatal` only for errors that cannot resolve on retry (missing
    binary, bad credentials, invalid config). Network errors are `Unsatisfied`.
 
+Backend ownership is a hard layout invariant. Every key in `backendParsers`
+must have canonical `internal/condition/<backend>.go` and
+`internal/condition/<backend>_test.go` files. Do not create catch-all files such
+as `*_extra.go` or `extra_backends_test.go`, and do not combine unrelated
+backends in one test. Backend-specific helpers stay with that backend; only
+genuinely shared infrastructure belongs in a narrowly named shared file.
+`make layout` derives its checks from the parser registry and runs in CI.
+
 ### Checklist for a new backend
 
 - [ ] `Descriptor()` returns `Backend` and `Target` fields
+- [ ] Canonical `<backend>.go` and `<backend>_test.go` files pass `make layout`
 - [ ] `Check` uses `ctx` throughout (pass to all blocking calls)
 - [ ] Error paths: `Fatal` for permanent, `Unsatisfied` for transient
 - [ ] No global state; all config lives on the struct

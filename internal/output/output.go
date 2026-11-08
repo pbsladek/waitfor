@@ -21,7 +21,7 @@ const (
 const maxTextFieldBytes = 512
 
 type Printer struct {
-	w       io.Writer
+	w       *errorWriter
 	format  Format
 	verbose bool
 	mu      sync.Mutex
@@ -85,10 +85,36 @@ type ndjsonEvent struct {
 }
 
 func NewPrinter(w io.Writer, format Format, verbose bool) *Printer {
-	return &Printer{w: w, format: format, verbose: verbose}
+	return &Printer{w: &errorWriter{writer: w}, format: format, verbose: verbose}
+}
+
+// Err returns the first output error, including errors from progress events.
+func (p *Printer) Err() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.w.err
+}
+
+type errorWriter struct {
+	writer io.Writer
+	err    error
+}
+
+func (w *errorWriter) Write(data []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	n, err := w.writer.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	w.err = err
+	return n, err
 }
 
 func (p *Printer) Start(count int, timeout time.Duration, interval time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.format == FormatNDJSON {
 		_ = p.writeNDJSON(ndjsonEvent{
 			Event:           "start",
@@ -101,12 +127,12 @@ func (p *Printer) Start(count int, timeout time.Duration, interval time.Duration
 	if p.format != FormatText {
 		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	_, _ = fmt.Fprintf(p.w, "[waitfor] checking %d condition(s) (timeout: %s, interval: %s)\n", count, timeout, interval)
 }
 
 func (p *Printer) Attempt(event Attempt) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.format == FormatNDJSON {
 		_ = p.writeNDJSON(ndjsonEvent{
 			Event:          "attempt",
@@ -125,8 +151,6 @@ func (p *Printer) Attempt(event Attempt) {
 	if !p.verbose && !event.Satisfied {
 		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if event.Satisfied {
 		_, _ = fmt.Fprintf(p.w, "[waitfor] [ok] %s (attempt %d, %.1fs) %s\n", sanitizeTextField(event.Name), event.Attempt, event.Elapsed.Seconds(), sanitizeTextField(event.Detail))
 		return
@@ -139,6 +163,8 @@ func (p *Printer) Attempt(event Attempt) {
 }
 
 func (p *Printer) Outcome(report Report) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.format == FormatJSON {
 		return WriteJSON(p.w, report)
 	}
@@ -148,7 +174,7 @@ func (p *Printer) Outcome(report Report) error {
 	switch report.Status {
 	case "satisfied":
 		_, _ = fmt.Fprintf(p.w, "[waitfor] conditions satisfied in %.3fs\n", report.ElapsedSeconds)
-		return nil
+		return p.w.err
 	case "fatal":
 		_, _ = fmt.Fprintf(p.w, "[waitfor] stopped after %.3fs due to unrecoverable error\n", report.ElapsedSeconds)
 	case "cancelled":
@@ -157,12 +183,10 @@ func (p *Printer) Outcome(report Report) error {
 		_, _ = fmt.Fprintf(p.w, "[waitfor] timeout after %.3fs\n", report.ElapsedSeconds)
 	}
 	p.printUnsatisfiedConditions(report.Conditions)
-	return nil
+	return p.w.err
 }
 
 func (p *Printer) writeNDJSON(event ndjsonEvent) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	enc := json.NewEncoder(p.w)
 	return enc.Encode(event)
 }
